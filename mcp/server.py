@@ -168,6 +168,16 @@ def task(
 
 
 @mcp.tool()
+def merge(team: str, branch: str) -> str:
+    """File a kind:merge role:manager bd issue for `branch`. Use to
+    manually unstick a workflow when an auto-merge issue wasn't filed
+    (e.g. legacy approvals closed before auto-merge was wired up). The
+    `cto approve` flow now auto-files merge issues; this is the manual
+    escape hatch."""
+    return _run(["merge", team, branch])
+
+
+@mcp.tool()
 def promote(team: str, issue_ids: list[str], kind: str = "epic") -> str:
     """Retrofit existing bd issues with role:manager + kind:<kind> labels
     so the team's manager agent picks them up. Use after adopting a repo

@@ -495,6 +495,44 @@ cmd_task() {
   info "filed $id ($kind, role:manager) in team $name"
 }
 
+# ---- merge ---------------------------------------------------------------
+#
+# File a kind:merge role:manager bd issue for a given task branch. Used
+# manually by the CTO to unstick a workflow when an automatic merge issue
+# wasn't filed (e.g. an approval that closed before the auto-merge logic
+# was wired up).
+
+cmd_merge() {
+  local team="${1:-}" branch="${2:-}"
+  require_team "$team"
+  [[ -n "$branch" ]] || die "usage: cto merge <team> <branch>"
+  local tdir; tdir="$(team_dir "$team")"
+
+  # Dedup: skip if there's already an open kind:merge issue for this
+  # branch (manager may have filed one when CTO automation lagged).
+  local existing
+  existing=$(cd "$tdir" && bd list --label "kind:merge" --status open --json 2>/dev/null \
+              | jq -r --arg b "$branch" '.[] | select(.description // "" | contains($b)) | .id' | head -1)
+  if [[ -n "$existing" ]]; then
+    info "merge issue already exists for $branch: $existing (skipping)"
+    return 0
+  fi
+
+  if ! git -C "$tdir" show-ref --verify --quiet "refs/heads/$branch"; then
+    warn "branch '$branch' not found in $tdir — filing merge issue anyway"
+  fi
+
+  local mid
+  mid=$(cd "$tdir" && bd create -t task \
+          -l "role:manager,kind:merge" -p 1 \
+          -d "branch: $branch
+filed-by: CTO (manual)
+action: merge --no-ff into main, prune the worktree, close this issue." \
+          --silent \
+          "Merge $branch")
+  info "filed merge issue $mid for $branch"
+}
+
 # ---- promote -------------------------------------------------------------
 #
 # Retrofit existing bd issues with role:* + kind:* labels so the team's
@@ -558,11 +596,41 @@ cmd_approve() {
       *) die "unknown flag: $1" ;;
     esac
   done
-  ( cd "$(team_dir "$name")" \
+
+  local tdir; tdir="$(team_dir "$name")"
+
+  # Snapshot the approval's labels + description before we close it.
+  local issue_json labels desc
+  issue_json=$(cd "$tdir" && bd show "$id" --json 2>/dev/null) || die "approve: cannot read $id"
+  labels=$(jq -r '.labels // [] | join(",")' <<<"$issue_json")
+  desc=$(jq -r '.description // ""' <<<"$issue_json")
+
+  ( cd "$tdir" \
       && bd comment "$id" "$comment" >/dev/null \
       && bd update "$id" --add-label "verdict:approved" >/dev/null \
       && bd close "$id" -r "$comment" >/dev/null )
   info "approved $id in team $name"
+
+  # If this was a CTO approval of a breakdown or plan, the next workflow
+  # step is "manager merges the relevant branch". Auto-file the merge
+  # issue so the team doesn't stall waiting on the human.
+  if [[ "$labels" == *"kind:approval"* ]]; then
+    local target="" branch=""
+    case "$labels" in
+      *target:breakdown*) target=breakdown ;;
+      *target:plan*)      target=plan ;;
+    esac
+    # The manager and reviewer prompts both put the branch on a line
+    # like "branch manager/<id>" or "branch: manager/<id>" or
+    # "@ branch task/<id>". Extract whichever shows up first.
+    branch=$(grep -oE '(manager|task)/[A-Za-z0-9._-]+' <<<"$desc" | head -1 || true)
+
+    if [[ -n "$target" && -n "$branch" ]]; then
+      cmd_merge "$name" "$branch"   # dedups internally
+    elif [[ -n "$target" ]]; then
+      warn "approval was for $target but no branch name found in description; no merge issue filed"
+    fi
+  fi
 }
 
 cmd_reject() {
@@ -932,6 +1000,7 @@ main() {
     config)    cmd_config    "$@" ;;
     task)      cmd_task      "$@" ;;
     promote)   cmd_promote   "$@" ;;
+    merge)     cmd_merge     "$@" ;;
     inbox)     cmd_inbox     "$@" ;;
     approve)   cmd_approve   "$@" ;;
     reject)    cmd_reject    "$@" ;;
