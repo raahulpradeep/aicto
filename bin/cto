@@ -1075,7 +1075,7 @@ while :; do
 
   case "$ROLE" in
     manager)
-      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) after a breakdown merges, file plan + review:plan; after a plan merges, file dev + review:code pairs; (5) update the team's open kind:status-digest issue (or create one if none). Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
+      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) run 'bd list --status closed -l kind:merge,target:breakdown --json' to find merged breakdowns and file plan + review:plan for each; run 'bd list --status closed -l kind:merge,target:plan --json' to find merged plans and file dev + review:code pairs for each; (5) update the team's open kind:status-digest issue (or create one if none). Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
       ;;
     developer|reviewer)
       label="role:$ROLE"
@@ -1128,23 +1128,6 @@ while :; do
       ${mcp_args[@]+"${mcp_args[@]}"} \
       2> >(tee "$err" >&2)
     rc=$?
-    if (( rc != 0 )); then
-      log "kimi exited $rc"
-      release_claim "$task_id"
-      sleep 30
-    else
-      if [[ -n "$task_id" ]]; then
-        st=$(bd show "$task_id" --json 2>/dev/null \
-             | jq -r '.[0].status // ""' 2>/dev/null || true)
-        if [[ "$st" == "in_progress" ]]; then
-          log "agent did not close $task_id (status=$st); resetting to open"
-          bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$LOCKS/$task_id" 2>/dev/null
-      fi
-      log "iteration ok (task=${task_id:-none})"
-      [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
-    fi
   else
     log "invoking claude (task=${task_id:-none})"
     # Stream events as they happen (tool calls + tool results + text)
@@ -1175,33 +1158,98 @@ while :; do
         else empty end
       ' 2>/dev/null
     rc=${PIPESTATUS[0]}
+  fi
 
-    if (( rc != 0 )); then
-      log "claude exited $rc"
-      release_claim "$task_id"
-      if looks_like_permission_block "$err"; then
-        escalate_permission "$task_id" "$err"
-        sleep 60   # back off until the human grants permission
-      else
-        sleep 30
-      fi
+  if (( rc != 0 )); then
+    log "$AGENT_PROVIDER exited $rc"
+    release_claim "$task_id"
+    if [[ "$AGENT_PROVIDER" != "kimi" ]] && looks_like_permission_block "$err"; then
+      escalate_permission "$task_id" "$err"
+      sleep 60   # back off until the human grants permission
     else
-      # On success the agent should have closed the bd issue itself.
-      # If it didn't (forgetful agent / context-window cutoff), the
-      # issue is now a zombie: in_progress, assigned to us, but nobody
-      # working it. Reset it so the next iteration re-attempts cleanly.
-      if [[ -n "$task_id" ]]; then
-        st=$(bd show "$task_id" --json 2>/dev/null \
-             | jq -r '.[0].status // ""' 2>/dev/null || true)
-        if [[ "$st" == "in_progress" ]]; then
-          log "agent did not close $task_id (status=$st); resetting to open"
-          bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
-        fi
-        rm -rf "$LOCKS/$task_id" 2>/dev/null
-      fi
-      log "iteration ok (task=${task_id:-none})"
-      [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
+      sleep 30
     fi
+  else
+    # On success the agent should have closed the bd issue itself.
+    # If it didn't (forgetful agent / context-window cutoff), the
+    # issue is now a zombie: in_progress, assigned to us, but nobody
+    # working it. Reset it so the next iteration re-attempts cleanly.
+    if [[ -n "$task_id" ]]; then
+      st=$(bd show "$task_id" --json 2>/dev/null \
+           | jq -r '.[0].status // ""' 2>/dev/null || true)
+      if [[ "$st" == "in_progress" ]]; then
+        log "agent did not close $task_id (status=$st); resetting to open"
+        bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
+      fi
+      rm -rf "$LOCKS/$task_id" 2>/dev/null
+    fi
+    log "iteration ok (task=${task_id:-none})"
+
+    # === WORKFLOW HOOKS ===
+    # These run after every successful iteration to file transitions
+    # that agents would otherwise forget.
+
+    # Hook 1: reviewer tags upstream with needs-re-review on changes-requested
+    if [[ "$ROLE" == "reviewer" && -n "$task_id" ]]; then
+      close_reason=$(bd show "$task_id" --json 2>/dev/null \
+                     | jq -r '.[0].close_reason // ""' 2>/dev/null || true)
+      if [[ "$close_reason" == *"changes-requested"* ]]; then
+        upstream=$(bd dep list "$task_id" --json 2>/dev/null \
+                   | jq -r '.dependencies[]? | select(.type=="blocks" or .type=="parent" or .type=="depends_on") | .target_id' \
+                   | head -1 || true)
+        if [[ -n "$upstream" && "$upstream" != "null" ]]; then
+          bd label add "$upstream" "needs-re-review" >/dev/null 2>&1 || true
+          log "tagged upstream $upstream with needs-re-review (review $task_id closed changes-requested)"
+        fi
+      fi
+    fi
+
+    # Hook 2: developer files re-review when closing a task tagged needs-re-review
+    if [[ "$ROLE" == "developer" && -n "$task_id" ]]; then
+      task_info=$(bd show "$task_id" --json 2>/dev/null || true)
+      st=$(echo "$task_info" | jq -r '.[0].status // ""' 2>/dev/null || true)
+      labels=$(echo "$task_info" | jq -r '.[0].labels // [] | join(",")' 2>/dev/null || true)
+      if [[ "$st" == "closed" && "$labels" == *"needs-re-review"* ]]; then
+        target="code"
+        [[ "$labels" == *"kind:plan"* ]] && target="plan"
+        epic=$(echo "$task_info" | jq -r '.[0].description // ""' 2>/dev/null \
+               | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
+        if [[ -n "$epic" ]]; then
+          new_review=$(bd create -t task -l "role:reviewer,kind:review,target:$target" -p 2 \
+                       -d "target: $target
+upstream: $task_id
+epic: $epic" \
+                       "Re-review $target for $task_id" 2>/dev/null \
+                       | head -1 || true)
+          if [[ -n "$new_review" ]]; then
+            bd dep "$new_review" --blocks "$task_id" >/dev/null 2>&1 || true
+            bd label remove "$task_id" "needs-re-review" >/dev/null 2>&1 || true
+            log "filed re-review $new_review for $task_id (target=$target, epic=$epic)"
+          fi
+        fi
+      fi
+    fi
+
+    # Hook 3: manager files epic merge when all children are closed
+    if [[ "$ROLE" == "manager" ]]; then
+      for epic in $(bd list --status open -l kind:epic --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
+        open_children=$(bd dep list "$epic" --direction=up 2>/dev/null | grep -c "open" || true)
+        if [[ "$open_children" == "0" ]]; then
+          existing=$(bd list --status open -l kind:merge,target:epic --json 2>/dev/null \
+                     | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
+          if [[ "$existing" == "0" ]]; then
+            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
+            bd create -t task -l "role:cto,kind:merge,target:epic" -p 1 \
+              -d "epic: $epic
+epic-branch: epic/$epic" \
+              "Merge epic: $epic_title" >/dev/null 2>&1 || true
+            log "filed epic merge for $epic"
+          fi
+        fi
+      done
+    fi
+
+    [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
   fi
   rm -f "$err"
 done
