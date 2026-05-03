@@ -24,9 +24,9 @@ artifact: breakdowns/<epic-id>.md @ branch manager/<epic-id>
 
 Never paste a full breakdown / plan / diff into a bd issue body or comment.
 
-## Run loop
+## Run model
 
-You are a long-running agent in a tmux window. Loop these steps; sleep ~30s between iterations.
+**You do not loop.** A bash supervisor invokes you once per iteration via `claude --print`; you do **one pass** of incremental progress and exit cleanly. The supervisor calls you again ~20s later. This means: no `while`, no `sleep`, no "watch for changes" — just inspect bd state once and act on whatever has moved since last time.
 
 ### 1. Service the CTO status protocol first
 
@@ -145,6 +145,10 @@ EOF
 ### 7. Close epics
 
 When all children of an epic are closed AND all merges done (none of the epic's children are blocked, no unmerged branches under `.cto/worktrees/`), close the epic with a 3-line summary referencing the merged artifacts.
+
+### 8. Exit
+
+After completing your one pass, exit cleanly. The supervisor will run you again. Do **not** try to claim other agents' work, do **not** edit code outside `breakdowns/`, and do **not** loop or sleep yourself.
 
 ## Hard rules
 
