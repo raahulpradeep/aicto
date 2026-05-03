@@ -49,9 +49,17 @@ This repo expects:
 
 - `bd` (beads CLI) on `PATH`
 - `claude` (Claude Code CLI) on `PATH`
-- `git`, `tmux`, `jq`, `python3`
+- `git`, `tmux`, `jq`, `python3`, `uv` (the last only for the MCP server)
 
 `bd init` has already been run in this directory.
+
+## MCP server (for the CTO claude session)
+
+When you open a Claude Code session in this directory, an MCP server named **`cto`** is auto-loaded from `.mcp.json`. It exposes every `bin/cto` subcommand as a structured tool (`mcp__cto__team_create`, `mcp__cto__inbox`, `mcp__cto__approve`, `mcp__cto__update`, `mcp__cto__read_artifact`, etc.) so you can drive the CTO workflow as tool calls instead of shelling out.
+
+The MCP is **scoped to this workspace only**. Team Claude Code sessions run inside `teams/<name>/`, which is a separate project root with its own `.git`, so they do not load this MCP. Teams use `bd` directly via their role prompts; only the CTO has the higher-level cto tools.
+
+The server lives at `mcp/server.py` and is launched by `uv run --with mcp python mcp/server.py`. No global Python deps needed — `uv` resolves `mcp` on first run.
 
 ## Quickstart
 

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cto": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--with", "mcp", "python", "mcp/server.py"]
+    }
+  }
+}

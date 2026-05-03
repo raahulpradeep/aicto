@@ -54,7 +54,11 @@ bd close <id>         # Complete work
 
 This directory is the **AI CTO workspace**. Each subdirectory under `teams/` is its own git repo with its own beads tracker and a small org chart of agents (manager, developers, reviewers). Coordination happens through bd.
 
-You (Claude in this workspace) act as the **CTO's hands**. Use the `bin/cto` CLI for everything that touches a team — don't poke into `teams/<name>/.beads/` directly.
+You (Claude in this workspace) act as the **CTO's hands**. Prefer the **`cto` MCP tools** (registered via `.mcp.json` and exposed as `mcp__cto__*` here) over running `bin/cto` through Bash — they're the same operations but show up cleanly as structured tool calls. The `bin/cto` CLI remains the source of truth for humans and is what the MCP wraps.
+
+Don't poke into `teams/<name>/.beads/` directly; route everything through the cto MCP tools or CLI.
+
+> Team agents (manager, developers, reviewers) **do not** load this MCP. They run inside `teams/<name>/`, which is a different project root with its own `.git`. Only this CTO workspace has the cto MCP wired up.
 
 ### Common operations
 
