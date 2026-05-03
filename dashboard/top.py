@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEAMS_DIR = ROOT / "teams"
 KEY_POLL_S = 0.25  # how often we wake to check stdin for q
 RECENT_CLOSED_LIMIT = 10
-RECENT_CLOSED_SCAN_PER_TEAM = 30  # bd -n; we sort+trim across teams afterward
+RECENT_CLOSED_SCAN_PER_TEAM = 0  # 0 = unlimited; bd ordering is not chronological, so we fetch all and sort in Python
 # Module-level executor reused across refreshes — bd subprocesses are
 # expensive (each invocation cold-starts dolt), so we run the per-team
 # queries in parallel.
