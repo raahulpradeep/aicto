@@ -16,7 +16,9 @@ import select
 import subprocess
 import sys
 import termios
+import time
 import tty
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -28,7 +30,11 @@ from rich.text import Text
 
 ROOT = Path(__file__).resolve().parent.parent
 TEAMS_DIR = ROOT / "teams"
-REFRESH_S = 1.0
+KEY_POLL_S = 0.25  # how often we wake to check stdin for q
+# Module-level executor reused across refreshes — bd subprocesses are
+# expensive (each invocation cold-starts dolt), so we run the per-team
+# queries in parallel.
+_POOL = ThreadPoolExecutor(max_workers=8)
 
 
 # ---- shell helpers --------------------------------------------------------
@@ -67,6 +73,42 @@ def tmux_windows(session: str) -> list[str]:
 # ---- data gather ----------------------------------------------------------
 
 
+def _bd_json(args: list[str], cwd: Path) -> list:
+    try:
+        return json.loads(_run(["bd", *args, "--json"], cwd=cwd) or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def _gather_team(team: str, tdir: Path) -> tuple[list[dict], list[dict]] | None:
+    """Pull all per-team data we need in one go.
+
+    Runs the two bd queries in parallel — each is a separate dolt
+    cold-start so they're hundreds of ms apiece; firing them concurrently
+    roughly halves wall-clock per team.
+    """
+    sess = f"cto-{team}"
+    if not tmux_alive(sess):
+        return None
+
+    windows = tmux_windows(sess)
+    f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
+    f_cto = _POOL.submit(_bd_json, ["list", "--status", "open", "-l", "role:cto"], tdir)
+    ip = f_ip.result()
+    cto_issues = f_cto.result()
+
+    ip_by_assignee = {i.get("assignee"): i for i in ip if i.get("assignee")}
+    agent_rows = [
+        {"agent": f"{team}:{w}", "team": team, "window": w, "issue": ip_by_assignee.get(f"{team}:{w}")}
+        for w in windows
+    ]
+    inbox_rows = [
+        {"team": team, "id": i.get("id", ""), "title": i.get("title", ""), "labels": i.get("labels", [])}
+        for i in cto_issues
+    ]
+    return agent_rows, inbox_rows
+
+
 def gather() -> tuple[list[dict], list[dict], list[str]]:
     """Return (agent_rows, inbox_rows, running_team_names)."""
     agents: list[dict] = []
@@ -76,54 +118,18 @@ def gather() -> tuple[list[dict], list[dict], list[str]]:
     if not TEAMS_DIR.is_dir():
         return agents, inbox, running
 
-    for tdir in sorted(p for p in TEAMS_DIR.iterdir() if p.is_dir()):
-        team = tdir.name
-        if not (tdir / ".cto").is_dir():
+    teams = [p for p in sorted(TEAMS_DIR.iterdir()) if p.is_dir() and (p / ".cto").is_dir()]
+    # Fan out per-team gather across the pool so multi-team workspaces
+    # don't add up linearly.
+    futures = {team.name: _POOL.submit(_gather_team, team.name, team) for team in teams}
+    for team_name, fut in futures.items():
+        result = fut.result()
+        if result is None:
             continue
-        sess = f"cto-{team}"
-        if not tmux_alive(sess):
-            continue
-        running.append(team)
-
-        windows = tmux_windows(sess)
-
-        try:
-            ip = json.loads(
-                _run(["bd", "list", "--status", "in_progress", "--json"], cwd=tdir) or "[]"
-            )
-        except json.JSONDecodeError:
-            ip = []
-        ip_by_assignee = {i.get("assignee"): i for i in ip if i.get("assignee")}
-
-        try:
-            cto_issues = json.loads(
-                _run(["bd", "list", "--status", "open", "-l", "role:cto", "--json"], cwd=tdir)
-                or "[]"
-            )
-        except json.JSONDecodeError:
-            cto_issues = []
-
-        for w in windows:
-            agent = f"{team}:{w}"
-            agents.append(
-                {
-                    "agent": agent,
-                    "team": team,
-                    "window": w,
-                    "issue": ip_by_assignee.get(agent),
-                }
-            )
-
-        for i in cto_issues:
-            inbox.append(
-                {
-                    "team": team,
-                    "id": i.get("id", ""),
-                    "title": i.get("title", ""),
-                    "labels": i.get("labels", []),
-                }
-            )
-
+        running.append(team_name)
+        a_rows, i_rows = result
+        agents.extend(a_rows)
+        inbox.extend(i_rows)
     return agents, inbox, running
 
 
@@ -142,7 +148,7 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def render(agents: list[dict], inbox: list[dict], running: list[str]) -> Layout:
+def render(agents: list[dict], inbox: list[dict], running: list[str], gather_ms: int = 0) -> Layout:
     now = dt.datetime.now(dt.timezone.utc)
 
     # ---- agents table ----
@@ -228,7 +234,7 @@ def render(agents: list[dict], inbox: list[dict], running: list[str]) -> Layout:
     ts = dt.datetime.now().strftime("%H:%M:%S")
     teams_summary = ", ".join(running) if running else "—"
     footer = Text(
-        f"q quit · {REFRESH_S:g}s refresh · teams: {teams_summary} · {ts}",
+        f"q quit · gather {gather_ms}ms · teams: {teams_summary} · {ts}",
         style="dim",
         justify="center",
     )
@@ -286,9 +292,14 @@ def main() -> int:
         with Live(refresh_per_second=4, screen=True) as live:
             try:
                 while True:
+                    t0 = time.monotonic()
                     agents, inbox, running = gather()
-                    live.update(render(agents, inbox, running))
-                    if stdin_quit_pressed(REFRESH_S):
+                    gather_ms = int((time.monotonic() - t0) * 1000)
+                    live.update(render(agents, inbox, running, gather_ms=gather_ms))
+                    # gather() is the natural throttle (~hundreds of ms
+                    # per refresh thanks to bd cold-starts); we just need
+                    # to poll stdin frequently enough that q feels snappy.
+                    if stdin_quit_pressed(KEY_POLL_S):
                         break
             except KeyboardInterrupt:
                 pass
