@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -297,14 +298,14 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
         )
 
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
-    t.add_column("AGENT", overflow="fold")
-    t.add_column("TEAM", overflow="fold")
-    t.add_column("WINDOW", overflow="fold")
-    t.add_column("PROVIDER", overflow="fold")
-    t.add_column("MODEL", overflow="fold")
-    t.add_column("STATUS", overflow="fold")
-    t.add_column("ISSUE", overflow="fold", ratio=2)
-    t.add_column("ELAPSED", justify="right", overflow="fold")
+    t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
+    t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
+    t.add_column("WINDOW", overflow="ellipsis", no_wrap=True)
+    t.add_column("PROVIDER", overflow="ellipsis", no_wrap=True)
+    t.add_column("MODEL", overflow="ellipsis", no_wrap=True)
+    t.add_column("STATUS", overflow="ellipsis", no_wrap=True)
+    t.add_column("ISSUE", overflow="ellipsis", no_wrap=True, ratio=2)
+    t.add_column("ELAPSED", justify="right", overflow="ellipsis", no_wrap=True)
 
     for row in agents:
         agent = row["agent"]
@@ -341,10 +342,10 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
 
 def _inbox_panel(inbox: list[dict]) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
-    t.add_column("TEAM", overflow="fold")
-    t.add_column("ID", overflow="fold")
-    t.add_column("TITLE", overflow="fold", ratio=3)
-    t.add_column("LABELS", overflow="fold", ratio=1)
+    t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
+    t.add_column("ID", overflow="ellipsis", no_wrap=True)
+    t.add_column("TITLE", overflow="ellipsis", no_wrap=True, ratio=3)
+    t.add_column("LABELS", overflow="ellipsis", no_wrap=True, ratio=1)
     if inbox:
         for row in inbox:
             labels = ",".join(
@@ -367,12 +368,12 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
 
 def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
-    t.add_column("TEAM", overflow="fold")
-    t.add_column("ID", overflow="fold")
-    t.add_column("KIND", overflow="fold")
-    t.add_column("TITLE", overflow="fold", ratio=3)
-    t.add_column("ASSIGNEE", overflow="fold")
-    t.add_column("AGE", overflow="fold", justify="right")
+    t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
+    t.add_column("ID", overflow="ellipsis", no_wrap=True)
+    t.add_column("KIND", overflow="ellipsis", no_wrap=True)
+    t.add_column("TITLE", overflow="ellipsis", no_wrap=True, ratio=3)
+    t.add_column("ASSIGNEE", overflow="ellipsis", no_wrap=True)
+    t.add_column("AGE", overflow="ellipsis", no_wrap=True, justify="right")
     if open_tasks:
         # Stable sort: priority asc (lower=more urgent), then created_at asc.
         rows = sorted(
@@ -408,13 +409,13 @@ def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
 
 def _closed_panel(closed: list[dict]) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
-    t.add_column("TEAM", overflow="fold")
-    t.add_column("ID", overflow="fold")
-    t.add_column("KIND", overflow="fold")
-    t.add_column("TITLE", overflow="fold", ratio=3)
-    t.add_column("CLOSED-BY", overflow="fold")
-    t.add_column("RESOLVE", overflow="fold", justify="right")
-    t.add_column("AT", overflow="fold")
+    t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
+    t.add_column("ID", overflow="ellipsis", no_wrap=True)
+    t.add_column("KIND", overflow="ellipsis", no_wrap=True)
+    t.add_column("TITLE", overflow="ellipsis", no_wrap=True, ratio=3)
+    t.add_column("CLOSED-BY", overflow="ellipsis", no_wrap=True)
+    t.add_column("RESOLVE", overflow="ellipsis", no_wrap=True, justify="right")
+    t.add_column("AT", overflow="ellipsis", no_wrap=True)
     if closed:
         for row in closed:
             closed_at = _parse_iso(row.get("closed_at") or "")
@@ -445,6 +446,15 @@ def _closed_panel(closed: list[dict]) -> Panel:
 # ---- render ---------------------------------------------------------------
 
 
+def _panel_height(row_count: int) -> int:
+    """Minimum rows to display a table with N data rows without clipping.
+
+    Panel top border (1) + table top border (1) + header (1) + separator (1) +
+    N rows + table bottom border (1) + panel bottom border (1) = N + 6.
+    """
+    return max(4, row_count + 6)
+
+
 def render(
     agents: list[dict],
     inbox: list[dict],
@@ -468,16 +478,43 @@ def render(
         justify="center",
     )
 
-    # Top row: agents + inbox side by side, sized to fit agents + a bit
-    # of breathing room. Closed has a fixed 8-row footprint. Open gets
-    # whatever's left. Footer is one row.
-    top_h = max(7, len(agents) + 4)
+    # Calculate minimum height for each panel so every row is visible.
+    # Panels with no data still render a placeholder row ("—").
+    top_h = max(
+        _panel_height(len(agents)),
+        _panel_height(max(1, len(inbox))),
+    )
+    open_h = _panel_height(max(1, len(open_tasks)))
+    closed_h = _panel_height(max(1, len(closed)))
+    footer_h = 1
+
+    # If the total exceeds terminal height, reduce from bottom up,
+    # never clipping below the absolute minimum (header + 1 row + borders).
+    term_h = Console().height
+    total = top_h + open_h + closed_h + footer_h
+    if total > term_h:
+        deficit = total - term_h
+        # Shrink open first, then closed, then top — but never below 4 rows.
+        for target, name in ((open_h, "open"), (closed_h, "closed"), (top_h, "top")):
+            if deficit <= 0:
+                break
+            avail = target - 4
+            if avail > 0:
+                reduction = min(avail, deficit)
+                if name == "open":
+                    open_h -= reduction
+                elif name == "closed":
+                    closed_h -= reduction
+                else:
+                    top_h -= reduction
+                deficit -= reduction
+
     layout = Layout()
     layout.split_column(
         Layout(name="top", size=top_h),
-        Layout(name="open"),
-        Layout(name="closed", size=8),
-        Layout(footer, name="footer", size=1),
+        Layout(name="open", size=open_h),
+        Layout(name="closed", size=closed_h),
+        Layout(footer, name="footer", size=footer_h),
     )
     layout["top"].split_row(
         Layout(agent_panel, name="agents", ratio=3),
