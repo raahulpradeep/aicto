@@ -238,7 +238,7 @@ Usage:
   cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi]
   cto team list
   cto team remove <name>
-  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
+  cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
   cto inbox [<team>]
@@ -509,13 +509,85 @@ cmd_team_remove() {
 
 # ---- config --------------------------------------------------------------
 
+_scale_team() {
+  local name="$1"
+  local tdir; tdir="$(team_dir "$name")"
+  local pdir="$tdir/.cto/prompts"
+  local sess; sess="$(tmux_session "$name")"
+  local mode model provider
+  mode="$(cfg_get "$name" permissionMode bypassPermissions)"
+  model="$(cfg_get "$name" model sonnet)"
+  provider="$(cfg_get "$name" agentProvider claude)"
+  local launcher="$tdir/.cto/supervisor.sh"
+
+  local n_devs n_revs
+  n_devs="$(cfg_get "$name" developers 2)"
+  n_revs="$(cfg_get "$name" reviewers 1)"
+
+  # Get currently running windows.
+  local -a existing_windows
+  existing_windows=($(tmux list-windows -t "$sess" -F '#W' 2>/dev/null))
+
+  # Spawn missing dev windows.
+  for i in $(seq 1 "$n_devs"); do
+    local win="dev-$i"
+    if [[ ! " ${existing_windows[*]} " =~ " $win " ]]; then
+      local dev_file="$pdir/dev-$i.md"
+      [[ "$provider" == "kimi" ]] && dev_file="$pdir/dev-$i.yaml"
+      tmux new-window -t "$sess" -n "$win" -c "$tdir" \
+        "$launcher" "$tdir" developer "$win" "$dev_file" "$mode" "$model" "$provider"
+      info "scaled up: $win"
+    fi
+  done
+
+  # Spawn missing reviewer windows.
+  for i in $(seq 1 "$n_revs"); do
+    local win="review-$i"
+    if [[ ! " ${existing_windows[*]} " =~ " $win " ]]; then
+      local rev_file="$pdir/review-$i.md"
+      [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
+      tmux new-window -t "$sess" -n "$win" -c "$tdir" \
+        "$launcher" "$tdir" reviewer "$win" "$rev_file" "$mode" "$model" "$provider"
+      info "scaled up: $win"
+    fi
+  done
+
+  # Kill excess dev windows (Ctrl-C first for graceful cleanup).
+  for w in "${existing_windows[@]}"; do
+    if [[ "$w" == dev-* ]]; then
+      local idx="${w#dev-}"
+      if (( idx > n_devs )); then
+        tmux send-keys -t "$sess:$w" C-c 2>/dev/null || true
+        sleep 2
+        tmux kill-window -t "$sess:$w" 2>/dev/null || true
+        info "scaled down: $w"
+      fi
+    fi
+  done
+
+  # Kill excess reviewer windows.
+  for w in "${existing_windows[@]}"; do
+    if [[ "$w" == review-* ]]; then
+      local idx="${w#review-}"
+      if (( idx > n_revs )); then
+        tmux send-keys -t "$sess:$w" C-c 2>/dev/null || true
+        sleep 2
+        tmux kill-window -t "$sess:$w" 2>/dev/null || true
+        info "scaled down: $w"
+      fi
+    fi
+  done
+}
+
 cmd_config() {
   local name="${1:-}"; shift || true
   require_team "$name"
+  local scale=0
   while (( $# )); do
     case "$1" in
       --developers)      cfg_set "$name" developers "$2";        shift 2 ;;
       --reviewers)       cfg_set "$name" reviewers  "$2";        shift 2 ;;
+      --scale)           scale=1; shift ;;
       --container-use)
         case "$2" in
           on|true)  cfg_set "$name" containerUse true ;;
@@ -535,9 +607,11 @@ cmd_config() {
   render_prompts "$name"
   info "config for $name:"
   cat "$(team_config_path "$name")"
-  if tmux_alive "$name"; then
+  if (( scale )) && tmux_alive "$name"; then
+    _scale_team "$name"
+  elif tmux_alive "$name"; then
     info ""
-    info "note: team is running — run 'cto restart $name' to apply changes."
+    info "note: team is running — run 'cto restart $name' to apply changes, or use --scale."
   fi
 }
 

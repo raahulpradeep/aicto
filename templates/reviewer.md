@@ -72,6 +72,7 @@ The reviewer **does not** file a merge yet. Plans need a second gate — the CTO
 ```
 bd close <review-id> -r "approved; see docs/reviews/<review-id>.md"
 bd create -t task -l role:cto,kind:approval,target:plan -p 1 \
+  --set-metadata artifact="plans/<epic-id>.md" \
   "Approve plan: <epic title>" \
   -d "$(cat <<EOF
 epic: $EPIC_ID

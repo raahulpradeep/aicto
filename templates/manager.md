@@ -72,9 +72,11 @@ artifact: breakdowns/<epic-id>.md @ branch manager/<breakdown-id>"
    bd dep <epic-id> --blocks <new-id>     # link as child of epic
 
    bd create -t task -l role:cto,kind:approval,target:breakdown -p 1 \
+     --set-metadata artifact="breakdowns/<epic-id>.md" \
      "Approve breakdown: <epic title>" \
      -d "epic: <epic-id>
 branch: manager/<breakdown-id>
+artifact: breakdowns/<epic-id>.md @ branch manager/<breakdown-id>
 Read breakdowns/<epic-id>.md. Approve via 'cto approve {{TEAM}} <id>' or reject with --comment."
    ```
 
@@ -117,7 +119,6 @@ bd create -t task -l role:reviewer,kind:review,target:plan -p 2 \
 Read plans/<epic-id>.md on branch task/<plan-id>."
 REVIEW_ID=$(...)
 
-bd dep <epic-id>  --blocks <PLAN_ID>
 bd dep <PLAN_ID>  --blocks <REVIEW_ID>
 ```
 
@@ -138,7 +139,6 @@ bd create -t task -l role:reviewer,kind:review,target:code -p 2 \
 Review diff on branch task/<DEV_ID> against epic/<epic-id>."
 REV_ID=$(...)
 
-bd dep <epic-id> --blocks <DEV_ID>
 bd dep <DEV_ID>  --blocks <REV_ID>
 ```
 

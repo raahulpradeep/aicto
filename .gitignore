@@ -9,3 +9,9 @@
 teams/*
 !teams/.gitkeep
 
+# Local-only directories
+.beads/
+.claude/
+**/__pycache__/
+*.pyc
+

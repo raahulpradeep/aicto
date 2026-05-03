@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import select
 import subprocess
 import sys
@@ -41,7 +42,7 @@ from rich.text import Text
 ROOT = Path(__file__).resolve().parent.parent
 TEAMS_DIR = ROOT / "teams"
 KEY_POLL_S = 0.25  # how often we wake to check stdin for q
-RECENT_CLOSED_LIMIT = 5
+RECENT_CLOSED_LIMIT = 10
 RECENT_CLOSED_SCAN_PER_TEAM = 30  # bd -n; we sort+trim across teams afterward
 # Module-level executor reused across refreshes — bd subprocesses are
 # expensive (each invocation cold-starts dolt), so we run the per-team
@@ -60,6 +61,7 @@ def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
             capture_output=True,
             text=True,
             timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
         return r.stdout if r.returncode == 0 else ""
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -96,6 +98,48 @@ def _bd_json(args: list[str], cwd: Path) -> list:
 
 
 META_LABELS = {"kind:status-digest", "kind:status-request"}
+
+# Extract artifact path from issue description.
+# Format: "artifact: <rel-path> @ <branch>"  (branch may be "task/...", "manager/...", etc.)
+_ARTIFACT_RE = re.compile(r"^artifact:\s*(.+?)\s+@\s*(.+)$", re.MULTILINE)
+_BRANCH_RE = re.compile(r"^branch:\s*(.+)$", re.MULTILINE)
+_EPIC_RE = re.compile(r"^epic:\s*(.+)$", re.MULTILINE)
+
+
+def _resolve_artifact_path(description: str, team: str, labels: list[str]) -> str:
+    """Return the absolute filesystem path to the artifact, or '—'."""
+    desc = description or ""
+
+    # 1. Try explicit artifact: line (includes branch context after @)
+    m = _ARTIFACT_RE.search(desc)
+    if m:
+        rel_path = m.group(1).strip()
+        branch = m.group(2).strip()
+    else:
+        # 2. No artifact: line — infer from branch + target
+        branch_m = _BRANCH_RE.search(desc)
+        branch = branch_m.group(1).strip() if branch_m else ""
+        epic_m = _EPIC_RE.search(desc)
+        epic_id = epic_m.group(1).strip() if epic_m else ""
+
+        targets = [l for l in labels or [] if l.startswith("target:")]
+        target = targets[0].split(":", 1)[1] if targets else ""
+
+        if target == "breakdown" and epic_id:
+            rel_path = f"breakdowns/{epic_id}.md"
+        elif target == "plan" and epic_id:
+            rel_path = f"plans/{epic_id}.md"
+        else:
+            return "—"
+
+    if not branch:
+        return "—"
+
+    # Worktree directory name is the last path component of the branch
+    # e.g. "task/health-kb-sdg" → "health-kb-sdg"
+    worktree_name = branch.split("/")[-1]
+    full = TEAMS_DIR / team / ".cto" / "worktrees" / worktree_name / rel_path
+    return str(full)
 
 
 def _kind(labels: list[str]) -> str:
@@ -299,9 +343,6 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
 
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
-    t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
-    t.add_column("WINDOW", overflow="ellipsis", no_wrap=True)
-    t.add_column("PROVIDER", overflow="ellipsis", no_wrap=True)
     t.add_column("MODEL", overflow="ellipsis", no_wrap=True)
     t.add_column("STATUS", overflow="ellipsis", no_wrap=True)
     t.add_column("ISSUE", overflow="ellipsis", no_wrap=True, ratio=2)
@@ -309,9 +350,6 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
 
     for row in agents:
         agent = row["agent"]
-        team = row["team"]
-        w = row["window"]
-        provider = row.get("provider", "claude")
         model = row.get("model", "—")
         issue = row["issue"]
         if issue:
@@ -321,21 +359,14 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
             title = _truncate(issue.get("title", ""), 50)
             t.add_row(
                 agent,
-                team,
-                w,
-                provider,
                 model,
                 Text("working", style="green"),
                 Text(f"{issue['id']}  {title}"),
                 Text(elapsed, style="green"),
             )
-        elif w == "manager":
-            t.add_row(
-                agent, team, w, provider, model, Text("active", style="yellow"), Text("—", style="dim"), "—"
-            )
         else:
             t.add_row(
-                agent, team, w, provider, model, Text("idle", style="dim"), Text("—", style="dim"), "—"
+                agent, model, Text("idle", style="dim"), Text("—", style="dim"), "—"
             )
     return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
 
@@ -344,19 +375,30 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
     t.add_column("ID", overflow="ellipsis", no_wrap=True)
-    t.add_column("TITLE", overflow="ellipsis", no_wrap=True, ratio=3)
+    t.add_column("TITLE", overflow="ellipsis", no_wrap=True, ratio=2)
+    t.add_column("ARTIFACT", no_wrap=False, ratio=2)
     t.add_column("LABELS", overflow="ellipsis", no_wrap=True, ratio=1)
     if inbox:
         for row in inbox:
             labels = ",".join(
                 lbl for lbl in row.get("labels", []) if not lbl.startswith("role:cto")
             )
-            t.add_row(row["team"], row["id"], row.get("title", ""), Text(labels, style="dim"))
+            artifact = _resolve_artifact_path(
+                row.get("description", ""), row["team"], row.get("labels", [])
+            )
+            t.add_row(
+                row["team"],
+                row["id"],
+                row.get("title", ""),
+                Text(artifact, style="cyan"),
+                Text(labels, style="dim"),
+            )
     else:
         t.add_row(
             Text("—", style="dim"),
             Text("—", style="dim"),
             Text("(nothing waiting on the CTO)", style="dim"),
+            Text("—", style="dim"),
             Text("—", style="dim"),
         )
     return Panel(
@@ -563,7 +605,7 @@ def stdin_quit_pressed(timeout: float) -> bool:
 
 def main() -> int:
     with cbreak_stdin():
-        with Live(refresh_per_second=4, screen=True) as live:
+        with Live(screen=False, auto_refresh=False, transient=True, vertical_overflow="crop") as live:
             try:
                 while True:
                     t0 = time.monotonic()
@@ -579,6 +621,7 @@ def main() -> int:
                             gather_ms=gather_ms,
                         )
                     )
+                    live.refresh()
                     if stdin_quit_pressed(KEY_POLL_S):
                         break
             except KeyboardInterrupt:
