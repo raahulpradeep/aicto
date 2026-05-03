@@ -924,7 +924,7 @@ cmd_update() {
     for i in $(seq 1 30); do
       sleep 2
       local closed
-      closed=$(cd "$tdir" && bd show "$req_id" --json 2>/dev/null | jq -r '.status // ""')
+      closed=$(cd "$tdir" && bd show "$req_id" --json 2>/dev/null | jq -r '.[0].status // ""')
       if [[ "$closed" == "closed" ]]; then
         break
       fi
