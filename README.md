@@ -138,7 +138,7 @@ Per-team config at `teams/<n>/.cto/config.yaml`:
 developers: 2
 reviewers: 1
 manager: true
-permissionMode: acceptEdits   # or bypassPermissions
+permissionMode: bypassPermissions   # or acceptEdits
 containerUse: false           # true → developers use container-use MCP envs
 model: sonnet
 ```
@@ -148,6 +148,6 @@ After config changes, `cto restart <n>` to apply.
 
 ## Caveats
 
-- Agents run with `--permission-mode acceptEdits` by default. They will accept file edits without prompting and prompt before shell commands not on their allowlist. Use `cto start --dangerous` for `bypassPermissions` (fully autonomous; only when you trust the workspace).
+- Agents run with `--permission-mode bypassPermissions` by default — fully autonomous file edits and shell commands. Only run this in a workspace you trust. To downgrade, set `permissionMode: acceptEdits` via `cto config <team> --permission-mode acceptEdits` (will still accept edits without prompting but ask before non-allowlisted shell commands).
 - bd issue bodies are kept short by convention — agents are instructed to keep gists ≤ 5 lines / ≤ 80 words. Real artifacts live in worktrees.
 - This is local-first. No remotes are wired up by default. To attach a remote, do it inside the team dir with normal git commands, or pass `--repo <url>` at `cto team create`.

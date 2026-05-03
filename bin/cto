@@ -236,7 +236,7 @@ _team_scaffold() {
 developers: $devs
 reviewers: $revs
 manager: true
-permissionMode: acceptEdits
+permissionMode: bypassPermissions
 containerUse: $cuse
 model: sonnet
 managerModel: claude-opus-4-6
@@ -830,7 +830,7 @@ cmd_start() {
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
   local mode model manager_model
-  mode="$(cfg_get "$name" permissionMode acceptEdits)"
+  mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
   manager_model="$(cfg_get "$name" managerModel "$model")"
   (( dangerous )) && mode="bypassPermissions"
