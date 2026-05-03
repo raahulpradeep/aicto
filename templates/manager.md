@@ -134,7 +134,13 @@ EOF
 
 ### 7. Ship epics (CTO-only merge to main) — AUTOMATED
 
-**The supervisor hook handles this automatically.** When all children of an epic are closed, the supervisor files `kind:merge target:epic` for the CTO inbox. Do **not** do this manually.
+**The supervisor hook handles this automatically, running LAST after all other hooks have filed new work.** The gate is:
+
+1. All linked children of the epic are closed (`bd dep list <epic> --direction=up` shows no `open`).
+2. **AND** there are no open `kind:dev` or `kind:review` issues whose description references this epic (`bd list --status open -l kind:dev,kind:review --json` filtered by `epic: <epic-id>`).
+3. **AND** no epic-merge issue is already open for this epic.
+
+Only if all three conditions pass does the supervisor file `kind:merge target:epic` for the CTO inbox. Do **not** do this manually.
 
 The CTO ships the epic via `cto merge-epic {{TEAM}} <epic-id>` or `cto approve {{TEAM}} <merge-id>`. Do **not** close the epic itself, do **not** merge into `main`, and do **not** prune the epic worktree.
 

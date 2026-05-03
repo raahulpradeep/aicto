@@ -1230,25 +1230,6 @@ epic: $epic" \
       fi
     fi
 
-    # Hook 3: manager files epic merge when all children are closed
-    if [[ "$ROLE" == "manager" ]]; then
-      for epic in $(bd list --status open -l kind:epic --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
-        open_children=$(bd dep list "$epic" --direction=up 2>/dev/null | grep -c "open" || true)
-        if [[ "$open_children" == "0" ]]; then
-          existing=$(bd list --status open -l kind:merge,target:epic --json 2>/dev/null \
-                     | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
-          if [[ "$existing" == "0" ]]; then
-            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
-            bd create -t task -l "role:cto,kind:merge,target:epic" -p 1 \
-              -d "epic: $epic
-epic-branch: epic/$epic" \
-              "Merge epic: $epic_title" >/dev/null 2>&1 || true
-            log "filed epic merge for $epic"
-          fi
-        fi
-      done
-    fi
-
     # Hook 4: after breakdown merge, file plan + review:plan
     if [[ "$ROLE" == "manager" ]]; then
       for merge in $(bd list --status closed -l kind:merge,target:breakdown --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
@@ -1324,6 +1305,32 @@ Review diff on branch task/$dev_id against epic/$epic." \
                   log "filed dev $dev_id + review:code $rev_id for epic $epic (full plan)"
                 fi
               fi
+            fi
+          fi
+        fi
+      done
+    fi
+
+    # Hook 3: manager files epic merge when all children are closed
+    # This runs LAST so that Hooks 4 and 5 have a chance to file new
+    # children before we evaluate the "all done" condition.
+    if [[ "$ROLE" == "manager" ]]; then
+      for epic in $(bd list --status open -l kind:epic --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
+        open_children=$(bd dep list "$epic" --direction=up 2>/dev/null | grep -c "open" || true)
+        if [[ "$open_children" == "0" ]]; then
+          # Gate: also check for any open dev/review issues referencing this epic
+          open_work=$(bd list --status open -l kind:dev,kind:review --json 2>/dev/null \
+                      | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
+          if [[ "$open_work" == "0" ]]; then
+            existing=$(bd list --status open -l kind:merge,target:epic --json 2>/dev/null \
+                       | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
+            if [[ "$existing" == "0" ]]; then
+              epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
+              bd create -t task -l "role:cto,kind:merge,target:epic" -p 1 \
+                -d "epic: $epic
+epic-branch: epic/$epic" \
+                "Merge epic: $epic_title" >/dev/null 2>&1 || true
+              log "filed epic merge for $epic"
             fi
           fi
         fi
