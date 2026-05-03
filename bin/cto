@@ -602,8 +602,8 @@ cmd_approve() {
   # Snapshot the approval's labels + description before we close it.
   local issue_json labels desc
   issue_json=$(cd "$tdir" && bd show "$id" --json 2>/dev/null) || die "approve: cannot read $id"
-  labels=$(jq -r '.labels // [] | join(",")' <<<"$issue_json")
-  desc=$(jq -r '.description // ""' <<<"$issue_json")
+  labels=$(jq -r '.[0].labels // [] | join(",")' <<<"$issue_json")
+  desc=$(jq -r '.[0].description // ""' <<<"$issue_json")
 
   ( cd "$tdir" \
       && bd comment "$id" "$comment" >/dev/null \
