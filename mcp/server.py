@@ -204,9 +204,11 @@ def merge(
 
 @mcp.tool()
 def merge_epic(team: str, epic_id: str, comment: Optional[str] = None) -> str:
-    """CTO-only: merge `epic/<epic-id>` into `main` from the team's main
-    worktree. Closes the open `kind:merge target:epic` issue, closes the
-    epic, and prunes the epic worktree + branch. Idempotent.
+    """CTO-only: merge `epic/<epic-id>` into the target branch from the
+    team's main worktree. The merge target is determined by the
+    `parent_branch` value stored in the epic's description (defaulting to
+    `main` when not set). Closes the open `kind:merge target:epic` issue,
+    closes the epic, and prunes the epic worktree + branch. Idempotent.
 
     Surfaces in `cto inbox` as a `role:cto kind:merge target:epic` issue
     that the manager files when the epic's sub-branches are all merged
