@@ -200,6 +200,7 @@ Usage:
   cto update <team> [--fresh]
   cto top                                   # live top-style dashboard
 
+  cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into main
   cto worktrees <team>
   cto worktrees prune <team>
   cto exec <team> -- <cmd…>
@@ -502,11 +503,23 @@ cmd_task() {
 # manually by the CTO to unstick a workflow when an automatic merge issue
 # wasn't filed (e.g. an approval that closed before the auto-merge logic
 # was wired up).
+#
+# In the per-epic-branch model, sub-merges (breakdown/plan/code) target
+# epic/<epic-id>, not main. The merge issue carries target:<value> so the
+# manager knows what's being merged where.
 
 cmd_merge() {
-  local team="${1:-}" branch="${2:-}"
+  local team="${1:-}" branch="${2:-}"; shift 2 2>/dev/null || true
   require_team "$team"
-  [[ -n "$branch" ]] || die "usage: cto merge <team> <branch>"
+  [[ -n "$branch" ]] || die "usage: cto merge <team> <branch> [--target breakdown|plan|code] [--epic <epic-id>]"
+  local target="" epic=""
+  while (( $# )); do
+    case "$1" in
+      --target) target="$2"; shift 2 ;;
+      --epic)   epic="$2";   shift 2 ;;
+      *) die "unknown merge flag: $1" ;;
+    esac
+  done
   local tdir; tdir="$(team_dir "$team")"
 
   # Dedup: skip if there's already an open kind:merge issue for this
@@ -523,15 +536,107 @@ cmd_merge() {
     warn "branch '$branch' not found in $tdir — filing merge issue anyway"
   fi
 
+  local labels="role:manager,kind:merge"
+  [[ -n "$target" ]] && labels="$labels,target:$target"
+
+  local merge_into="main"
+  [[ -n "$epic" ]] && merge_into="epic/$epic"
+
+  local desc="branch: $branch
+filed-by: CTO (manual)"
+  [[ -n "$epic" ]] && desc="$desc
+epic: $epic"
+  desc="$desc
+action: merge --no-ff into $merge_into, prune the sub-worktree, close this issue."
+
   local mid
   mid=$(cd "$tdir" && bd create -t task \
-          -l "role:manager,kind:merge" -p 1 \
-          -d "branch: $branch
-filed-by: CTO (manual)
-action: merge --no-ff into main, prune the worktree, close this issue." \
+          -l "$labels" -p 1 \
+          -d "$desc" \
           --silent \
           "Merge $branch")
-  info "filed merge issue $mid for $branch"
+  info "filed merge issue $mid for $branch (into $merge_into)"
+}
+
+# ---- merge-epic ----------------------------------------------------------
+#
+# CTO-only. Merge epic/<epic-id> into main from the team's main worktree.
+# Closes the open kind:merge target:epic issue, closes the epic itself,
+# and prunes the epic worktree + branch. Idempotent: safe to re-run.
+
+cmd_merge_epic() {
+  local team="${1:-}" epic_id="${2:-}"; shift 2 2>/dev/null || true
+  require_team "$team"
+  [[ -n "$epic_id" ]] || die "usage: cto merge-epic <team> <epic-id>"
+  local comment="merged by CTO"
+  while (( $# )); do
+    case "$1" in
+      --comment|-c) comment="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local tdir; tdir="$(team_dir "$team")"
+  local epic_branch="epic/$epic_id"
+
+  if ! git -C "$tdir" show-ref --verify --quiet "refs/heads/$epic_branch"; then
+    warn "epic branch '$epic_branch' not found — nothing to merge"
+  else
+    # Verify the team's main worktree is on main; refuse to coerce.
+    local head
+    head="$(git -C "$tdir" symbolic-ref --short HEAD 2>/dev/null || true)"
+    [[ "$head" == "main" ]] || die "merge-epic: team main worktree is on '$head', not main; refusing to checkout"
+
+    info "merging $epic_branch into main"
+    # Agents are constantly writing to .beads/issues.jsonl while the team is
+    # running. Stash bd state in the main worktree (if dirty) so the merge
+    # proceeds cleanly, then pop it back.
+    local stashed=0
+    if ! git -C "$tdir" diff --quiet -- .beads 2>/dev/null \
+       || ! git -C "$tdir" diff --cached --quiet -- .beads 2>/dev/null; then
+      if git -C "$tdir" stash push -u -m "cto-merge-epic-$epic_id" -- .beads >/dev/null 2>&1; then
+        stashed=1
+      fi
+    fi
+
+    if ! git -C "$tdir" -c commit.gpgsign=false merge --no-ff "$epic_branch" -m "merge $epic_branch"; then
+      warn "merge failed (likely conflict). Resolve in $tdir, then re-run cto merge-epic $team $epic_id."
+      (( stashed )) && git -C "$tdir" stash pop >/dev/null 2>&1 || true
+      return 1
+    fi
+    (( stashed )) && git -C "$tdir" stash pop >/dev/null 2>&1 || true
+  fi
+
+  # Close the open merge-epic issue, if any.
+  local merge_id
+  merge_id=$(cd "$tdir" && bd list --status open --label "kind:merge" --label "target:epic" --json 2>/dev/null \
+              | jq -r --arg e "$epic_branch" '.[] | select(.description // "" | contains($e)) | .id' | head -1)
+  if [[ -n "$merge_id" ]]; then
+    ( cd "$tdir" \
+        && bd comment "$merge_id" "$comment" >/dev/null \
+        && bd update "$merge_id" --add-label "verdict:approved" >/dev/null \
+        && bd close   "$merge_id" -r "$comment" >/dev/null )
+    info "closed merge-epic issue $merge_id"
+  fi
+
+  # Close the epic itself if it's still open. epic_id IS the bd issue id.
+  local epic_status
+  epic_status=$(cd "$tdir" && bd show "$epic_id" --json 2>/dev/null \
+                | jq -r 'if type=="array" then .[0].status // "" else .status // "" end' 2>/dev/null || true)
+  if [[ "$epic_status" == "open" || "$epic_status" == "in_progress" ]]; then
+    ( cd "$tdir" && bd close "$epic_id" -r "epic merged into main by CTO" >/dev/null ) || true
+    info "closed epic $epic_id"
+  fi
+
+  # Prune the epic worktree + branch.
+  if [[ -d "$tdir/.cto/worktrees/$epic_id" ]]; then
+    git -C "$tdir" worktree remove --force "$tdir/.cto/worktrees/$epic_id" 2>/dev/null || true
+    info "removed epic worktree .cto/worktrees/$epic_id"
+  fi
+  if git -C "$tdir" show-ref --verify --quiet "refs/heads/$epic_branch"; then
+    git -C "$tdir" branch -D "$epic_branch" 2>/dev/null || true
+    info "deleted branch $epic_branch"
+  fi
 }
 
 # ---- promote -------------------------------------------------------------
@@ -606,6 +711,23 @@ cmd_approve() {
   labels=$(jq -r '.[0].labels // [] | join(",")' <<<"$issue_json")
   desc=$(jq -r '.[0].description // ""' <<<"$issue_json")
 
+  # Special case: CTO approving a kind:merge target:epic = "ship the epic".
+  # Delegate to cmd_merge_epic which executes the actual git merge,
+  # closes the merge issue + epic, and prunes the worktree/branch.
+  if [[ "$labels" == *"kind:merge"* && "$labels" == *"target:epic"* ]]; then
+    local epic_id
+    epic_id=$(grep -oE 'epic[- ]?branch:[[:space:]]*epic/[A-Za-z0-9._-]+' <<<"$desc" \
+              | head -1 | sed 's|.*epic/||' || true)
+    if [[ -z "$epic_id" ]]; then
+      epic_id=$(grep -oE 'epic:[[:space:]]*[A-Za-z0-9._-]+' <<<"$desc" \
+                | head -1 | awk -F: '{print $2}' | tr -d '[:space:]' || true)
+    fi
+    [[ -n "$epic_id" ]] || die "approve: cannot find epic id in merge-epic issue $id description"
+    info "target:epic approval — running cto merge-epic $name $epic_id"
+    cmd_merge_epic "$name" "$epic_id" --comment "$comment"
+    return
+  fi
+
   ( cd "$tdir" \
       && bd comment "$id" "$comment" >/dev/null \
       && bd update "$id" --add-label "verdict:approved" >/dev/null \
@@ -613,10 +735,10 @@ cmd_approve() {
   info "approved $id in team $name"
 
   # If this was a CTO approval of a breakdown or plan, the next workflow
-  # step is "manager merges the relevant branch". Auto-file the merge
-  # issue so the team doesn't stall waiting on the human.
+  # step is "manager merges the relevant branch into epic/<id>". Auto-file
+  # the merge issue so the team doesn't stall waiting on the human.
   if [[ "$labels" == *"kind:approval"* ]]; then
-    local target="" branch=""
+    local target="" branch="" epic_id=""
     case "$labels" in
       *target:breakdown*) target=breakdown ;;
       *target:plan*)      target=plan ;;
@@ -625,9 +747,18 @@ cmd_approve() {
     # like "branch manager/<id>" or "branch: manager/<id>" or
     # "@ branch task/<id>". Extract whichever shows up first.
     branch=$(grep -oE '(manager|task)/[A-Za-z0-9._-]+' <<<"$desc" | head -1 || true)
+    # Extract epic id (manager prompt always includes "epic: <id>" in the gist).
+    epic_id=$(grep -oE 'epic:[[:space:]]*[A-Za-z0-9._-]+' <<<"$desc" \
+              | head -1 | awk -F: '{print $2}' | tr -d '[:space:]' || true)
 
     if [[ -n "$target" && -n "$branch" ]]; then
-      cmd_merge "$name" "$branch"   # dedups internally
+      if [[ -n "$epic_id" ]]; then
+        cmd_merge "$name" "$branch" --target "$target" --epic "$epic_id"
+      else
+        # Legacy in-flight epic that pre-dates the per-epic-branch model.
+        warn "approval $id has no 'epic:' line — filing legacy main-targeted merge"
+        cmd_merge "$name" "$branch" --target "$target"
+      fi
     elif [[ -n "$target" ]]; then
       warn "approval was for $target but no branch name found in description; no merge issue filed"
     fi
@@ -1040,9 +1171,33 @@ cmd_worktrees() {
   case "$sub" in
     prune)
       git -C "$tdir" worktree prune -v
+      # Snapshot live epic/* heads once so we can check sub-branches against any of them.
+      local epic_refs=()
+      while IFS= read -r r; do [[ -n "$r" ]] && epic_refs+=("$r"); done < <(
+        git -C "$tdir" for-each-ref --format='%(refname:short)' 'refs/heads/epic/' 2>/dev/null
+      )
       while IFS=$'\t' read -r path branch; do
         [[ -z "$path" || "$path" == "$tdir" ]] && continue
-        if git -C "$tdir" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+        local merged=0
+        # epic/* branches are only safe to prune once they've landed on main.
+        if [[ "$branch" == epic/* ]]; then
+          if git -C "$tdir" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+            merged=1
+          fi
+        else
+          # Sub-branches: merged to main OR to any open epic branch.
+          if git -C "$tdir" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+            merged=1
+          else
+            local ep
+            for ep in "${epic_refs[@]}"; do
+              if git -C "$tdir" merge-base --is-ancestor "$branch" "$ep" 2>/dev/null; then
+                merged=1; break
+              fi
+            done
+          fi
+        fi
+        if (( merged )); then
           info "removing merged worktree: $path ($branch)"
           git -C "$tdir" worktree remove "$path" 2>/dev/null || true
           git -C "$tdir" branch -d "$branch" 2>/dev/null || true
@@ -1099,6 +1254,7 @@ main() {
     task)      cmd_task      "$@" ;;
     promote)   cmd_promote   "$@" ;;
     merge)     cmd_merge     "$@" ;;
+    merge-epic) cmd_merge_epic "$@" ;;
     inbox)     cmd_inbox     "$@" ;;
     approve)   cmd_approve   "$@" ;;
     reject)    cmd_reject    "$@" ;;

@@ -168,13 +168,41 @@ def task(
 
 
 @mcp.tool()
-def merge(team: str, branch: str) -> str:
-    """File a kind:merge role:manager bd issue for `branch`. Use to
-    manually unstick a workflow when an auto-merge issue wasn't filed
-    (e.g. legacy approvals closed before auto-merge was wired up). The
-    `cto approve` flow now auto-files merge issues; this is the manual
-    escape hatch."""
-    return _run(["merge", team, branch])
+def merge(
+    team: str,
+    branch: str,
+    target: Optional[str] = None,
+    epic: Optional[str] = None,
+) -> str:
+    """File a kind:merge role:manager bd issue for `branch`. The manager
+    will execute it (merging into epic/<epic-id> when `epic` is given,
+    else into `main` for legacy in-flight epics). Use as a manual escape
+    hatch — `cto approve` already auto-files sub-merge issues.
+
+    `target` is breakdown|plan|code (added as a label so the manager
+    knows what's being merged)."""
+    args = ["merge", team, branch]
+    if target:
+        args += ["--target", target]
+    if epic:
+        args += ["--epic", epic]
+    return _run(args)
+
+
+@mcp.tool()
+def merge_epic(team: str, epic_id: str, comment: Optional[str] = None) -> str:
+    """CTO-only: merge `epic/<epic-id>` into `main` from the team's main
+    worktree. Closes the open `kind:merge target:epic` issue, closes the
+    epic, and prunes the epic worktree + branch. Idempotent.
+
+    Surfaces in `cto inbox` as a `role:cto kind:merge target:epic` issue
+    that the manager files when the epic's sub-branches are all merged
+    into the feature branch and tests pass. Equivalent to running
+    `cto approve` on that inbox item — both paths execute the merge."""
+    args = ["merge-epic", team, epic_id]
+    if comment:
+        args += ["--comment", comment]
+    return _run(args)
 
 
 @mcp.tool()
@@ -285,7 +313,10 @@ def worktrees(name: str) -> str:
 
 @mcp.tool()
 def worktrees_prune(name: str) -> str:
-    """Garbage-collect worktrees whose branch is fully merged into main."""
+    """Garbage-collect worktrees whose branch is fully merged into `main`
+    OR into any open `epic/*` feature branch (so completed sub-branches
+    of in-flight epics are reclaimed without waiting for the epic to
+    ship)."""
     return _run(["worktrees", "prune", name])
 
 

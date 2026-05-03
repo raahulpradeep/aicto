@@ -31,19 +31,27 @@ Inspect labels: `kind:plan` (you are the planner) or `kind:dev` (you implement).
 
 Inspect the labels on the claimed issue to know what kind of work it is.
 
-**If `kind:plan`** — you are the planner for the epic. The breakdown is already on `main` at `breakdowns/<epic-id>.md`. Read it.
+Every plan/dev/review issue includes an `epic: <epic-id>` line in its description — that's your base branch. Extract it once:
 
-**If `kind:dev`** — the plan is on `main` at `plans/<epic-id>.md`. Read the relevant section.
+```
+EPIC_ID=$(bd show <id> --json | jq -r '.[0].description' | grep -oE 'epic:[[:space:]]*[A-Za-z0-9._-]+' | head -1 | awk -F: '{print $2}' | tr -d '[:space:]')
+```
+
+**If `kind:plan`** — you are the planner. The breakdown is on `epic/$EPIC_ID` at `breakdowns/$EPIC_ID.md`. Read it.
+
+**If `kind:dev`** — the plan is on `epic/$EPIC_ID` at `plans/$EPIC_ID.md`. Read the relevant section.
 
 #### Default mode (`containerUse: false`)
 
-Create your worktree from `{{TEAM_DIR}}`:
+Create your worktree from `{{TEAM_DIR}}`, **branched off the epic feature branch** (never `main`):
 
 ```
 cd {{TEAM_DIR}}
-git worktree add .cto/worktrees/<id> -b task/<id> main
+git worktree add .cto/worktrees/<id> -b task/<id> epic/$EPIC_ID
 cd .cto/worktrees/<id>
 ```
+
+Do not touch `.cto/worktrees/$EPIC_ID/` — that's the manager's staging area for sub-merges into the epic branch.
 
 #### Sandboxed mode (`containerUse: true`)
 
@@ -83,6 +91,7 @@ Multiple commits are fine. Do not amend or rebase shared history. Do **not** mer
 
 ```
 bd close <id> -r "$(cat <<'EOF'
+epic: <epic-id>
 artifact: <path-on-branch>
 branch: task/<id>            # or env: <container-use-env-id>
 files: 5 changed, 132 +, 9 -

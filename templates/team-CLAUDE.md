@@ -7,7 +7,7 @@ This repository is a **team workspace** owned by an AI CTO. Multiple Claude Code
 ## How this team operates
 
 - One **manager**, {{N_DEVS}} **developers**, {{N_REVIEWERS}} **reviewers** (configured in `.cto/config.yaml`).
-- All work-in-progress lives in **per-task worktrees** at `.cto/worktrees/<issue-id>` on branches `manager/<id>` (manager) or `task/<id>` (developers).
+- Each epic gets its own long-lived feature branch `epic/<epic-id>` and worktree at `.cto/worktrees/<epic-id>/`. **All sub-branches** (`manager/<id>`, `task/<id>`) are carved off the epic branch and live in sibling sub-worktrees at `.cto/worktrees/<issue-id>/`. The team's main worktree always stays on `main`. The manager merges sub-branches **into the epic worktree**; only the **CTO** merges `epic/<id>` into `main`.
 - bd lives in the **main worktree only**. All bd commands run from `{{TEAM_DIR}}`.
 - `containerUse: {{CONTAINER_USE}}` — when true, developers use the `container-use` MCP tools instead of bare git worktrees.
 
@@ -21,7 +21,8 @@ This repository is a **team workspace** owned by an AI CTO. Multiple Claude Code
 | `kind:dev` | Developer-authored implementation. |
 | `kind:review` + `target:plan|code` | Reviewer's read of a plan or code diff. |
 | `kind:approval` + `target:breakdown|plan` | CTO's final sign-off. |
-| `kind:merge` | Manager merges a branch into `main`. |
+| `kind:merge` + `target:breakdown|plan|code` | Manager merges a sub-branch into `epic/<epic-id>` (never `main`). |
+| `kind:merge` + `target:epic` + `role:cto` | **CTO-only.** Manager files this when the epic is complete; CTO runs `cto merge-epic` to merge `epic/<id>` into `main`. |
 | `kind:status-digest` / `kind:status-request` | Manager↔CTO status protocol. |
 
 | label | meaning |
@@ -34,7 +35,8 @@ This repository is a **team workspace** owned by an AI CTO. Multiple Claude Code
 2. The reviewer must close `kind:review target:plan` (approved) before they file `kind:approval target:plan`.
 3. The CTO must close `kind:approval target:plan` before any `kind:dev` is filed.
 4. The reviewer must close `kind:review target:code` (approved) before a `kind:merge` is filed for that dev branch.
-5. Only the manager merges, only via a `kind:merge` issue.
+5. The manager merges sub-branches into `epic/<epic-id>`, only via a `kind:merge target:breakdown|plan|code` issue.
+6. **Only the CTO merges `epic/<id>` into `main`**, via `cto merge-epic` (or `cto approve` on the manager-filed `kind:merge target:epic role:cto` issue). The manager never touches `main`.
 
 ## Gist discipline
 
