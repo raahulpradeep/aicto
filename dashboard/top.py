@@ -1,11 +1,20 @@
 #!/usr/bin/env -S uv run --quiet --with rich python
 """Live `top`-style dashboard for the AI CTO workspace.
 
-Shows two panels:
-  1. Per-agent state across every running team (one row per tmux window).
-  2. Open issues with role:cto across all teams (the human's inbox).
+Four panels:
+  1. Agents       — one row per tmux window across every running team.
+  2. CTO inbox    — open issues with role:cto across all teams.
+  3. Open tasks   — open work nobody's holding (excludes role:cto + status meta).
+  4. Recently closed — last 5 closures across all teams.
 
-Refreshes ~1s. Quit with `q` or Ctrl-C. Read-only.
+Refreshes ~1s. Quit with `q`, `Q`, `Esc`, or Ctrl-C. Read-only.
+
+Known limitation: `bd list --status closed --json` doesn't include the
+`assignee` or `started_at` fields, so:
+  * "CLOSED-BY" is best-effort: derived from labels (verdict:approved →
+    "CTO", or the `role:*` label).
+  * "RESOLVE-TIME" is full lifecycle (`closed_at - created_at`), not
+    claim-to-close.
 """
 from __future__ import annotations
 
@@ -31,10 +40,12 @@ from rich.text import Text
 ROOT = Path(__file__).resolve().parent.parent
 TEAMS_DIR = ROOT / "teams"
 KEY_POLL_S = 0.25  # how often we wake to check stdin for q
+RECENT_CLOSED_LIMIT = 5
+RECENT_CLOSED_SCAN_PER_TEAM = 30  # bd -n; we sort+trim across teams afterward
 # Module-level executor reused across refreshes — bd subprocesses are
 # expensive (each invocation cold-starts dolt), so we run the per-team
 # queries in parallel.
-_POOL = ThreadPoolExecutor(max_workers=8)
+_POOL = ThreadPoolExecutor(max_workers=12)
 
 
 # ---- shell helpers --------------------------------------------------------
@@ -70,7 +81,7 @@ def tmux_windows(session: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-# ---- data gather ----------------------------------------------------------
+# ---- bd query -------------------------------------------------------------
 
 
 def _bd_json(args: list[str], cwd: Path) -> list:
@@ -80,60 +91,80 @@ def _bd_json(args: list[str], cwd: Path) -> list:
         return []
 
 
-def _gather_team(team: str, tdir: Path) -> tuple[list[dict], list[dict]] | None:
-    """Pull all per-team data we need in one go.
+# ---- data shapers ---------------------------------------------------------
 
-    Runs the two bd queries in parallel — each is a separate dolt
-    cold-start so they're hundreds of ms apiece; firing them concurrently
-    roughly halves wall-clock per team.
+
+META_LABELS = {"kind:status-digest", "kind:status-request"}
+
+
+def _kind(labels: list[str]) -> str:
+    for lbl in labels or []:
+        if lbl.startswith("kind:"):
+            return lbl[len("kind:") :]
+    return "—"
+
+
+def _is_meta(labels: list[str]) -> bool:
+    return any(lbl in META_LABELS for lbl in labels or [])
+
+
+def _classify_closed(issue: dict) -> str:
+    """Best-effort closer identification for a closed bd issue.
+
+    bd doesn't track an explicit closer; we fall back to label hints.
     """
-    sess = f"cto-{team}"
-    if not tmux_alive(sess):
+    labels = issue.get("labels") or []
+    if "verdict:approved" in labels or "verdict:rejected" in labels:
+        return "CTO"
+    for lbl in labels:
+        if lbl.startswith("role:") and lbl != "role:cto":
+            return lbl[len("role:") :]
+    return "—"
+
+
+def _human_duration(seconds: int) -> str:
+    if seconds < 0:
+        return "—"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{m}m {s}s" if s and m < 10 else f"{m}m"
+    if seconds < 86400:
+        h, rem = divmod(seconds, 3600)
+        m, _ = divmod(rem, 60)
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, rem = divmod(seconds, 86400)
+    h, _ = divmod(rem, 3600)
+    return f"{d}d {h}h" if h else f"{d}d"
+
+
+def _parse_iso(s: str) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
         return None
 
-    windows = tmux_windows(sess)
-    f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
-    f_cto = _POOL.submit(_bd_json, ["list", "--status", "open", "-l", "role:cto"], tdir)
-    ip = f_ip.result()
-    cto_issues = f_cto.result()
 
-    ip_by_assignee = {i.get("assignee"): i for i in ip if i.get("assignee")}
-    agent_rows = [
-        {"agent": f"{team}:{w}", "team": team, "window": w, "issue": ip_by_assignee.get(f"{team}:{w}")}
-        for w in windows
-    ]
-    inbox_rows = [
-        {"team": team, "id": i.get("id", ""), "title": i.get("title", ""), "labels": i.get("labels", [])}
-        for i in cto_issues
-    ]
-    return agent_rows, inbox_rows
+def _resolve_time(issue: dict) -> str:
+    end = _parse_iso(issue.get("closed_at") or "")
+    start = _parse_iso(issue.get("started_at") or "") or _parse_iso(issue.get("created_at") or "")
+    if not (end and start):
+        return "—"
+    return _human_duration(int((end - start).total_seconds()))
 
 
-def gather() -> tuple[list[dict], list[dict], list[str]]:
-    """Return (agent_rows, inbox_rows, running_team_names)."""
-    agents: list[dict] = []
-    inbox: list[dict] = []
-    running: list[str] = []
-
-    if not TEAMS_DIR.is_dir():
-        return agents, inbox, running
-
-    teams = [p for p in sorted(TEAMS_DIR.iterdir()) if p.is_dir() and (p / ".cto").is_dir()]
-    # Fan out per-team gather across the pool so multi-team workspaces
-    # don't add up linearly.
-    futures = {team.name: _POOL.submit(_gather_team, team.name, team) for team in teams}
-    for team_name, fut in futures.items():
-        result = fut.result()
-        if result is None:
-            continue
-        running.append(team_name)
-        a_rows, i_rows = result
-        agents.extend(a_rows)
-        inbox.extend(i_rows)
-    return agents, inbox, running
+def _age(issue: dict, now: dt.datetime) -> str:
+    created = _parse_iso(issue.get("created_at") or "")
+    if not created:
+        return "—"
+    return _human_duration(int((now - created).total_seconds()))
 
 
-# ---- render ---------------------------------------------------------------
+def _truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def _fmt_elapsed(seconds: int) -> str:
@@ -144,16 +175,93 @@ def _fmt_elapsed(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
-def _truncate(s: str, n: int) -> str:
-    return s if len(s) <= n else s[: n - 1] + "…"
+# ---- per-team gather ------------------------------------------------------
 
 
-def render(agents: list[dict], inbox: list[dict], running: list[str], gather_ms: int = 0) -> Layout:
-    now = dt.datetime.now(dt.timezone.utc)
+def _gather_team(team: str, tdir: Path):
+    """Return (agent_rows, inbox_rows, open_rows, closed_rows) or None.
 
-    # ---- agents table ----
+    Three bd queries fired in parallel; the broader `--status open`
+    query covers both the CTO inbox and the Open Tasks panels.
+    """
+    sess = f"cto-{team}"
+    if not tmux_alive(sess):
+        return None
+
+    windows = tmux_windows(sess)
+    f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
+    f_open = _POOL.submit(_bd_json, ["list", "--status", "open"], tdir)
+    f_closed = _POOL.submit(
+        _bd_json,
+        ["list", "--status", "closed", "-n", str(RECENT_CLOSED_SCAN_PER_TEAM)],
+        tdir,
+    )
+    ip = f_ip.result()
+    op = f_open.result()
+    cl = f_closed.result()
+
+    ip_by_assignee = {i["assignee"]: i for i in ip if i.get("assignee")}
+    agent_rows = [
+        {
+            "agent": f"{team}:{w}",
+            "team": team,
+            "window": w,
+            "issue": ip_by_assignee.get(f"{team}:{w}"),
+        }
+        for w in windows
+    ]
+
+    inbox_rows = [
+        {"team": team, **i} for i in op if "role:cto" in (i.get("labels") or [])
+    ]
+    open_rows = [
+        {"team": team, **i}
+        for i in op
+        if "role:cto" not in (i.get("labels") or []) and not _is_meta(i.get("labels") or [])
+    ]
+    closed_rows = [{"team": team, **i} for i in cl]
+    return agent_rows, inbox_rows, open_rows, closed_rows
+
+
+def gather():
+    """Return (agents, inbox, open_tasks, closed_recent, running)."""
+    agents: list[dict] = []
+    inbox: list[dict] = []
+    open_tasks: list[dict] = []
+    closed: list[dict] = []
+    running: list[str] = []
+
+    if not TEAMS_DIR.is_dir():
+        return agents, inbox, open_tasks, closed, running
+
+    teams = [
+        p for p in sorted(TEAMS_DIR.iterdir()) if p.is_dir() and (p / ".cto").is_dir()
+    ]
+    futures = {team.name: _POOL.submit(_gather_team, team.name, team) for team in teams}
+    for team_name, fut in futures.items():
+        result = fut.result()
+        if result is None:
+            continue
+        running.append(team_name)
+        a_rows, i_rows, o_rows, c_rows = result
+        agents.extend(a_rows)
+        inbox.extend(i_rows)
+        open_tasks.extend(o_rows)
+        closed.extend(c_rows)
+
+    # sort closed across teams by closed_at desc, take top 5
+    closed.sort(key=lambda r: r.get("closed_at") or "", reverse=True)
+    closed_recent = closed[:RECENT_CLOSED_LIMIT]
+
+    return agents, inbox, open_tasks, closed_recent, running
+
+
+# ---- panel builders -------------------------------------------------------
+
+
+def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Panel:
     if not running:
-        agent_panel = Panel(
+        return Panel(
             Text(
                 "no running teams — start one with `bin/cto start <team>`",
                 style="dim",
@@ -162,75 +270,165 @@ def render(agents: list[dict], inbox: list[dict], running: list[str], gather_ms:
             title="Agents (0)",
             border_style="dim",
         )
-    else:
-        t = Table(expand=True, show_lines=False, header_style="bold")
-        t.add_column("AGENT", overflow="fold", no_wrap=False)
-        t.add_column("TEAM", overflow="fold")
-        t.add_column("WINDOW", overflow="fold")
-        t.add_column("STATUS", overflow="fold")
-        t.add_column("ISSUE", overflow="fold", ratio=2)
-        t.add_column("ELAPSED", justify="right", overflow="fold")
 
-        for row in agents:
-            agent = row["agent"]
-            team = row["team"]
-            w = row["window"]
-            issue = row["issue"]
-            if issue:
-                started_iso = (issue.get("started_at") or issue.get("updated_at") or "").replace(
-                    "Z", "+00:00"
-                )
-                try:
-                    started = dt.datetime.fromisoformat(started_iso)
-                    secs = max(0, int((now - started).total_seconds()))
-                    elapsed = _fmt_elapsed(secs)
-                except ValueError:
-                    elapsed = "—"
-                title = _truncate(issue.get("title", ""), 60)
-                t.add_row(
-                    agent,
-                    team,
-                    w,
-                    Text("working", style="green"),
-                    Text(f"{issue['id']}  {title}"),
-                    Text(elapsed, style="green"),
-                )
-            elif w == "manager":
-                t.add_row(
-                    agent, team, w, Text("active", style="yellow"), Text("—", style="dim"), "—"
-                )
-            else:
-                t.add_row(
-                    agent, team, w, Text("idle", style="dim"), Text("—", style="dim"), "—"
-                )
-        agent_panel = Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
+    t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
+    t.add_column("AGENT", overflow="fold")
+    t.add_column("TEAM", overflow="fold")
+    t.add_column("WINDOW", overflow="fold")
+    t.add_column("STATUS", overflow="fold")
+    t.add_column("ISSUE", overflow="fold", ratio=2)
+    t.add_column("ELAPSED", justify="right", overflow="fold")
 
-    # ---- inbox table ----
-    inbox_t = Table(expand=True, show_lines=False, header_style="bold")
-    inbox_t.add_column("TEAM", overflow="fold")
-    inbox_t.add_column("ID", overflow="fold")
-    inbox_t.add_column("TITLE", overflow="fold", ratio=3)
-    inbox_t.add_column("LABELS", overflow="fold", ratio=1)
+    for row in agents:
+        agent = row["agent"]
+        team = row["team"]
+        w = row["window"]
+        issue = row["issue"]
+        if issue:
+            started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
+            secs = int((now - started).total_seconds()) if started else 0
+            elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
+            title = _truncate(issue.get("title", ""), 50)
+            t.add_row(
+                agent,
+                team,
+                w,
+                Text("working", style="green"),
+                Text(f"{issue['id']}  {title}"),
+                Text(elapsed, style="green"),
+            )
+        elif w == "manager":
+            t.add_row(
+                agent, team, w, Text("active", style="yellow"), Text("—", style="dim"), "—"
+            )
+        else:
+            t.add_row(
+                agent, team, w, Text("idle", style="dim"), Text("—", style="dim"), "—"
+            )
+    return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
+
+
+def _inbox_panel(inbox: list[dict]) -> Panel:
+    t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
+    t.add_column("TEAM", overflow="fold")
+    t.add_column("ID", overflow="fold")
+    t.add_column("TITLE", overflow="fold", ratio=3)
+    t.add_column("LABELS", overflow="fold", ratio=1)
     if inbox:
         for row in inbox:
             labels = ",".join(
                 lbl for lbl in row.get("labels", []) if not lbl.startswith("role:cto")
             )
-            inbox_t.add_row(row["team"], row["id"], row["title"], Text(labels, style="dim"))
+            t.add_row(row["team"], row["id"], row.get("title", ""), Text(labels, style="dim"))
     else:
-        inbox_t.add_row(
-            "[dim]—[/]",
-            "[dim]—[/]",
+        t.add_row(
+            Text("—", style="dim"),
+            Text("—", style="dim"),
             Text("(nothing waiting on the CTO)", style="dim"),
-            "[dim]—[/]",
+            Text("—", style="dim"),
         )
-    inbox_panel = Panel(
-        inbox_t,
+    return Panel(
+        t,
         title=f"CTO inbox ({len(inbox)})",
         border_style="magenta" if inbox else "dim",
     )
 
-    # ---- footer ----
+
+def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
+    t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
+    t.add_column("TEAM", overflow="fold")
+    t.add_column("ID", overflow="fold")
+    t.add_column("KIND", overflow="fold")
+    t.add_column("TITLE", overflow="fold", ratio=3)
+    t.add_column("ASSIGNEE", overflow="fold")
+    t.add_column("AGE", overflow="fold", justify="right")
+    if open_tasks:
+        # Stable sort: priority asc (lower=more urgent), then created_at asc.
+        rows = sorted(
+            open_tasks,
+            key=lambda r: (r.get("priority") or 99, r.get("created_at") or ""),
+        )
+        for row in rows:
+            assignee = row.get("assignee") or ""
+            assignee_disp = Text(assignee, style="green") if assignee else Text("—", style="dim")
+            t.add_row(
+                row["team"],
+                row.get("id", ""),
+                _kind(row.get("labels") or []),
+                _truncate(row.get("title", ""), 60),
+                assignee_disp,
+                _age(row, now),
+            )
+    else:
+        t.add_row(
+            Text("—", style="dim"),
+            Text("—", style="dim"),
+            Text("—", style="dim"),
+            Text("(no open tasks)", style="dim"),
+            Text("—", style="dim"),
+            Text("—", style="dim"),
+        )
+    return Panel(
+        t,
+        title=f"Open tasks ({len(open_tasks)})",
+        border_style="blue" if open_tasks else "dim",
+    )
+
+
+def _closed_panel(closed: list[dict]) -> Panel:
+    t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
+    t.add_column("TEAM", overflow="fold")
+    t.add_column("ID", overflow="fold")
+    t.add_column("KIND", overflow="fold")
+    t.add_column("TITLE", overflow="fold", ratio=3)
+    t.add_column("CLOSED-BY", overflow="fold")
+    t.add_column("RESOLVE", overflow="fold", justify="right")
+    t.add_column("AT", overflow="fold")
+    if closed:
+        for row in closed:
+            closed_at = _parse_iso(row.get("closed_at") or "")
+            at_str = closed_at.astimezone().strftime("%H:%M:%S") if closed_at else "—"
+            closer = _classify_closed(row)
+            closer_style = "green" if closer == "CTO" else "yellow"
+            t.add_row(
+                row["team"],
+                row.get("id", ""),
+                _kind(row.get("labels") or []),
+                _truncate(row.get("title", ""), 50),
+                Text(closer, style=closer_style),
+                _resolve_time(row),
+                at_str,
+            )
+    else:
+        t.add_row(
+            *[Text("—", style="dim")] * 6,
+            Text("(no closures yet)", style="dim"),
+        )
+    return Panel(
+        t,
+        title=f"Recently closed ({len(closed)})",
+        border_style="green" if closed else "dim",
+    )
+
+
+# ---- render ---------------------------------------------------------------
+
+
+def render(
+    agents: list[dict],
+    inbox: list[dict],
+    open_tasks: list[dict],
+    closed: list[dict],
+    running: list[str],
+    gather_ms: int = 0,
+) -> Layout:
+    now = dt.datetime.now(dt.timezone.utc)
+
+    agent_panel = _agent_panel(agents, running, now)
+    inbox_panel = _inbox_panel(inbox)
+    open_panel = _open_panel(open_tasks, now)
+    closed_panel = _closed_panel(closed)
+
     ts = dt.datetime.now().strftime("%H:%M:%S")
     teams_summary = ", ".join(running) if running else "—"
     footer = Text(
@@ -239,12 +437,23 @@ def render(agents: list[dict], inbox: list[dict], running: list[str], gather_ms:
         justify="center",
     )
 
+    # Top row: agents + inbox side by side, sized to fit agents + a bit
+    # of breathing room. Closed has a fixed 8-row footprint. Open gets
+    # whatever's left. Footer is one row.
+    top_h = max(7, len(agents) + 4)
     layout = Layout()
     layout.split_column(
-        Layout(agent_panel, name="agents"),
-        Layout(inbox_panel, name="inbox", size=max(6, min(14, len(inbox) + 4))),
+        Layout(name="top", size=top_h),
+        Layout(name="open"),
+        Layout(name="closed", size=8),
         Layout(footer, name="footer", size=1),
     )
+    layout["top"].split_row(
+        Layout(agent_panel, name="agents", ratio=3),
+        Layout(inbox_panel, name="inbox", ratio=2),
+    )
+    layout["open"].update(open_panel)
+    layout["closed"].update(closed_panel)
     return layout
 
 
@@ -269,9 +478,6 @@ def cbreak_stdin():
 def stdin_quit_pressed(timeout: float) -> bool:
     """Block up to `timeout` seconds; return True if the user pressed q/Q/Esc."""
     if not sys.stdin.isatty():
-        # Not a tty (e.g. piped) — just sleep and never quit via key.
-        import time
-
         time.sleep(timeout)
         return False
     rlist, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -293,12 +499,18 @@ def main() -> int:
             try:
                 while True:
                     t0 = time.monotonic()
-                    agents, inbox, running = gather()
+                    agents, inbox, open_tasks, closed, running = gather()
                     gather_ms = int((time.monotonic() - t0) * 1000)
-                    live.update(render(agents, inbox, running, gather_ms=gather_ms))
-                    # gather() is the natural throttle (~hundreds of ms
-                    # per refresh thanks to bd cold-starts); we just need
-                    # to poll stdin frequently enough that q feels snappy.
+                    live.update(
+                        render(
+                            agents,
+                            inbox,
+                            open_tasks,
+                            closed,
+                            running,
+                            gather_ms=gather_ms,
+                        )
+                    )
                     if stdin_quit_pressed(KEY_POLL_S):
                         break
             except KeyboardInterrupt:
