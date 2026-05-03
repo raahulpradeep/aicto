@@ -771,6 +771,32 @@ looks_like_permission_block() {
 trap 'log "supervisor stopping"; exit 0' INT TERM
 
 log "supervisor up (role=$ROLE, mode=$PERM, model=$MODEL)"
+
+# Boot-time recovery: if a previous instance of this agent was killed
+# mid-iteration (tmux kill, machine reboot, etc.), there may be bd
+# issues stuck in_progress with our $AGENT assignee, plus stale lock
+# dirs we own. Reset them so future iterations can re-attempt.
+zombies=$(bd list --status in_progress --json 2>/dev/null \
+          | jq -r --arg a "$AGENT" '.[] | select(.assignee == $a) | .id' 2>/dev/null || true)
+if [[ -n "$zombies" ]]; then
+  for zid in $zombies; do
+    log "boot recovery: resetting zombie claim $zid"
+    bd update "$zid" --status open --assignee "" >/dev/null 2>&1 || true
+    rm -rf "$LOCKS/$zid" 2>/dev/null || true
+  done
+fi
+# Also: any lock dir whose owner stamp matches this agent but has no
+# corresponding in_progress bd issue → leftover from a crash. Drop it.
+shopt -s nullglob
+for ld in "$LOCKS"/*/; do
+  [[ -d "$ld" ]] || continue
+  owner=$(cat "$ld/owner" 2>/dev/null || true)
+  if [[ "$owner" == "$AGENT" ]]; then
+    rm -rf "$ld"
+    log "boot recovery: removed stale lock $(basename "$ld")"
+  fi
+done
+shopt -u nullglob
 while :; do
   err=$(mktemp -t cto-err-XXXX)
   task_id=""
@@ -834,10 +860,19 @@ while :; do
       sleep 30
     fi
   else
-    # On success the agent closed the bd issue itself; we just need to
-    # release the per-issue lock dir so the next iteration can pick up
-    # the next ready item.
-    [[ -n "$task_id" ]] && rm -rf "$LOCKS/$task_id" 2>/dev/null
+    # On success the agent should have closed the bd issue itself.
+    # If it didn't (forgetful agent / context-window cutoff), the
+    # issue is now a zombie: in_progress, assigned to us, but nobody
+    # working it. Reset it so the next iteration re-attempts cleanly.
+    if [[ -n "$task_id" ]]; then
+      st=$(bd show "$task_id" --json 2>/dev/null \
+           | jq -r '.[0].status // ""' 2>/dev/null || true)
+      if [[ "$st" == "in_progress" ]]; then
+        log "agent did not close $task_id (status=$st); resetting to open"
+        bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
+      fi
+      rm -rf "$LOCKS/$task_id" 2>/dev/null
+    fi
     log "iteration ok (task=${task_id:-none})"
     [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
   fi
