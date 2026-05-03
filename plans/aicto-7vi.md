@@ -65,10 +65,11 @@ grep -oE 'parent_branch:[[:space:]]*[A-Za-z0-9._/-]+' <desc> | head -1 | awk -F:
    - New: `[[ "$head" == "$merge_target" ]] || die …`
 4. Replace the merge command at line 750 to use `"$merge_target"` instead of the implicit HEAD.
 5. Replace the close-reason at line 775: `"epic merged into $merge_target by CTO"`.
-6. **Validate target branch existence** before merging:
+6. **Validate target branch existence** before merging (check both local and remote refs so a branch that exists on origin but hasn't been fetched locally is still accepted):
    ```bash
    git -C "$tdir" show-ref --verify --quiet "refs/heads/$merge_target" \
-     || die "merge-epic: target branch '$merge_target' not found in $tdir"
+     || git -C "$tdir" show-ref --verify --quiet "refs/remotes/origin/$merge_target" \
+     || die "merge-epic: target branch '$merge_target' not found locally or on origin"
    ```
 7. Update worktree-prune ancestor check (lines 1365–1370): use `"$merge_target"` instead of `"main"` when pruning the epic's own sub-branches. This requires a helper `epic_parent_branch()` that reads the epic's description once.
 
@@ -84,17 +85,20 @@ grep -oE 'parent_branch:[[:space:]]*[A-Za-z0-9._/-]+' <desc> | head -1 | awk -F:
 ```bash
 # Read the parent_branch value stored in an epic's description.
 # Returns "main" if not set.
+# team_root must be the main worktree root — bd only works from there.
 epic_parent_branch() {
-  local tdir="$1" epic_id="$2"
+  local team_root="$1" epic_id="$2"
   local desc
-  desc=$(cd "$tdir" && bd show "$epic_id" --json 2>/dev/null \
+  desc=$(cd "$team_root" && bd show "$epic_id" --json 2>/dev/null \
          | jq -r 'if type=="array" then .[0].description // "" else .description // "" end')
   local pb
   pb=$(grep -oE 'parent_branch:[[:space:]]*[A-Za-z0-9._/-]+' <<<"$desc" \
-       | head -1 | sed 's/parent_branch:[[:space:]]*//' || true)
+       | head -1 | sed 's/parent_branch:[[:space:]]*//')
   echo "${pb:-main}"
 }
 ```
+
+The call site in `cmd_merge_epic` must supply `team_root` (resolved via `git rev-parse --show-toplevel` on the main worktree, not `tdir`), not the epic worktree path.
 
 ---
 
@@ -112,7 +116,8 @@ epic_parent_branch() {
 - Line 51 currently hardcodes `git branch epic/<epic-id> main`. Update the instruction to:
   > Create the epic branch from `main` (or from `parent_branch` if set in the epic description):
   > ```bash
-  > PARENT=$(bd show <epic-id> ... | grep parent_branch | awk '{print $2}' || echo main)
+  > PARENT=$(bd show <epic-id> ... | grep parent_branch | awk '{print $2}')
+  > PARENT=${PARENT:-main}
   > git branch epic/<epic-id> $PARENT
   > ```
 - Update any `merge epic/<id> into main` references in the template to say `into <parent_branch> (default: main)`.
