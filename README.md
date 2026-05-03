@@ -66,8 +66,13 @@ The server lives at `mcp/server.py` and is launched by `uv run --with mcp python
 ```bash
 # 1. Create a team (1 manager, 2 devs, 1 reviewer by default).
 bin/cto team create demo-app
-#   …or with options:
+#   …with options:
 bin/cto team create demo-app --developers 3 --reviewers 2 --container-use
+#   …from a remote git URL:
+bin/cto team create demo-app --repo git@github.com:you/demo-app.git
+#   …or adopt an existing local directory (with or without git):
+bin/cto team adopt  demo-app ~/Work/some-existing-repo            # moves it
+bin/cto team adopt  demo-app ~/Work/some-existing-repo --copy     # copies it
 
 # 2. File the team's first epic.
 bin/cto task demo-app "Build a CLI that greets the user by name" \

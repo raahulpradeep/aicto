@@ -181,6 +181,7 @@ cto — manage AI CTO teams.
 
 Usage:
   cto team create <name> [--repo <url>] [--developers N] [--reviewers N] [--container-use] [--description "…"]
+  cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use]
   cto team list
   cto team remove <name>
   cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M]
@@ -204,6 +205,77 @@ Usage:
 
 Run any subcommand with no args for context-specific help.
 EOF
+}
+
+# ---- shared scaffolding (used by `team create` and `team adopt`) --------
+#
+# Assumes teams/<name>/ exists as a git repo with at least one commit on
+# `main`. Layers the AI CTO operating model on top: dirs, .gitignore,
+# config.yaml, CLAUDE.md, AGENTS.md, bd init, role prompts, final commit.
+
+_team_scaffold() {
+  local name="$1" devs="$2" revs="$3" cuse="$4"
+  local tdir="$TEAMS_DIR/$name"
+
+  mkdir -p "$tdir/.cto/prompts" "$tdir/.cto/worktrees" \
+            "$tdir/breakdowns" "$tdir/plans" "$tdir/docs/reviews"
+  : > "$tdir/.cto/worktrees/.gitkeep"
+  [[ -e "$tdir/breakdowns/.gitkeep" ]]   || : > "$tdir/breakdowns/.gitkeep"
+  [[ -e "$tdir/plans/.gitkeep" ]]        || : > "$tdir/plans/.gitkeep"
+  [[ -e "$tdir/docs/reviews/.gitkeep" ]] || : > "$tdir/docs/reviews/.gitkeep"
+
+  # Append cto-managed gitignore lines (idempotent).
+  if ! grep -qxF '.cto/worktrees/' "$tdir/.gitignore" 2>/dev/null; then
+    printf '\n# cto\n.cto/worktrees/\n.cto/prompts/\n' >> "$tdir/.gitignore"
+  fi
+
+  cat > "$tdir/.cto/config.yaml" <<EOF
+# AI CTO team config — edit via 'cto config $name …', not by hand.
+developers: $devs
+reviewers: $revs
+manager: true
+permissionMode: acceptEdits
+containerUse: $cuse
+model: sonnet
+extraArgs: []
+EOF
+
+  # Compose CLAUDE.md / AGENTS.md. If the adopted repo already has them,
+  # back them up so we don't clobber project docs silently.
+  for f in CLAUDE.md AGENTS.md; do
+    if [[ -f "$tdir/$f" && ! -f "$tdir/.cto/orig-$f" ]]; then
+      cp "$tdir/$f" "$tdir/.cto/orig-$f"
+    fi
+  done
+
+  sed -e "s|{{TEAM}}|$name|g" \
+      -e "s|{{TEAM_DIR}}|$tdir|g" \
+      -e "s|{{N_DEVS}}|$devs|g" \
+      -e "s|{{N_REVIEWERS}}|$revs|g" \
+      -e "s|{{CONTAINER_USE}}|$cuse|g" \
+      "$TEMPLATES_DIR/team-CLAUDE.md" > "$tdir/CLAUDE.md"
+  sed -e "s|{{TEAM}}|$name|g" \
+      "$TEMPLATES_DIR/team-AGENTS.md" > "$tdir/AGENTS.md"
+
+  # If we backed up an original CLAUDE.md, append a pointer to it.
+  if [[ -f "$tdir/.cto/orig-CLAUDE.md" ]]; then
+    printf '\n## Original project CLAUDE.md\n\nPreserved at `.cto/orig-CLAUDE.md`. Merge in any project-specific guidance you want agents to follow.\n' \
+      >> "$tdir/CLAUDE.md"
+  fi
+
+  # bd init only if not already initialized (adopted repo may have one).
+  if [[ ! -d "$tdir/.beads" ]]; then
+    ( cd "$tdir" && bd init >/dev/null )
+  else
+    info "  (existing .beads found in adopted repo — leaving it alone)"
+  fi
+
+  render_prompts "$name"
+
+  git -C "$tdir" add -A
+  if ! git -C "$tdir" diff --cached --quiet; then
+    git -C "$tdir" -c commit.gpgsign=false commit -m "cto: scaffold team config" >/dev/null
+  fi
 }
 
 # ---- team create ---------------------------------------------------------
@@ -236,61 +308,93 @@ cmd_team_create() {
   else
     mkdir -p "$tdir"
     git -C "$tdir" init -b main >/dev/null
-    # Need a commit on main for `git worktree add ... main` to work later.
     : > "$tdir/.gitkeep"
     git -C "$tdir" add .gitkeep >/dev/null
     git -C "$tdir" -c commit.gpgsign=false commit -m "init team: $name${desc:+ — $desc}" >/dev/null
   fi
 
-  mkdir -p "$tdir/.cto/prompts" "$tdir/.cto/worktrees" \
-            "$tdir/breakdowns" "$tdir/plans" "$tdir/docs/reviews"
-  : > "$tdir/.cto/worktrees/.gitkeep"
-  : > "$tdir/breakdowns/.gitkeep"
-  : > "$tdir/plans/.gitkeep"
-  : > "$tdir/docs/reviews/.gitkeep"
-
-  # Per-team gitignore so the worktree dir isn't tracked.
-  cat > "$tdir/.gitignore" <<EOF
-.cto/worktrees/
-.cto/prompts/
-EOF
-
-  # Write config.yaml.
-  cat > "$tdir/.cto/config.yaml" <<EOF
-# AI CTO team config — edit via 'cto config $name …', not by hand.
-developers: $devs
-reviewers: $revs
-manager: true
-permissionMode: acceptEdits
-containerUse: $cuse
-model: sonnet
-extraArgs: []
-EOF
-
-  # Compose the team CLAUDE.md from the template.
-  sed -e "s|{{TEAM}}|$name|g" \
-      -e "s|{{TEAM_DIR}}|$tdir|g" \
-      -e "s|{{N_DEVS}}|$devs|g" \
-      -e "s|{{N_REVIEWERS}}|$revs|g" \
-      -e "s|{{CONTAINER_USE}}|$cuse|g" \
-      "$TEMPLATES_DIR/team-CLAUDE.md" > "$tdir/CLAUDE.md"
-
-  sed -e "s|{{TEAM}}|$name|g" \
-      "$TEMPLATES_DIR/team-AGENTS.md" > "$tdir/AGENTS.md"
-
-  # Initialize bd in the team workspace. bd init does its own commit.
-  ( cd "$tdir" && bd init >/dev/null )
-
-  # Render role prompts.
-  render_prompts "$name"
-
-  # Final commit (any remaining changes from prompts/config).
-  git -C "$tdir" add -A
-  if ! git -C "$tdir" diff --cached --quiet; then
-    git -C "$tdir" -c commit.gpgsign=false commit -m "cto: scaffold team config" >/dev/null
-  fi
+  _team_scaffold "$name" "$devs" "$revs" "$cuse"
 
   info "team created at: $tdir"
+  info "next: cto task $name \"<epic title>\" --epic && cto start $name"
+}
+
+# ---- team adopt ----------------------------------------------------------
+#
+# Bring an existing local directory into teams/<name>/. Handles both bare
+# directories (no .git) and existing git repos. By default the source is
+# moved; pass --copy to copy it instead.
+
+cmd_team_adopt() {
+  local name="" src="" devs=2 revs=1 cuse=false copy=false
+  while (( $# )); do
+    case "$1" in
+      --developers) devs="$2"; shift 2 ;;
+      --reviewers)  revs="$2"; shift 2 ;;
+      --container-use) cuse=true; shift ;;
+      --copy) copy=true; shift ;;
+      --) shift; break ;;
+      -*) die "unknown flag for team adopt: $1" ;;
+      *)
+        if   [[ -z "$name" ]]; then name="$1"
+        elif [[ -z "$src"  ]]; then src="$1"
+        else die "extra arg: $1"
+        fi
+        shift ;;
+    esac
+  done
+  [[ -n "$name" && -n "$src" ]] || die "usage: cto team adopt <name> <path-to-existing-dir> [--copy] [--developers N] [--reviewers N] [--container-use]"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid team name: $name"
+  [[ ! -e "$TEAMS_DIR/$name" ]] || die "team already exists: $name"
+  [[ -d "$src" ]] || die "source not found or not a directory: $src"
+  src="$(cd "$src" && pwd)"
+  [[ "$src" != "$TEAMS_DIR/$name" ]] || die "source is already the team path"
+  case "$src" in "$CTO_ROOT"|"$CTO_ROOT"/*) die "cannot adopt a path inside the CTO workspace: $src" ;; esac
+
+  local tdir="$TEAMS_DIR/$name"
+  info "adopting: $src → teams/$name (copy=$copy, devs=$devs, reviewers=$revs, container-use=$cuse)"
+
+  if $copy; then
+    mkdir -p "$tdir"
+    # Use rsync if available for speed + correctness; fall back to cp -R.
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a "$src"/ "$tdir"/
+    else
+      cp -R "$src"/. "$tdir"/
+    fi
+  else
+    mv "$src" "$tdir"
+  fi
+
+  # Ensure it's a git repo on `main` with at least one commit.
+  if [[ ! -d "$tdir/.git" ]]; then
+    info "  no .git found — running git init"
+    git -C "$tdir" init -b main >/dev/null
+  else
+    # Make sure HEAD exists on a branch named main (rename if needed).
+    local head_ref
+    head_ref="$(git -C "$tdir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ -z "$head_ref" ]]; then
+      git -C "$tdir" checkout -b main >/dev/null 2>&1 || true
+    elif [[ "$head_ref" != "main" ]]; then
+      info "  current branch is '$head_ref'; leaving as-is (worktrees will branch from it)"
+    fi
+  fi
+
+  # Stage anything not yet committed (typical for a fresh dir or a dirty repo).
+  git -C "$tdir" add -A
+  if ! git -C "$tdir" diff --cached --quiet; then
+    git -C "$tdir" -c commit.gpgsign=false commit -m "adopt: import $name" >/dev/null
+  elif ! git -C "$tdir" rev-parse --verify HEAD >/dev/null 2>&1; then
+    # Empty repo with no commits — make one so worktrees work.
+    : > "$tdir/.gitkeep"
+    git -C "$tdir" add .gitkeep >/dev/null
+    git -C "$tdir" -c commit.gpgsign=false commit -m "adopt: init empty repo for $name" >/dev/null
+  fi
+
+  _team_scaffold "$name" "$devs" "$revs" "$cuse"
+
+  info "team adopted at: $tdir"
   info "next: cto task $name \"<epic title>\" --epic && cto start $name"
 }
 
@@ -710,6 +814,7 @@ main() {
       local sub="${1:-}"; shift || true
       case "$sub" in
         create) cmd_team_create "$@" ;;
+        adopt)  cmd_team_adopt  "$@" ;;
         list)   cmd_team_list   "$@" ;;
         remove) cmd_team_remove "$@" ;;
         *) die "unknown team subcommand: $sub" ;;

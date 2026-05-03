@@ -68,6 +68,36 @@ def team_create(
 
 
 @mcp.tool()
+def team_adopt(
+    name: str,
+    path: str,
+    copy: bool = False,
+    developers: int = 2,
+    reviewers: int = 1,
+    container_use: bool = False,
+) -> str:
+    """Adopt an existing local directory (with or without .git) as a team.
+
+    Moves `path` into teams/<name>/ by default; pass copy=True to copy
+    instead. Works on bare directories (runs `git init`) and on existing
+    git repos (preserves history). Layers the cto scaffolding on top:
+    bd init, .cto/config.yaml, role prompts, breakdowns/plans/docs dirs,
+    and a templated CLAUDE.md (the original CLAUDE.md, if any, is
+    preserved at .cto/orig-CLAUDE.md).
+
+    Use this when the source has no git URL — for a remote URL, use
+    team_create(repo=...) instead."""
+    args = ["team", "adopt", name, path,
+            "--developers", str(developers),
+            "--reviewers", str(reviewers)]
+    if copy:
+        args.append("--copy")
+    if container_use:
+        args.append("--container-use")
+    return _run(args)
+
+
+@mcp.tool()
 def team_list() -> str:
     """List all teams with their agent counts, container-use mode, tmux
     state, and open bd issue counts."""
