@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "aicto",
+  "project_id": "3a2fb8b2-bd4c-461a-99db-f5193b50b8ca"
+}
