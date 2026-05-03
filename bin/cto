@@ -1,0 +1,735 @@
+#!/usr/bin/env bash
+# cto — CLI for the AI CTO workspace.
+#
+# Manages multi-agent teams: each team is a git repo with its own beads
+# tracker; agents (manager, developers, reviewers) run as tmux windows
+# inside a per-team session. Coordination happens entirely through bd.
+#
+# See README.md for usage.
+
+set -euo pipefail
+
+# --------------------------------------------------------------------------
+# globals & helpers
+# --------------------------------------------------------------------------
+
+CTO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEAMS_DIR="$CTO_ROOT/teams"
+TEMPLATES_DIR="$CTO_ROOT/templates"
+
+die()  { printf 'cto: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'cto: %s\n' "$*" >&2; }
+info() { printf '%s\n' "$*"; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+# Required everywhere.
+for cmd in git bd tmux jq python3; do require_cmd "$cmd"; done
+
+# Validate a team name and ensure it exists.
+require_team() {
+  local name="$1"
+  [[ -n "$name" ]] || die "team name required"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid team name: $name (lowercase, alnum, .-_ )"
+  [[ -d "$TEAMS_DIR/$name" ]] || die "team not found: $name (try: cto team list)"
+}
+
+team_dir() { printf '%s/%s' "$TEAMS_DIR" "$1"; }
+team_config_path() { printf '%s/.cto/config.yaml' "$(team_dir "$1")"; }
+
+# Read a key from a team's .cto/config.yaml. Usage: cfg_get <team> <key> [default]
+cfg_get() {
+  local team="$1" key="$2" default="${3-}"
+  local path
+  path="$(team_config_path "$team")"
+  python3 - "$path" "$key" "$default" <<'PY'
+import sys, os
+path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {}
+if os.path.exists(path):
+    # Minimal YAML parser: supports flat key: value lines and lists like [].
+    # We avoid pyyaml so the script has no extra deps.
+    with open(path) as f:
+        for line in f:
+            line = line.split('#', 1)[0].rstrip()
+            if not line or ':' not in line:
+                continue
+            k, _, v = line.partition(':')
+            k = k.strip(); v = v.strip()
+            if v.startswith('[') and v.endswith(']'):
+                v = [x.strip().strip('"\'') for x in v[1:-1].split(',') if x.strip()]
+            elif v.lower() in ('true', 'false'):
+                v = v.lower() == 'true'
+            elif v.isdigit():
+                v = int(v)
+            else:
+                v = v.strip('"\'')
+            data[k] = v
+val = data.get(key, default)
+if isinstance(val, list):
+    print(' '.join(val))
+elif isinstance(val, bool):
+    print('true' if val else 'false')
+else:
+    print(val)
+PY
+}
+
+# Set a key in a team's .cto/config.yaml.
+cfg_set() {
+  local team="$1" key="$2" value="$3"
+  local path
+  path="$(team_config_path "$team")"
+  python3 - "$path" "$key" "$value" <<'PY'
+import sys, os, re
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = []
+found = False
+if os.path.exists(path):
+    with open(path) as f:
+        lines = f.readlines()
+out = []
+pattern = re.compile(rf'^\s*{re.escape(key)}\s*:')
+for line in lines:
+    if pattern.match(line):
+        out.append(f"{key}: {value}\n")
+        found = True
+    else:
+        out.append(line)
+if not found:
+    if out and not out[-1].endswith('\n'):
+        out.append('\n')
+    out.append(f"{key}: {value}\n")
+with open(path, 'w') as f:
+    f.writelines(out)
+PY
+}
+
+# --------------------------------------------------------------------------
+# role prompt rendering
+# --------------------------------------------------------------------------
+
+render_prompts() {
+  local team="$1"
+  local tdir; tdir="$(team_dir "$team")"
+  local pdir="$tdir/.cto/prompts"
+  mkdir -p "$pdir"
+  local n_devs n_revs cuse
+  n_devs="$(cfg_get "$team" developers 2)"
+  n_revs="$(cfg_get "$team" reviewers 1)"
+  cuse="$(cfg_get "$team" containerUse false)"
+
+  for role in manager developer reviewer; do
+    local src="$TEMPLATES_DIR/$role.md"
+    [[ -f "$src" ]] || die "missing template: $src"
+    # Manager has no slot.
+    if [[ "$role" == "manager" ]]; then
+      sed -e "s|{{TEAM}}|$team|g" \
+          -e "s|{{TEAM_DIR}}|$tdir|g" \
+          -e "s|{{CONTAINER_USE}}|$cuse|g" \
+          "$src" > "$pdir/manager.md"
+    fi
+  done
+
+  # Render N developer prompts (one per slot).
+  for i in $(seq 1 "$n_devs"); do
+    sed -e "s|{{TEAM}}|$team|g" \
+        -e "s|{{TEAM_DIR}}|$tdir|g" \
+        -e "s|{{CONTAINER_USE}}|$cuse|g" \
+        -e "s|{{SLOT}}|dev-$i|g" \
+        "$TEMPLATES_DIR/developer.md" > "$pdir/dev-$i.md"
+  done
+
+  # Render M reviewer prompts.
+  for i in $(seq 1 "$n_revs"); do
+    sed -e "s|{{TEAM}}|$team|g" \
+        -e "s|{{TEAM_DIR}}|$tdir|g" \
+        -e "s|{{CONTAINER_USE}}|$cuse|g" \
+        -e "s|{{SLOT}}|review-$i|g" \
+        "$TEMPLATES_DIR/reviewer.md" > "$pdir/review-$i.md"
+  done
+
+  # Clean up stale slot files (e.g. after reducing dev/reviewer count).
+  shopt -s nullglob
+  for f in "$pdir"/dev-*.md; do
+    local slot; slot="$(basename "$f" .md)"; slot="${slot#dev-}"
+    if (( slot > n_devs )); then rm -f "$f"; fi
+  done
+  for f in "$pdir"/review-*.md; do
+    local slot; slot="$(basename "$f" .md)"; slot="${slot#review-}"
+    if (( slot > n_revs )); then rm -f "$f"; fi
+  done
+  shopt -u nullglob
+}
+
+# --------------------------------------------------------------------------
+# tmux helpers
+# --------------------------------------------------------------------------
+
+tmux_session() { printf 'cto-%s' "$1"; }
+tmux_alive()   { tmux has-session -t "$(tmux_session "$1")" 2>/dev/null; }
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+cto — manage AI CTO teams.
+
+Usage:
+  cto team create <name> [--repo <url>] [--developers N] [--reviewers N] [--container-use] [--description "…"]
+  cto team list
+  cto team remove <name>
+  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M]
+
+  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
+  cto inbox [<team>]
+  cto approve <team> <id> [--comment "…"]
+  cto reject <team> <id> --comment "…"
+
+  cto start <team> [--attach] [--dangerous]
+  cto stop <team>
+  cto restart <team>
+  cto attach <team> [<window>]
+
+  cto status [<team>]
+  cto update <team> [--fresh]
+
+  cto worktrees <team>
+  cto worktrees prune <team>
+  cto exec <team> -- <cmd…>
+
+Run any subcommand with no args for context-specific help.
+EOF
+}
+
+# ---- team create ---------------------------------------------------------
+
+cmd_team_create() {
+  local name="" repo="" desc="" devs=2 revs=1 cuse=false
+  while (( $# )); do
+    case "$1" in
+      --repo) repo="$2"; shift 2 ;;
+      --developers) devs="$2"; shift 2 ;;
+      --reviewers)  revs="$2"; shift 2 ;;
+      --container-use) cuse=true; shift ;;
+      --description|-d) desc="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "unknown flag for team create: $1" ;;
+      *) [[ -z "$name" ]] && name="$1" || die "extra arg: $1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "team create: name required"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid team name: $name"
+  [[ ! -e "$TEAMS_DIR/$name" ]] || die "team already exists: $name"
+  [[ "$devs" =~ ^[0-9]+$ ]] || die "--developers must be an integer"
+  [[ "$revs" =~ ^[0-9]+$ ]] || die "--reviewers must be an integer"
+
+  local tdir="$TEAMS_DIR/$name"
+  info "creating team: $name (devs=$devs, reviewers=$revs, container-use=$cuse)"
+
+  if [[ -n "$repo" ]]; then
+    git clone "$repo" "$tdir"
+  else
+    mkdir -p "$tdir"
+    git -C "$tdir" init -b main >/dev/null
+    # Need a commit on main for `git worktree add ... main` to work later.
+    : > "$tdir/.gitkeep"
+    git -C "$tdir" add .gitkeep >/dev/null
+    git -C "$tdir" -c commit.gpgsign=false commit -m "init team: $name${desc:+ — $desc}" >/dev/null
+  fi
+
+  mkdir -p "$tdir/.cto/prompts" "$tdir/.cto/worktrees" \
+            "$tdir/breakdowns" "$tdir/plans" "$tdir/docs/reviews"
+  : > "$tdir/.cto/worktrees/.gitkeep"
+  : > "$tdir/breakdowns/.gitkeep"
+  : > "$tdir/plans/.gitkeep"
+  : > "$tdir/docs/reviews/.gitkeep"
+
+  # Per-team gitignore so the worktree dir isn't tracked.
+  cat > "$tdir/.gitignore" <<EOF
+.cto/worktrees/
+.cto/prompts/
+EOF
+
+  # Write config.yaml.
+  cat > "$tdir/.cto/config.yaml" <<EOF
+# AI CTO team config — edit via 'cto config $name …', not by hand.
+developers: $devs
+reviewers: $revs
+manager: true
+permissionMode: acceptEdits
+containerUse: $cuse
+model: sonnet
+extraArgs: []
+EOF
+
+  # Compose the team CLAUDE.md from the template.
+  sed -e "s|{{TEAM}}|$name|g" \
+      -e "s|{{TEAM_DIR}}|$tdir|g" \
+      -e "s|{{N_DEVS}}|$devs|g" \
+      -e "s|{{N_REVIEWERS}}|$revs|g" \
+      -e "s|{{CONTAINER_USE}}|$cuse|g" \
+      "$TEMPLATES_DIR/team-CLAUDE.md" > "$tdir/CLAUDE.md"
+
+  sed -e "s|{{TEAM}}|$name|g" \
+      "$TEMPLATES_DIR/team-AGENTS.md" > "$tdir/AGENTS.md"
+
+  # Initialize bd in the team workspace. bd init does its own commit.
+  ( cd "$tdir" && bd init >/dev/null )
+
+  # Render role prompts.
+  render_prompts "$name"
+
+  # Final commit (any remaining changes from prompts/config).
+  git -C "$tdir" add -A
+  if ! git -C "$tdir" diff --cached --quiet; then
+    git -C "$tdir" -c commit.gpgsign=false commit -m "cto: scaffold team config" >/dev/null
+  fi
+
+  info "team created at: $tdir"
+  info "next: cto task $name \"<epic title>\" --epic && cto start $name"
+}
+
+# ---- team list -----------------------------------------------------------
+
+cmd_team_list() {
+  shopt -s nullglob
+  local found=0
+  printf '%-20s %-8s %-8s %-12s %-7s %s\n' TEAM DEVS REVIEWERS CONTAINER-USE TMUX OPEN-ISSUES
+  for d in "$TEAMS_DIR"/*/; do
+    local name; name="$(basename "$d")"
+    [[ "$name" == ".gitkeep" ]] && continue
+    [[ -d "$d/.cto" ]] || continue
+    found=1
+    local devs revs cuse alive open
+    devs="$(cfg_get "$name" developers 2)"
+    revs="$(cfg_get "$name" reviewers 1)"
+    cuse="$(cfg_get "$name" containerUse false)"
+    if tmux_alive "$name"; then alive=yes; else alive=no; fi
+    open="$(cd "$d" && bd list --status open --json 2>/dev/null | jq 'length' 2>/dev/null || echo '?')"
+    printf '%-20s %-8s %-8s %-12s %-7s %s\n' "$name" "$devs" "$revs" "$cuse" "$alive" "$open"
+  done
+  shopt -u nullglob
+  (( found )) || info "no teams yet — try: cto team create <name>"
+}
+
+# ---- team remove ---------------------------------------------------------
+
+cmd_team_remove() {
+  local name="${1:-}"
+  require_team "$name"
+  read -r -p "Remove team '$name' and ALL its data? [y/N] " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || { info "aborted"; return; }
+  if tmux_alive "$name"; then
+    tmux kill-session -t "$(tmux_session "$name")" 2>/dev/null || true
+  fi
+  rm -rf "$(team_dir "$name")"
+  info "removed: $name"
+}
+
+# ---- config --------------------------------------------------------------
+
+cmd_config() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  while (( $# )); do
+    case "$1" in
+      --developers)      cfg_set "$name" developers "$2";        shift 2 ;;
+      --reviewers)       cfg_set "$name" reviewers  "$2";        shift 2 ;;
+      --container-use)
+        case "$2" in
+          on|true)  cfg_set "$name" containerUse true ;;
+          off|false) cfg_set "$name" containerUse false ;;
+          *) die "--container-use takes on|off" ;;
+        esac
+        shift 2 ;;
+      --permission-mode) cfg_set "$name" permissionMode "$2";    shift 2 ;;
+      --model)           cfg_set "$name" model "$2";             shift 2 ;;
+      *) die "unknown config flag: $1" ;;
+    esac
+  done
+  render_prompts "$name"
+  info "config for $name:"
+  cat "$(team_config_path "$name")"
+  if tmux_alive "$name"; then
+    info ""
+    info "note: team is running — run 'cto restart $name' to apply changes."
+  fi
+}
+
+# ---- task ---------------------------------------------------------------
+
+cmd_task() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local title="" desc="" prio=2 kind=epic
+  while (( $# )); do
+    case "$1" in
+      -d|--description) desc="$2"; shift 2 ;;
+      -p|--priority)    prio="$2"; shift 2 ;;
+      --epic) kind=epic; shift ;;
+      --dev)  kind=dev;  shift ;;
+      --plan) kind=plan; shift ;;
+      --) shift ;;
+      -*) die "unknown task flag: $1" ;;
+      *) [[ -z "$title" ]] && title="$1" || die "extra arg: $1"; shift ;;
+    esac
+  done
+  [[ -n "$title" ]] || die "task title required"
+
+  local labels="role:manager,kind:$kind"
+  local id
+  id=$(cd "$(team_dir "$name")" && bd create -t task \
+        -l "$labels" -p "$prio" \
+        -d "${desc:-(no description)}" \
+        --silent \
+        "$title")
+  info "filed $id ($kind, role:manager) in team $name"
+}
+
+# ---- inbox ---------------------------------------------------------------
+
+cmd_inbox() {
+  local target="${1:-}"
+  shopt -s nullglob
+  local any=0
+  for d in "$TEAMS_DIR"/*/; do
+    local name; name="$(basename "$d")"
+    [[ -d "$d/.cto" ]] || continue
+    [[ -n "$target" && "$target" != "$name" ]] && continue
+    local rows
+    rows="$(cd "$d" && bd list --status open -l role:cto --json 2>/dev/null || echo '[]')"
+    local count; count="$(jq 'length' <<<"$rows")"
+    (( count == 0 )) && continue
+    any=1
+    info "── $name ──"
+    jq -r '.[] | "  \(.id)  \(.title)  [\((.labels // []) | join(",") )]"' <<<"$rows"
+  done
+  shopt -u nullglob
+  (( any )) || info "inbox empty — nothing waiting on the CTO."
+}
+
+# ---- approve / reject ---------------------------------------------------
+
+cmd_approve() {
+  local name="${1:-}" id="${2:-}"; shift 2 || true
+  require_team "$name"
+  [[ -n "$id" ]] || die "approve: issue id required"
+  local comment="approved by CTO"
+  while (( $# )); do
+    case "$1" in
+      --comment|-c) comment="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  ( cd "$(team_dir "$name")" \
+      && bd comment "$id" "$comment" >/dev/null \
+      && bd update "$id" --add-label "verdict:approved" >/dev/null \
+      && bd close "$id" -r "$comment" >/dev/null )
+  info "approved $id in team $name"
+}
+
+cmd_reject() {
+  local name="${1:-}" id="${2:-}"; shift 2 || true
+  require_team "$name"
+  [[ -n "$id" ]] || die "reject: issue id required"
+  local comment=""
+  while (( $# )); do
+    case "$1" in
+      --comment|-c) comment="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$comment" ]] || die "reject: --comment required"
+
+  # Find the upstream (the issue this approval depends on) and reopen it
+  # with the comment.
+  local upstream
+  upstream=$(cd "$(team_dir "$name")" && bd dep list "$id" --json 2>/dev/null \
+              | jq -r '.dependencies[]? | select(.type=="blocks" or .type=="parent" or .type=="depends_on") | .target_id' \
+              | head -1 || true)
+
+  ( cd "$(team_dir "$name")" \
+      && bd comment "$id" "REJECTED: $comment" >/dev/null \
+      && bd update "$id" --add-label "verdict:rejected" >/dev/null \
+      && bd close "$id" -r "rejected: $comment" >/dev/null )
+
+  if [[ -n "$upstream" && "$upstream" != "null" ]]; then
+    ( cd "$(team_dir "$name")" \
+        && bd reopen "$upstream" >/dev/null \
+        && bd comment "$upstream" "Reopened by CTO: $comment" >/dev/null )
+    info "rejected $id; reopened upstream $upstream in team $name"
+  else
+    warn "rejected $id but could not auto-detect upstream — agent must reopen manually"
+  fi
+}
+
+# ---- start / stop / restart / attach ------------------------------------
+
+cmd_start() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local attach=0 dangerous=0 force=0
+  while (( $# )); do
+    case "$1" in
+      --attach)     attach=1;    shift ;;
+      --dangerous)  dangerous=1; shift ;;
+      --force)      force=1;     shift ;;
+      *) die "unknown start flag: $1" ;;
+    esac
+  done
+
+  if tmux_alive "$name"; then
+    if (( force )); then
+      tmux kill-session -t "$(tmux_session "$name")"
+    else
+      die "team $name is already running (cto attach $name to view, or --force)"
+    fi
+  fi
+
+  render_prompts "$name"
+
+  local tdir; tdir="$(team_dir "$name")"
+  local pdir="$tdir/.cto/prompts"
+  local mode model
+  mode="$(cfg_get "$name" permissionMode acceptEdits)"
+  model="$(cfg_get "$name" model sonnet)"
+  (( dangerous )) && mode="bypassPermissions"
+  local n_devs n_revs
+  n_devs="$(cfg_get "$name" developers 2)"
+  n_revs="$(cfg_get "$name" reviewers 1)"
+
+  local sess; sess="$(tmux_session "$name")"
+
+  # Build the claude command for a given prompt file.
+  # We feed the prompt as the first user message via -p but also keep
+  # stdin interactive — using --append-system-prompt would be cleaner if
+  # available, but `-p` + `--permission-mode` is the documented headless
+  # form. For tmux interactive use, we instead pipe the prompt into an
+  # interactive claude session via heredoc-style stdin.
+  #
+  # Concretely: run `claude --permission-mode <mode> --model <model>`
+  # interactively, but seed it by using `claude` with no args is
+  # interactive; the role prompt is delivered by a `claude` subcommand
+  # that reads the file. The simplest cross-version-safe approach is to
+  # pre-fill the prompt with the role file content via a small wrapper.
+
+  local launcher="$tdir/.cto/launch.sh"
+  cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+# generated by cto — launches a claude agent with a role prompt
+set -euo pipefail
+ROLE_FILE="\$1"
+cd "$tdir"
+exec claude \\
+  --permission-mode "$mode" \\
+  --model "$model" \\
+  --append-system-prompt "\$(cat "\$ROLE_FILE")" \\
+  "Begin your loop. Report your role and what you'll do first, then proceed."
+EOF
+  chmod +x "$launcher"
+
+  # First window: manager.
+  tmux new-session -d -s "$sess" -n manager -c "$tdir" \
+    "$launcher" "$pdir/manager.md"
+
+  # Developer windows.
+  for i in $(seq 1 "$n_devs"); do
+    tmux new-window -t "$sess" -n "dev-$i" -c "$tdir" \
+      "$launcher" "$pdir/dev-$i.md"
+  done
+
+  # Reviewer windows.
+  for i in $(seq 1 "$n_revs"); do
+    tmux new-window -t "$sess" -n "review-$i" -c "$tdir" \
+      "$launcher" "$pdir/review-$i.md"
+  done
+
+  info "started team $name in tmux session: $sess"
+  info "  windows: manager, dev-1..$n_devs, review-1..$n_revs"
+  info "  permissionMode: $mode, model: $model"
+  info "  attach: cto attach $name   (Ctrl-b d to detach)"
+  if (( attach )); then
+    tmux attach -t "$sess"
+  fi
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  require_team "$name"
+  tmux_alive "$name" || { info "not running: $name"; return; }
+  local sess; sess="$(tmux_session "$name")"
+  # Send Ctrl-C to each window so agents can flush bd state.
+  for w in $(tmux list-windows -t "$sess" -F '#W'); do
+    tmux send-keys -t "$sess:$w" C-c 2>/dev/null || true
+  done
+  sleep 2
+  tmux kill-session -t "$sess"
+  info "stopped: $name"
+}
+
+cmd_restart() {
+  local name="${1:-}"
+  require_team "$name"
+  cmd_stop "$name" || true
+  cmd_start "$name"
+}
+
+cmd_attach() {
+  local name="${1:-}" win="${2:-}"
+  require_team "$name"
+  tmux_alive "$name" || die "team not running: $name (try: cto start $name)"
+  local sess; sess="$(tmux_session "$name")"
+  if [[ -n "$win" ]]; then
+    tmux attach -t "$sess:$win"
+  else
+    tmux attach -t "$sess"
+  fi
+}
+
+# ---- status / update -----------------------------------------------------
+
+cmd_status() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    cmd_team_list
+    info ""
+    info "── inbox ──"
+    cmd_inbox
+    return
+  fi
+  require_team "$target"
+  local tdir; tdir="$(team_dir "$target")"
+  info "── $target ──"
+  ( cd "$tdir" && bd list --status open )
+  info ""
+  info "── recent digests ──"
+  ( cd "$tdir" && bd list --label kind:status-digest --status closed --closed-after "$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u --date='1 day ago' +%Y-%m-%d)" 2>/dev/null || true )
+  info ""
+  if tmux_alive "$target"; then
+    info "── tmux: cto:$target ──"
+    tmux list-windows -t "$(tmux_session "$target")" -F '  #W'
+  else
+    info "tmux: not running"
+  fi
+}
+
+cmd_update() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local fresh=0
+  while (( $# )); do
+    case "$1" in
+      --fresh) fresh=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local tdir; tdir="$(team_dir "$name")"
+  if (( fresh )); then
+    tmux_alive "$name" || die "team not running; cannot request a fresh digest"
+    local req_id
+    req_id=$(cd "$tdir" && bd create -t task \
+              -l role:manager,kind:status-request -p 1 \
+              --silent \
+              "Status request from CTO" \
+              -d "Please write a fresh digest, then close this issue.")
+    info "filed status request: $req_id; waiting up to 60s for the manager..."
+    local i
+    for i in $(seq 1 30); do
+      sleep 2
+      local closed
+      closed=$(cd "$tdir" && bd show "$req_id" --json 2>/dev/null | jq -r '.status // ""')
+      if [[ "$closed" == "closed" ]]; then
+        break
+      fi
+    done
+  fi
+
+  # Print the most recent status-digest (open or recently closed).
+  local digest
+  digest=$(cd "$tdir" && bd list --label kind:status-digest --json 2>/dev/null \
+            | jq -r 'sort_by(.updated_at // .created_at) | reverse | .[0] // empty')
+  if [[ -z "$digest" ]]; then
+    info "(no status digest yet for $name)"
+    return
+  fi
+  jq -r '"id: \(.id)\ntitle: \(.title)\nupdated: \(.updated_at // .created_at)\nstatus: \(.status)\n---\n\(.description)"' <<<"$digest"
+}
+
+# ---- worktrees -----------------------------------------------------------
+
+cmd_worktrees() {
+  local sub=list name=""
+  if [[ "${1:-}" == "prune" ]]; then sub=prune; shift; fi
+  name="${1:-}"
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  case "$sub" in
+    prune)
+      git -C "$tdir" worktree prune -v
+      while IFS=$'\t' read -r path branch; do
+        [[ -z "$path" || "$path" == "$tdir" ]] && continue
+        if git -C "$tdir" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+          info "removing merged worktree: $path ($branch)"
+          git -C "$tdir" worktree remove "$path" 2>/dev/null || true
+          git -C "$tdir" branch -d "$branch" 2>/dev/null || true
+        fi
+      done < <(git -C "$tdir" worktree list --porcelain \
+                | awk '/^worktree /{p=$2} /^branch /{b=$2; sub("^refs/heads/","",b); print p"\t"b}')
+      ;;
+    list)
+      git -C "$tdir" worktree list
+      ;;
+  esac
+}
+
+# ---- exec ----------------------------------------------------------------
+
+cmd_exec() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+  (( $# )) || die "exec: command required"
+  ( cd "$(team_dir "$name")" && "$@" )
+}
+
+# --------------------------------------------------------------------------
+# dispatch
+# --------------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    "" | -h | --help | help) usage ;;
+    team)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        create) cmd_team_create "$@" ;;
+        list)   cmd_team_list   "$@" ;;
+        remove) cmd_team_remove "$@" ;;
+        *) die "unknown team subcommand: $sub" ;;
+      esac
+      ;;
+    config)    cmd_config    "$@" ;;
+    task)      cmd_task      "$@" ;;
+    inbox)     cmd_inbox     "$@" ;;
+    approve)   cmd_approve   "$@" ;;
+    reject)    cmd_reject    "$@" ;;
+    start)     cmd_start     "$@" ;;
+    stop)      cmd_stop      "$@" ;;
+    restart)   cmd_restart   "$@" ;;
+    attach)    cmd_attach    "$@" ;;
+    status)    cmd_status    "$@" ;;
+    update)    cmd_update    "$@" ;;
+    worktrees) cmd_worktrees "$@" ;;
+    exec)      cmd_exec      "$@" ;;
+    *) die "unknown command: $cmd (see: cto help)" ;;
+  esac
+}
+
+main "$@"

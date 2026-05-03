@@ -3,3 +3,9 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Each subdir under teams/ is its own git repo with its own bd tracker.
+# We intentionally do not vendor them in the CTO repo.
+teams/*
+!teams/.gitkeep
+
