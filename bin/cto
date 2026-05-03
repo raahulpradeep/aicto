@@ -1075,7 +1075,7 @@ while :; do
 
   case "$ROLE" in
     manager)
-      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) run 'bd list --status closed -l kind:merge,target:breakdown --json' to find merged breakdowns and file plan + review:plan for each; run 'bd list --status closed -l kind:merge,target:plan --json' to find merged plans and file dev + review:code pairs for each; (5) update the team's open kind:status-digest issue (or create one if none). Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
+      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) update the team's open kind:status-digest issue (or create one if none). All plan/dev filing and epic-ship detection is automated by the supervisor — do not do it manually. Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
       ;;
     developer|reviewer)
       label="role:$ROLE"
@@ -1244,6 +1244,87 @@ epic: $epic" \
 epic-branch: epic/$epic" \
               "Merge epic: $epic_title" >/dev/null 2>&1 || true
             log "filed epic merge for $epic"
+          fi
+        fi
+      done
+    fi
+
+    # Hook 4: after breakdown merge, file plan + review:plan
+    if [[ "$ROLE" == "manager" ]]; then
+      for merge in $(bd list --status closed -l kind:merge,target:breakdown --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
+        epic=$(bd show "$merge" --json 2>/dev/null | jq -r '.[0].description // ""' 2>/dev/null | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
+        if [[ -n "$epic" ]]; then
+          has_plan=$(bd list -l kind:plan --json 2>/dev/null | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
+          if [[ "$has_plan" == "0" ]]; then
+            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
+            plan_id=$(bd create -t task -l "role:developer,kind:plan" -p 2 \
+                      -d "epic: $epic
+Produce plans/$epic.md per breakdowns/$epic.md. Base your worktree on epic/$epic." \
+                      "Plan: $epic_title" 2>/dev/null | head -1 || true)
+            if [[ -n "$plan_id" ]]; then
+              review_id=$(bd create -t task -l "role:reviewer,kind:review,target:plan" -p 2 \
+                          -d "epic: $epic
+Read plans/$epic.md on branch task/$plan_id." \
+                          "Review plan: $epic_title" 2>/dev/null | head -1 || true)
+              if [[ -n "$review_id" ]]; then
+                bd dep "$plan_id" --blocks "$review_id" >/dev/null 2>&1 || true
+                log "filed plan $plan_id + review:plan $review_id for epic $epic"
+              fi
+            fi
+          fi
+        fi
+      done
+    fi
+
+    # Hook 5: after plan merge, file dev + review:code pairs
+    if [[ "$ROLE" == "manager" ]]; then
+      for merge in $(bd list --status closed -l kind:merge,target:plan --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
+        epic=$(bd show "$merge" --json 2>/dev/null | jq -r '.[0].description // ""' 2>/dev/null | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
+        if [[ -n "$epic" ]]; then
+          has_dev=$(bd list -l kind:dev --json 2>/dev/null | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
+          if [[ "$has_dev" == "0" ]]; then
+            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
+            plan_file=""
+            for pf in .cto/worktrees/"$epic"/plans/"$epic"*.md; do
+              [[ -f "$pf" ]] && { plan_file="$pf"; break; }
+            done
+            chunks=""
+            if [[ -n "$plan_file" && -f "$plan_file" ]]; then
+              chunks=$(grep -E '^### Dev [A-Z].*—' "$plan_file" 2>/dev/null | sed 's/^### Dev \([A-Z]\)[^—]*—[[:space:]]*\(.*\)$/\1|\2/' || true)
+            fi
+            if [[ -n "$chunks" ]]; then
+              while IFS='|' read -r dev_letter chunk_desc; do
+                dev_id=$(bd create -t task -l "role:developer,kind:dev" -p 2 \
+                         -d "epic: $epic
+Per plans/$(basename "$plan_file") §$dev_letter — $chunk_desc. Worktree: .cto/worktrees/<dev-id> off epic/$epic." \
+                         "$chunk_desc" 2>/dev/null | head -1 || true)
+                if [[ -n "$dev_id" ]]; then
+                  rev_id=$(bd create -t task -l "role:reviewer,kind:review,target:code" -p 2 \
+                           -d "epic: $epic
+Review diff on branch task/$dev_id against epic/$epic." \
+                           "Review: $chunk_desc" 2>/dev/null | head -1 || true)
+                  if [[ -n "$rev_id" ]]; then
+                    bd dep "$dev_id" --blocks "$rev_id" >/dev/null 2>&1 || true
+                    log "filed dev $dev_id + review:code $rev_id for epic $epic (chunk $dev_letter)"
+                  fi
+                fi
+              done <<< "$chunks"
+            else
+              dev_id=$(bd create -t task -l "role:developer,kind:dev" -p 2 \
+                       -d "epic: $epic
+Implement all deliverables from the merged plan for epic $epic. Read the plan document(s) in .cto/worktrees/$epic/plans/ for details. Worktree: .cto/worktrees/<dev-id> off epic/$epic." \
+                       "Implement $epic_title" 2>/dev/null | head -1 || true)
+              if [[ -n "$dev_id" ]]; then
+                rev_id=$(bd create -t task -l "role:reviewer,kind:review,target:code" -p 2 \
+                         -d "epic: $epic
+Review diff on branch task/$dev_id against epic/$epic." \
+                         "Review: $epic_title" 2>/dev/null | head -1 || true)
+                if [[ -n "$rev_id" ]]; then
+                  bd dep "$dev_id" --blocks "$rev_id" >/dev/null 2>&1 || true
+                  log "filed dev $dev_id + review:code $rev_id for epic $epic (full plan)"
+                fi
+              fi
+            fi
           fi
         fi
       done

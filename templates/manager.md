@@ -102,45 +102,17 @@ For each ready `merge` issue:
    ```
 6. Close the merge issue: `bd close <merge-id> -r "merged into epic/<epic-id>"`.
 
-### 4. After a breakdown merge: create plan + review:plan
+### 4. After a breakdown merge: plan + review:plan — AUTOMATED
 
-When a `kind:merge target:breakdown` closes, the breakdown is now on `epic/<epic-id>`. For each such epic that does not yet have a `kind:plan` child:
+**The supervisor hook handles this automatically.** After a `kind:merge target:breakdown` closes, the supervisor scans for it and files `kind:plan` + `kind:review target:plan` for the epic. Do **not** do this manually.
 
-```
-bd create -t task -l role:developer,kind:plan -p 2 \
-  "Plan: <epic title>" \
-  -d "epic: <epic-id>
-Produce plans/<epic-id>.md per breakdowns/<epic-id>.md. Base your worktree on epic/<epic-id>."
-PLAN_ID=$(...)
+*(If you see an epic stuck without a plan after a breakdown merge, the hook may have failed — check the supervisor logs in the manager tmux pane.)*
 
-bd create -t task -l role:reviewer,kind:review,target:plan -p 2 \
-  "Review plan: <epic title>" \
-  -d "epic: <epic-id>
-Read plans/<epic-id>.md on branch task/<plan-id>."
-REVIEW_ID=$(...)
+### 5. After a plan merge: dev + review:code pairs — AUTOMATED
 
-bd dep <PLAN_ID>  --blocks <REVIEW_ID>
-```
+**The supervisor hook handles this automatically.** After a `kind:merge target:plan` closes, the supervisor reads the merged plan, parses `## Dev Chunks` for chunk boundaries, and files one `kind:dev` + `kind:review target:code` pair per chunk. If no chunks are found, it files a single dev + review for the full plan. Do **not** do this manually.
 
-### 5. After a plan merge: create dev + review:code pairs
-
-When a `kind:merge target:plan` closes, read the merged `plans/<epic-id>.md` (now on `epic/<epic-id>`). For each chunk listed in the plan, file a `dev` and a paired `review:code`. Always include the `epic:` line so the dev/reviewer base their worktrees on `epic/<epic-id>`:
-
-```
-bd create -t task -l role:developer,kind:dev -p 2 \
-  "<chunk title>" \
-  -d "epic: <epic-id>
-Per plans/<epic-id>.md §<section>. Worktree: .cto/worktrees/<dev-id> off epic/<epic-id>."
-DEV_ID=$(...)
-
-bd create -t task -l role:reviewer,kind:review,target:code -p 2 \
-  "Review: <chunk title>" \
-  -d "epic: <epic-id>
-Review diff on branch task/<DEV_ID> against epic/<epic-id>."
-REV_ID=$(...)
-
-bd dep <DEV_ID>  --blocks <REV_ID>
-```
+*(If you see an epic stuck without dev tasks after a plan merge, the hook may have failed — check the supervisor logs.)*
 
 You do **not** file `kind:approval,target:plan` — that is the reviewer's job after their own approval. Do not pre-emptively merge. Wait for explicit `merge` issues.
 
@@ -160,21 +132,11 @@ EOF
 )"
 ```
 
-### 7. Ship epics (CTO-only merge to main)
+### 7. Ship epics (CTO-only merge to main) — AUTOMATED
 
-When all children of an epic are closed AND every sub-branch has been merged into `epic/<epic-id>` (i.e. only `.cto/worktrees/<epic-id>/` remains for this epic — all `manager/<id>`, `task/<id>` worktrees pruned), file a single CTO-targeted merge issue:
+**The supervisor hook handles this automatically.** When all children of an epic are closed, the supervisor files `kind:merge target:epic` for the CTO inbox. Do **not** do this manually.
 
-```
-bd create -t task -l role:cto,kind:merge,target:epic -p 1 \
-  "Merge epic: <epic title>" \
-  -d "epic: <epic-id>
-epic-branch: epic/<epic-id>
-artifacts: breakdowns/<epic-id>.md, plans/<epic-id>.md
-verdict: epic complete; all dev branches merged into epic/<epic-id>.
-Run 'cto merge-epic {{TEAM}} <epic-id>' (or 'cto approve {{TEAM}} <merge-id>') to ship to main."
-```
-
-Do **not** close the epic itself, do **not** merge into `main`, and do **not** prune the epic worktree. The CTO does all of that via `cto merge-epic`. Your job ends with filing the merge request.
+The CTO ships the epic via `cto merge-epic {{TEAM}} <epic-id>` or `cto approve {{TEAM}} <merge-id>`. Do **not** close the epic itself, do **not** merge into `main`, and do **not** prune the epic worktree.
 
 ### 8. Exit
 
