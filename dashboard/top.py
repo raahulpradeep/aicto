@@ -31,6 +31,7 @@ import tty
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+import concurrent.futures
 
 from rich.console import Console
 from rich.layout import Layout
@@ -48,6 +49,14 @@ RECENT_CLOSED_SCAN_PER_TEAM = 0  # 0 = unlimited; bd ordering is not chronologic
 # expensive (each invocation cold-starts dolt), so we run the per-team
 # queries in parallel.
 _POOL = ThreadPoolExecutor(max_workers=12)
+
+_MIN_PANEL_H = 8
+_MAX_TOP_ROWS = 6
+
+_layout_heights: dict[str, int] = {}
+_prev_console_size: tuple[int, int] = (0, 0)
+
+_prev_data: dict[str, tuple] = {}
 
 
 # ---- shell helpers --------------------------------------------------------
@@ -294,7 +303,11 @@ def _gather_team(team: str, tdir: Path):
 
 
 def gather():
-    """Return (agents, inbox, open_tasks, closed_recent, running)."""
+    """Return (agents, inbox, open_tasks, closed_recent, running).
+
+    Fetch is intentionally separated from render so every panel sees a
+    consistent snapshot — render() is never called with partially-gathered data.
+    """
     agents: list[dict] = []
     inbox: list[dict] = []
     open_tasks: list[dict] = []
@@ -307,19 +320,41 @@ def gather():
     teams = [
         p for p in sorted(TEAMS_DIR.iterdir()) if p.is_dir() and (p / ".cto").is_dir()
     ]
+    live_team_names = {t.name for t in teams}
+    # Evict stale-cache entries for teams that no longer exist on disk.
+    for gone in list(_prev_data.keys()):
+        if gone not in live_team_names:
+            del _prev_data[gone]
+
     futures = {team.name: _POOL.submit(_gather_team, team.name, team) for team in teams}
     for team_name, fut in futures.items():
-        result = fut.result()
+        result = None
+        try:
+            result = fut.result(timeout=10.0)
+        except (concurrent.futures.TimeoutError, Exception):
+            pass
+
         if result is None:
-            continue
+            cached = _prev_data.get(team_name)
+            if cached is None:
+                continue
+            a_rows, i_rows, o_rows, c_rows = cached
+            # Mark all rows from cache as stale so panels can signal the user.
+            a_rows = [{**r, "stale": True} for r in a_rows]
+            i_rows = [{**r, "stale": True} for r in i_rows]
+            o_rows = [{**r, "stale": True} for r in o_rows]
+            c_rows = [{**r, "stale": True} for r in c_rows]
+        else:
+            a_rows, i_rows, o_rows, c_rows = result
+            _prev_data[team_name] = result
+
         running.append(team_name)
-        a_rows, i_rows, o_rows, c_rows = result
         agents.extend(a_rows)
         inbox.extend(i_rows)
         open_tasks.extend(o_rows)
         closed.extend(c_rows)
 
-    # sort closed across teams by closed_at desc, take top 5
+    # sort closed across teams by closed_at desc, take top N
     closed.sort(key=lambda r: r.get("closed_at") or "", reverse=True)
     closed_recent = closed[:RECENT_CLOSED_LIMIT]
 
@@ -349,24 +384,30 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
     t.add_column("ELAPSED", justify="right", overflow="ellipsis", no_wrap=True)
 
     for row in agents:
-        agent = row["agent"]
+        stale = row.get("stale", False)
+        agent = ("~" if stale else "") + row["agent"]
         model = row.get("model", "—")
         issue = row["issue"]
+        row_style = "dim" if stale else ""
         if issue:
             started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
             secs = int((now - started).total_seconds()) if started else 0
             elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
             title = _truncate(issue.get("title", ""), 50)
             t.add_row(
-                agent,
-                model,
-                Text("working", style="green"),
-                Text(f"{issue['id']}  {title}"),
-                Text(elapsed, style="green"),
+                Text(agent, style=row_style),
+                Text(model, style=row_style),
+                Text("working", style="green" if not stale else "dim"),
+                Text(f"{issue['id']}  {title}", style=row_style),
+                Text(elapsed, style="green" if not stale else "dim"),
             )
         else:
             t.add_row(
-                agent, model, Text("idle", style="dim"), Text("—", style="dim"), "—"
+                Text(agent, style=row_style),
+                Text(model, style=row_style),
+                Text("idle", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"),
             )
     return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
 
@@ -380,6 +421,9 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
     t.add_column("LABELS", overflow="ellipsis", no_wrap=True, ratio=1)
     if inbox:
         for row in inbox:
+            stale = row.get("stale", False)
+            team_disp = ("~" if stale else "") + row["team"]
+            row_style = "dim" if stale else ""
             labels = ",".join(
                 lbl for lbl in row.get("labels", []) if not lbl.startswith("role:cto")
             )
@@ -387,10 +431,10 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
                 row.get("description", ""), row["team"], row.get("labels", [])
             )
             t.add_row(
-                row["team"],
-                row["id"],
-                row.get("title", ""),
-                Text(artifact, style="cyan"),
+                Text(team_disp, style=row_style),
+                Text(row["id"], style=row_style),
+                Text(row.get("title", ""), style=row_style),
+                Text(artifact, style="cyan" if not stale else "dim"),
                 Text(labels, style="dim"),
             )
     else:
@@ -423,15 +467,21 @@ def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
             key=lambda r: (r.get("priority") or 99, r.get("created_at") or ""),
         )
         for row in rows:
+            stale = row.get("stale", False)
+            team_disp = ("~" if stale else "") + row["team"]
+            row_style = "dim" if stale else ""
             assignee = row.get("assignee") or ""
-            assignee_disp = Text(assignee, style="green") if assignee else Text("—", style="dim")
+            if stale:
+                assignee_disp = Text(assignee or "—", style="dim")
+            else:
+                assignee_disp = Text(assignee, style="green") if assignee else Text("—", style="dim")
             t.add_row(
-                row["team"],
-                row.get("id", ""),
-                _kind(row.get("labels") or []),
-                _truncate(row.get("title", ""), 60),
+                Text(team_disp, style=row_style),
+                Text(row.get("id", ""), style=row_style),
+                Text(_kind(row.get("labels") or []), style=row_style),
+                Text(_truncate(row.get("title", ""), 60), style=row_style),
                 assignee_disp,
-                _age(row, now),
+                Text(_age(row, now), style=row_style),
             )
     else:
         t.add_row(
@@ -460,18 +510,21 @@ def _closed_panel(closed: list[dict]) -> Panel:
     t.add_column("AT", overflow="ellipsis", no_wrap=True)
     if closed:
         for row in closed:
+            stale = row.get("stale", False)
+            team_disp = ("~" if stale else "") + row["team"]
+            row_style = "dim" if stale else ""
             closed_at = _parse_iso(row.get("closed_at") or "")
             at_str = closed_at.astimezone().strftime("%H:%M:%S") if closed_at else "—"
             closer = _classify_closed(row)
-            closer_style = "green" if closer == "CTO" else "yellow"
+            closer_style = "dim" if stale else ("green" if closer == "CTO" else "yellow")
             t.add_row(
-                row["team"],
-                row.get("id", ""),
-                _kind(row.get("labels") or []),
-                _truncate(row.get("title", ""), 50),
+                Text(team_disp, style=row_style),
+                Text(row.get("id", ""), style=row_style),
+                Text(_kind(row.get("labels") or []), style=row_style),
+                Text(_truncate(row.get("title", ""), 50), style=row_style),
                 Text(closer, style=closer_style),
-                _resolve_time(row),
-                at_str,
+                Text(_resolve_time(row), style=row_style),
+                Text(at_str, style=row_style),
             )
     else:
         t.add_row(
@@ -486,6 +539,16 @@ def _closed_panel(closed: list[dict]) -> Panel:
 
 
 # ---- render ---------------------------------------------------------------
+
+
+def _compute_layout_heights(term_h: int) -> dict[str, int]:
+    """Compute stable panel-height budget from terminal height."""
+    usable = max(term_h - 1, 3 * _MIN_PANEL_H)
+    top_h = max(_MIN_PANEL_H, usable * 4 // 10)
+    remaining = usable - top_h
+    open_h = max(_MIN_PANEL_H, remaining // 2)
+    closed_h = max(_MIN_PANEL_H, remaining - open_h)
+    return {"top": top_h, "open": open_h, "closed": closed_h, "footer": 1}
 
 
 def _panel_height(row_count: int) -> int:
@@ -504,7 +567,10 @@ def render(
     closed: list[dict],
     running: list[str],
     gather_ms: int = 0,
+    console: Console | None = None,
 ) -> Layout:
+    global _prev_console_size, _layout_heights
+
     now = dt.datetime.now(dt.timezone.utc)
 
     agent_panel = _agent_panel(agents, running, now)
@@ -520,36 +586,19 @@ def render(
         justify="center",
     )
 
-    # Calculate minimum height for each panel so every row is visible.
-    # Panels with no data still render a placeholder row ("—").
-    top_h = max(
-        _panel_height(len(agents)),
-        _panel_height(max(1, len(inbox))),
-    )
-    open_h = _panel_height(max(1, len(open_tasks)))
-    closed_h = _panel_height(max(1, len(closed)))
-    footer_h = 1
+    # Only recompute the height budget when the terminal is resized; this
+    # prevents row-jump flicker caused by per-cycle panel height fluctuations.
+    if console is None:
+        console = Console()
+    cur_size = (console.size.width, console.size.height)
+    if cur_size != _prev_console_size or not _layout_heights:
+        _layout_heights = _compute_layout_heights(console.height)
+        _prev_console_size = cur_size
 
-    # If the total exceeds terminal height, reduce from bottom up,
-    # never clipping below the absolute minimum (header + 1 row + borders).
-    term_h = Console().height
-    total = top_h + open_h + closed_h + footer_h
-    if total > term_h:
-        deficit = total - term_h
-        # Shrink open first, then closed, then top — but never below 4 rows.
-        for target, name in ((open_h, "open"), (closed_h, "closed"), (top_h, "top")):
-            if deficit <= 0:
-                break
-            avail = target - 4
-            if avail > 0:
-                reduction = min(avail, deficit)
-                if name == "open":
-                    open_h -= reduction
-                elif name == "closed":
-                    closed_h -= reduction
-                else:
-                    top_h -= reduction
-                deficit -= reduction
+    top_h = _layout_heights["top"]
+    open_h = _layout_heights["open"]
+    closed_h = _layout_heights["closed"]
+    footer_h = _layout_heights["footer"]
 
     layout = Layout()
     layout.split_column(
@@ -619,9 +668,10 @@ def main() -> int:
                             closed,
                             running,
                             gather_ms=gather_ms,
-                        )
+                            console=live.console,
+                        ),
+                        refresh=True,
                     )
-                    live.refresh()
                     if stdin_quit_pressed(KEY_POLL_S):
                         break
             except KeyboardInterrupt:
