@@ -842,13 +842,34 @@ while :; do
   esac
 
   log "invoking claude (task=${task_id:-none})"
+  # Stream events as they happen (tool calls + tool results + text)
+  # so the tmux pane shows what the agent is actually doing in real
+  # time, not just a summary at the end. The jq filter is forgiving:
+  # malformed lines are silently dropped (// empty).
   claude --print \
+    --output-format stream-json --verbose \
     --permission-mode "$PERM" \
     --model "$MODEL" \
     --append-system-prompt "$(cat "$ROLE_FILE")" \
     "$starter" \
-    2> >(tee "$err" >&2)
-  rc=$?
+    2> >(tee "$err" >&2) \
+  | jq -r --unbuffered '
+      . as $e |
+      if $e.type == "assistant" then
+        ($e.message.content // [])[]?
+        | if .type == "text" and ((.text // "") | length) > 0 then
+            .text
+          elif .type == "tool_use" then
+            "  → " + .name + " " + ((.input // {}) | tostring | if length>140 then .[0:140]+"…" else . end)
+          else empty end
+      elif $e.type == "user" then
+        ($e.message.content // [])[]?
+        | select(.type == "tool_result")
+        | (.content // "" | tostring | if length>200 then .[0:200]+"…" else . end)
+        | "  ← " + .
+      else empty end
+    ' 2>/dev/null
+  rc=${PIPESTATUS[0]}
 
   if (( rc != 0 )); then
     log "claude exited $rc"
