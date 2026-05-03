@@ -1,0 +1,10 @@
+# AI CTO team config — edit via 'cto config aicto …', not by hand.
+developers: 2
+reviewers: 1
+manager: true
+permissionMode: bypassPermissions
+containerUse: false
+agentProvider: claude
+model: sonnet
+managerModel: claude-opus-4-6
+extraArgs: []
