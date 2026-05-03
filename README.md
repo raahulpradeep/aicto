@@ -126,6 +126,7 @@ Run `bin/cto help` for a full list. Common ones:
 | `cto attach <n> [<window>]` | drop into the tmux session |
 | `cto status [<n>]` | bd snapshot + tmux state |
 | `cto update <n> [--fresh]` | latest manager status digest |
+| `cto top` | live `top`-style dashboard: every agent across every running team + the CTO inbox; refresh ~1s; quit with `q` |
 | `cto worktrees <n>` / `cto worktrees prune <n>` | list / GC per-task worktrees |
 | `cto exec <n> -- <cmd…>` | escape hatch: run a command in the team's main worktree |
 

@@ -198,6 +198,7 @@ Usage:
 
   cto status [<team>]
   cto update <team> [--fresh]
+  cto top                                   # live top-style dashboard
 
   cto worktrees <team>
   cto worktrees prune <team>
@@ -999,6 +1000,17 @@ cmd_worktrees() {
   esac
 }
 
+# ---- top -----------------------------------------------------------------
+#
+# Live `top`-style dashboard. Single command, refreshes ~1s, quit with q.
+# Implemented as a Python script (rich) under uv so we don't add a global
+# dep — same pattern as the MCP server.
+
+cmd_top() {
+  require_cmd uv
+  exec uv run --quiet --with rich python3 "$CTO_ROOT/dashboard/top.py" "$@"
+}
+
 # ---- exec ----------------------------------------------------------------
 
 cmd_exec() {
@@ -1040,6 +1052,7 @@ main() {
     attach)    cmd_attach    "$@" ;;
     status)    cmd_status    "$@" ;;
     update)    cmd_update    "$@" ;;
+    top)       cmd_top       "$@" ;;
     worktrees) cmd_worktrees "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
