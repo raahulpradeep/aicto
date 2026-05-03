@@ -708,9 +708,22 @@ action: merge --no-ff into $merge_into, prune the sub-worktree, close this issue
 
 # ---- merge-epic ----------------------------------------------------------
 #
-# CTO-only. Merge epic/<epic-id> into main from the team's main worktree.
-# Closes the open kind:merge target:epic issue, closes the epic itself,
-# and prunes the epic worktree + branch. Idempotent: safe to re-run.
+# CTO-only. Merge epic/<epic-id> into main (or parent_branch) from the team's
+# main worktree. Closes the open kind:merge target:epic issue, closes the
+# epic itself, and prunes the epic worktree + branch. Idempotent: safe to re-run.
+
+# Read the parent_branch stored in an epic's description. Returns "main" if unset.
+# team_root must be the main worktree root (bd only works from there).
+epic_parent_branch() {
+  local team_root="$1" epic_id="$2"
+  local desc
+  desc=$(cd "$team_root" && bd show "$epic_id" --json 2>/dev/null \
+         | jq -r 'if type=="array" then .[0].description // "" else .description // "" end')
+  local pb
+  pb=$(grep -oE 'parent_branch:[[:space:]]*[A-Za-z0-9._/-]+' <<<"$desc" \
+       | head -1 | sed 's/parent_branch:[[:space:]]*//')
+  echo "${pb:-main}"
+}
 
 cmd_merge_epic() {
   local team="${1:-}" epic_id="${2:-}"; shift 2 2>/dev/null || true
@@ -726,16 +739,23 @@ cmd_merge_epic() {
 
   local tdir; tdir="$(team_dir "$team")"
   local epic_branch="epic/$epic_id"
+  local merge_target
+  merge_target="$(epic_parent_branch "$tdir" "$epic_id")"
 
   if ! git -C "$tdir" show-ref --verify --quiet "refs/heads/$epic_branch"; then
     warn "epic branch '$epic_branch' not found — nothing to merge"
   else
-    # Verify the team's main worktree is on main; refuse to coerce.
+    # Validate that the merge target branch exists locally or on origin.
+    git -C "$tdir" show-ref --verify --quiet "refs/heads/$merge_target" \
+      || git -C "$tdir" show-ref --verify --quiet "refs/remotes/origin/$merge_target" \
+      || die "merge-epic: target branch '$merge_target' not found locally or on origin"
+
+    # Verify the team's main worktree is on the merge target; refuse to coerce.
     local head
     head="$(git -C "$tdir" symbolic-ref --short HEAD 2>/dev/null || true)"
-    [[ "$head" == "main" ]] || die "merge-epic: team main worktree is on '$head', not main; refusing to checkout"
+    [[ "$head" == "$merge_target" ]] || die "merge-epic: team main worktree is on '$head', not '$merge_target'; refusing to checkout"
 
-    info "merging $epic_branch into main"
+    info "merging $epic_branch into $merge_target"
     # Agents are constantly writing to .beads/issues.jsonl while the team is
     # running. Stash bd state in the main worktree (if dirty) so the merge
     # proceeds cleanly, then pop it back.
@@ -747,7 +767,7 @@ cmd_merge_epic() {
       fi
     fi
 
-    if ! git -C "$tdir" -c commit.gpgsign=false merge --no-ff "$epic_branch" -m "merge $epic_branch"; then
+    if ! git -C "$tdir" -c commit.gpgsign=false merge --no-ff "$epic_branch" -m "merge $epic_branch into $merge_target"; then
       warn "merge failed (likely conflict). Resolve in $tdir, then re-run cto merge-epic $team $epic_id."
       (( stashed )) && git -C "$tdir" stash pop >/dev/null 2>&1 || true
       return 1
@@ -772,7 +792,7 @@ cmd_merge_epic() {
   epic_status=$(cd "$tdir" && bd show "$epic_id" --json 2>/dev/null \
                 | jq -r 'if type=="array" then .[0].status // "" else .status // "" end' 2>/dev/null || true)
   if [[ "$epic_status" == "open" || "$epic_status" == "in_progress" ]]; then
-    ( cd "$tdir" && bd close "$epic_id" -r "epic merged into main by CTO" >/dev/null ) || true
+    ( cd "$tdir" && bd close "$epic_id" -r "epic merged into $merge_target by CTO" >/dev/null ) || true
     info "closed epic $epic_id"
   fi
 
@@ -1360,9 +1380,12 @@ cmd_worktrees() {
       while IFS=$'\t' read -r path branch; do
         [[ -z "$path" || "$path" == "$tdir" ]] && continue
         local merged=0
-        # epic/* branches are only safe to prune once they've landed on main.
+        # epic/* branches are only safe to prune once they've landed on their target branch.
         if [[ "$branch" == epic/* ]]; then
-          if git -C "$tdir" merge-base --is-ancestor "$branch" main 2>/dev/null; then
+          local epic_issue="${branch#epic/}"
+          local parent_target
+          parent_target="$(epic_parent_branch "$tdir" "$epic_issue")"
+          if git -C "$tdir" merge-base --is-ancestor "$branch" "$parent_target" 2>/dev/null; then
             merged=1
           fi
         else
