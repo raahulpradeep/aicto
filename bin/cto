@@ -226,7 +226,7 @@ _team_scaffold() {
 
   # Append cto-managed gitignore lines (idempotent).
   if ! grep -qxF '.cto/worktrees/' "$tdir/.gitignore" 2>/dev/null; then
-    printf '\n# cto\n.cto/worktrees/\n.cto/prompts/\n' >> "$tdir/.gitignore"
+    printf '\n# cto\n.cto/worktrees/\n.cto/prompts/\n.cto/locks/\n' >> "$tdir/.gitignore"
   fi
 
   cat > "$tdir/.cto/config.yaml" <<EOF
@@ -731,13 +731,24 @@ set -uo pipefail
 TEAM_DIR="$1"; ROLE="$2"; SLOT="$3"; ROLE_FILE="$4"; PERM="$5"; MODEL="$6"
 cd "$TEAM_DIR"
 
+# Globally unique agent identity. Used as the bd assignee, the
+# filesystem-lock owner stamp, and the agent's self-identifier in
+# claude prompts. Team names are unique within the CTO workspace, so
+# "<team>:<slot>" is unique across every team.
+TEAM=$(basename "$TEAM_DIR")
+AGENT="$TEAM:$SLOT"
+
+LOCKS="$TEAM_DIR/.cto/locks"
+mkdir -p "$LOCKS"
+
 ts() { date '+%H:%M:%S'; }
-log() { printf '[%s %s] %s\n' "$(ts)" "$SLOT" "$*"; }
+log() { printf '[%s %s] %s\n' "$(ts)" "$AGENT" "$*"; }
 
 release_claim() {
   local id="$1"
   [[ -z "$id" ]] && return 0
   bd update "$id" --status open --assignee "" >/dev/null 2>&1 || true
+  rm -rf "$LOCKS/$id" 2>/dev/null || true
   log "released claim on $id"
 }
 
@@ -747,7 +758,7 @@ escalate_permission() {
   bd create -t task -l "role:cto,kind:permission-blocked" -p 1 \
     --silent \
     --body-file "$errfile" \
-    "Agent $SLOT blocked on permissions${id:+ (issue $id)}" \
+    "Agent $AGENT blocked on permissions${id:+ (issue $id)}" \
     >/dev/null 2>&1 || true
 }
 
@@ -767,23 +778,38 @@ while :; do
     manager)
       starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) after a breakdown merges, file plan + review:plan; after a plan merges, file dev + review:code pairs; (5) update the team's open kind:status-digest issue (or create one if none). Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
       ;;
-    developer)
-      task_id=$(bd ready --label "role:developer" --json 2>/dev/null \
-                | jq -r 'sort_by(.priority) | .[0].id // empty')
-      [[ -z "$task_id" ]] && { rm -f "$err"; sleep 15; continue; }
-      bd update "$task_id" --claim >/dev/null 2>&1 \
-        || { log "lost claim race on $task_id"; rm -f "$err"; sleep 5; continue; }
-      log "claimed $task_id"
-      starter="You have been assigned bd issue $task_id (already claimed for you on this iteration). Run 'bd show $task_id' to read it, identify whether it's kind:plan or kind:dev, set up your worktree, do the work, run any project tests/lints, commit on the task branch, and close the bd issue with a short gist (artifact path, branch, files-touched count, one-line test result). Do exactly one bd issue this iteration and exit."
-      ;;
-    reviewer)
-      task_id=$(bd ready --label "role:reviewer" --json 2>/dev/null \
-                | jq -r 'sort_by(.priority) | .[0].id // empty')
-      [[ -z "$task_id" ]] && { rm -f "$err"; sleep 15; continue; }
-      bd update "$task_id" --claim >/dev/null 2>&1 \
-        || { log "lost claim race on $task_id"; rm -f "$err"; sleep 5; continue; }
-      log "claimed $task_id"
-      starter="You have been assigned bd review issue $task_id (already claimed). Run 'bd show $task_id' to identify the upstream (target:plan or target:code) and what artifact to read. Apply your principal-engineer review; if approved on a plan, file the kind:approval target:plan for the CTO; if approved on code, file the kind:merge for the manager; if changes requested, reopen upstream with concrete asks. Do exactly one review this iteration and exit."
+    developer|reviewer)
+      label="role:$ROLE"
+      # Atomic claim: walk the ready queue in priority order and try to
+      # `mkdir` a per-issue lock directory under .cto/locks/. mkdir is
+      # atomic on a local filesystem, so only one slot wins per id.
+      # bd's --claim is no help here because it sets assignee = current
+      # OS user, which is the same string for every slot in this team.
+      task_id=""
+      for cand in $(bd ready --label "$label" --json 2>/dev/null \
+                    | jq -r 'sort_by(.priority) | .[].id'); do
+        if mkdir "$LOCKS/$cand" 2>/dev/null; then
+          echo "$AGENT" > "$LOCKS/$cand/owner"
+          task_id="$cand"
+          break
+        fi
+      done
+      if [[ -z "$task_id" ]]; then rm -f "$err"; sleep 15; continue; fi
+
+      # Stamp the bd issue with our globally-unique agent identity and
+      # flip it to in_progress so it falls out of `bd ready` for everyone.
+      if ! bd update "$task_id" --status in_progress --assignee "$AGENT" >/dev/null 2>&1; then
+        log "could not flip $task_id to in_progress; releasing"
+        release_claim "$task_id"
+        rm -f "$err"; sleep 5; continue
+      fi
+      log "claimed $task_id (assignee=$AGENT)"
+
+      if [[ "$ROLE" == developer ]]; then
+        starter="You are agent '$AGENT'. You have been assigned bd issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to read it, identify whether it's kind:plan or kind:dev, set up your worktree, do the work, run any project tests/lints, commit on the task branch, and close the bd issue with a short gist (artifact path, branch, files-touched count, one-line test result). Do exactly one bd issue this iteration and exit."
+      else
+        starter="You are agent '$AGENT'. You have been assigned bd review issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to identify the upstream (target:plan or target:code) and what artifact to read. Apply your principal-engineer review; if approved on a plan, file the kind:approval target:plan for the CTO; if approved on code, file the kind:merge for the manager; if changes requested, reopen upstream with concrete asks. Do exactly one review this iteration and exit."
+      fi
       ;;
     *) log "unknown role: $ROLE"; exit 2 ;;
   esac
@@ -807,6 +833,10 @@ while :; do
       sleep 30
     fi
   else
+    # On success the agent closed the bd issue itself; we just need to
+    # release the per-issue lock dir so the next iteration can pick up
+    # the next ready item.
+    [[ -n "$task_id" ]] && rm -rf "$LOCKS/$task_id" 2>/dev/null
     log "iteration ok (task=${task_id:-none})"
     [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
   fi
