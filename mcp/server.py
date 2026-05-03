@@ -168,6 +168,22 @@ def task(
 
 
 @mcp.tool()
+def promote(team: str, issue_ids: list[str], kind: str = "epic") -> str:
+    """Retrofit existing bd issues with role:manager + kind:<kind> labels
+    so the team's manager agent picks them up. Use after adopting a repo
+    whose pre-existing issues don't yet carry the cto workflow labels.
+
+    kind defaults to 'epic' (the manager will then decompose them); use
+    'dev' or 'plan' only as escape hatches that bypass the breakdown
+    gate."""
+    if kind not in ("epic", "dev", "plan"):
+        raise ValueError(f"kind must be epic|dev|plan, got {kind!r}")
+    if not issue_ids:
+        raise ValueError("issue_ids must contain at least one id")
+    return _run(["promote", team, f"--{kind}", *issue_ids])
+
+
+@mcp.tool()
 def inbox(team: Optional[str] = None) -> str:
     """List open bd issues with role:cto across all teams (or a single
     team). This is what's awaiting human-CTO approval — typically

@@ -495,6 +495,34 @@ cmd_task() {
   info "filed $id ($kind, role:manager) in team $name"
 }
 
+# ---- promote -------------------------------------------------------------
+#
+# Retrofit existing bd issues with role:* + kind:* labels so the team's
+# agents start picking them up. Used when adopting a repo whose issues
+# pre-date the cto workflow.
+
+cmd_promote() {
+  local team="${1:-}"; shift || true
+  require_team "$team"
+  local kind=epic
+  local ids=()
+  while (( $# )); do
+    case "$1" in
+      --epic) kind=epic; shift ;;
+      --dev)  kind=dev;  shift ;;
+      --plan) kind=plan; shift ;;
+      --) shift ;;
+      -*) die "unknown promote flag: $1" ;;
+      *) ids+=("$1"); shift ;;
+    esac
+  done
+  (( ${#ids[@]} )) || die "promote: at least one issue id required"
+  for id in "${ids[@]}"; do
+    ( cd "$(team_dir "$team")" && bd update "$id" --add-label "role:manager,kind:$kind" >/dev/null )
+    info "promoted $id → role:manager,kind:$kind"
+  done
+}
+
 # ---- inbox ---------------------------------------------------------------
 
 cmd_inbox() {
@@ -822,6 +850,7 @@ main() {
       ;;
     config)    cmd_config    "$@" ;;
     task)      cmd_task      "$@" ;;
+    promote)   cmd_promote   "$@" ;;
     inbox)     cmd_inbox     "$@" ;;
     approve)   cmd_approve   "$@" ;;
     reject)    cmd_reject    "$@" ;;
