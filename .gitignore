@@ -15,3 +15,8 @@ teams/*
 **/__pycache__/
 *.pyc
 
+
+# cto
+.cto/worktrees/
+.cto/prompts/
+.cto/locks/

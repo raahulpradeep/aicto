@@ -1,94 +1,59 @@
-# Project Instructions for AI Agents
+# aicto — team workspace
 
-This file provides instructions and context for AI coding agents working on this project.
+This repository is a **team workspace** owned by an AI CTO. Multiple AI agents (a manager, developers, and reviewers) work here in parallel, coordinating exclusively through this team's beads tracker.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+> If you are a human reading this: do **not** run interactive agent sessions here unless you've read `~/Work/control-room/aicto/README.md`. Use `cto …` from the parent dir.
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+## How this team operates
 
-### Quick Reference
+- One **manager**, 2 **developers**, 1 **reviewers** (configured in `.cto/config.yaml`).
+- Each epic gets its own long-lived feature branch `epic/<epic-id>` and worktree at `.cto/worktrees/<epic-id>/`. **All sub-branches** (`manager/<id>`, `task/<id>`) are carved off the epic branch and live in sibling sub-worktrees at `.cto/worktrees/<issue-id>/`. The team's main worktree always stays on `main`. The manager merges sub-branches **into the epic worktree**; only the **CTO** merges `epic/<id>` into `main`.
+- bd lives in the **main worktree only**. All bd commands run from `/Users/rahulpradeep/Work/control-room/aicto/teams/aicto`.
+- `containerUse: false` — when true, developers use the `container-use` MCP tools instead of bare git worktrees.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
+## Workflow stages (encoded as bd labels on `task`-typed issues)
 
-### Rules
+| label | meaning |
+| --- | --- |
+| `kind:epic` | High-level CTO ask. Owned by manager. |
+| `kind:breakdown` | Manager's written breakdown of an epic. |
+| `kind:plan` | Developer-authored design doc (`plans/<epic-id>.md`). |
+| `kind:dev` | Developer-authored implementation. |
+| `kind:review` + `target:plan|code` | Reviewer's read of a plan or code diff. |
+| `kind:approval` + `target:breakdown|plan` | CTO's final sign-off. |
+| `kind:merge` + `target:breakdown|plan|code` | Manager merges a sub-branch into `epic/<epic-id>` (never `main`). |
+| `kind:merge` + `target:epic` + `role:cto` | **CTO-only.** Manager files this when the epic is complete; CTO runs `cto merge-epic` to merge `epic/<id>` into `main`. |
+| `kind:status-digest` / `kind:status-request` | Manager↔CTO status protocol. |
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+| label | meaning |
+| --- | --- |
+| `role:manager`, `role:developer`, `role:reviewer`, `role:cto` | Who claims it. |
 
-## Session Completion
+## Gates the workflow enforces
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+1. The CTO must close `kind:approval target:breakdown` before any plan is filed.
+2. The reviewer must close `kind:review target:plan` (approved) before they file `kind:approval target:plan`.
+3. The CTO must close `kind:approval target:plan` before any `kind:dev` is filed.
+4. The reviewer must close `kind:review target:code` (approved) before a `kind:merge` is filed for that dev branch.
+5. The manager merges sub-branches into `epic/<epic-id>`, only via a `kind:merge target:breakdown|plan|code` issue.
+6. **Only the CTO merges `epic/<id>` into `main`**, via `cto merge-epic` (or `cto approve` on the manager-filed `kind:merge target:epic role:cto` issue). The manager never touches `main`.
 
-**MANDATORY WORKFLOW:**
+## Gist discipline
 
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+bd issue bodies and comments hold **gists**, not artifacts. ≤ 5 lines or ≤ 80 words. Real content lives as committed files in worktrees, referenced by path + branch.
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
-
-
-## CTO operating mode
-
-This directory is the **AI CTO workspace**. Each subdirectory under `teams/` is its own git repo with its own beads tracker and a small org chart of agents (manager, developers, reviewers). Coordination happens through bd.
-
-You (the AI coding assistant in this workspace) act as the **CTO's hands**. Prefer the **`cto` MCP tools** (registered via `.mcp.json` and exposed as `mcp__cto__*` here) over running `bin/cto` through Bash — they're the same operations but show up cleanly as structured tool calls. The `bin/cto` CLI remains the source of truth for humans and is what the MCP wraps.
-
-Don't poke into `teams/<name>/.beads/` directly; route everything through the cto MCP tools or CLI.
-
-> Team agents (manager, developers, reviewers) **do not** load this MCP. They run inside `teams/<name>/`, which is a different project root with its own `.git`. Only this CTO workspace has the cto MCP wired up.
-
-### Common operations
+## Quick reference
 
 ```bash
-bin/cto team list                                      # see teams + open issue counts
-bin/cto team create <name> [--developers N] [--reviewers M] [--container-use]
-bin/cto config <name> --developers 3                   # change team shape
-
-bin/cto task <name> "<title>" --epic -d "<intent>"     # file an epic
-bin/cto inbox                                          # what's awaiting CTO approval?
-bin/cto approve <name> <id>                            # approve breakdown OR plan
-bin/cto reject  <name> <id> --comment "<why>"          # bounce it back
-
-bin/cto start <name>                                   # bring up the team's tmux session
-bin/cto attach <name> [<window>]                       # watch an agent live
-bin/cto stop   <name>                                  # graceful Ctrl-C + kill
-bin/cto status [<name>]                                # bd state + tmux state
-bin/cto update <name> [--fresh]                        # latest manager status digest
-
-bin/cto worktrees <name>                               # list per-task worktrees
-bin/cto worktrees prune <name>                         # garbage-collect merged ones
+bd ready --label role:<myrole> --json     # what should I work on?
+bd update <id> --claim                     # atomic claim
+bd close <id> -r "<gist>"                  # finish work
+bd dep <a> --blocks <b>                    # dependency
+bd list --status open --label role:cto     # what's awaiting CTO?
 ```
 
-### Hard rules (mirror what the team prompts enforce)
+<!-- Beads integration block (auto-managed) is appended below by `bd init`. -->
 
-- **File epics, never `--dev` directly.** That bypasses the breakdown gate.
-- **Two CTO gates exist**: `kind:approval target:breakdown` (filed by the manager) and `kind:approval target:plan` (filed by the reviewer **after** their own approval). Both reach the human via `cto inbox`. Both are closed via `cto approve` / `cto reject`.
-- **Code reviews never reach the CTO.** If `cto inbox` ever shows a `target:code` item, that is a workflow bug.
-- **bd holds gists, not artifacts.** Real plans/breakdowns/diffs live as committed files in `teams/<name>/breakdowns/`, `…/plans/`, `…/docs/reviews/`, and on per-task branches under `…/.cto/worktrees/`. When asked to read an artifact, use the Read tool against its path; don't dump bd descriptions.
-- **When the human asks how a team is doing → `cto update <name>`** (or `--fresh`). Don't grep bd directly.
-- **Never edit a team's source code from this CTO workspace.** Teams own their own repos.
+## Original project CLAUDE.md
 
-The CTO's own `.beads/` (this directory) is for cross-team initiatives, not for per-team work.
+Preserved at `.cto/orig-CLAUDE.md`. Merge in any project-specific guidance you want agents to follow.
