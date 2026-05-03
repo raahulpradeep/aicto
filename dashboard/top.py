@@ -49,6 +49,12 @@ RECENT_CLOSED_SCAN_PER_TEAM = 0  # 0 = unlimited; bd ordering is not chronologic
 # queries in parallel.
 _POOL = ThreadPoolExecutor(max_workers=12)
 
+_MIN_PANEL_H = 8
+_MAX_TOP_ROWS = 6
+
+_layout_heights: dict[str, int] = {}
+_prev_console_size: tuple[int, int] = (0, 0)
+
 
 # ---- shell helpers --------------------------------------------------------
 
@@ -488,6 +494,16 @@ def _closed_panel(closed: list[dict]) -> Panel:
 # ---- render ---------------------------------------------------------------
 
 
+def _compute_layout_heights(term_h: int) -> dict[str, int]:
+    """Compute stable panel-height budget from terminal height."""
+    usable = max(term_h - 1, 3 * _MIN_PANEL_H)
+    top_h = max(_MIN_PANEL_H, usable * 4 // 10)
+    remaining = usable - top_h
+    open_h = max(_MIN_PANEL_H, remaining // 2)
+    closed_h = max(_MIN_PANEL_H, remaining - open_h)
+    return {"top": top_h, "open": open_h, "closed": closed_h, "footer": 1}
+
+
 def _panel_height(row_count: int) -> int:
     """Minimum rows to display a table with N data rows without clipping.
 
@@ -504,7 +520,10 @@ def render(
     closed: list[dict],
     running: list[str],
     gather_ms: int = 0,
+    console: Console | None = None,
 ) -> Layout:
+    global _prev_console_size, _layout_heights
+
     now = dt.datetime.now(dt.timezone.utc)
 
     agent_panel = _agent_panel(agents, running, now)
@@ -520,36 +539,19 @@ def render(
         justify="center",
     )
 
-    # Calculate minimum height for each panel so every row is visible.
-    # Panels with no data still render a placeholder row ("—").
-    top_h = max(
-        _panel_height(len(agents)),
-        _panel_height(max(1, len(inbox))),
-    )
-    open_h = _panel_height(max(1, len(open_tasks)))
-    closed_h = _panel_height(max(1, len(closed)))
-    footer_h = 1
+    # Only recompute the height budget when the terminal is resized; this
+    # prevents row-jump flicker caused by per-cycle panel height fluctuations.
+    if console is None:
+        console = Console()
+    cur_size = (console.size.width, console.size.height)
+    if cur_size != _prev_console_size or not _layout_heights:
+        _layout_heights = _compute_layout_heights(console.height)
+        _prev_console_size = cur_size
 
-    # If the total exceeds terminal height, reduce from bottom up,
-    # never clipping below the absolute minimum (header + 1 row + borders).
-    term_h = Console().height
-    total = top_h + open_h + closed_h + footer_h
-    if total > term_h:
-        deficit = total - term_h
-        # Shrink open first, then closed, then top — but never below 4 rows.
-        for target, name in ((open_h, "open"), (closed_h, "closed"), (top_h, "top")):
-            if deficit <= 0:
-                break
-            avail = target - 4
-            if avail > 0:
-                reduction = min(avail, deficit)
-                if name == "open":
-                    open_h -= reduction
-                elif name == "closed":
-                    closed_h -= reduction
-                else:
-                    top_h -= reduction
-                deficit -= reduction
+    top_h = _layout_heights["top"]
+    open_h = _layout_heights["open"]
+    closed_h = _layout_heights["closed"]
+    footer_h = _layout_heights["footer"]
 
     layout = Layout()
     layout.split_column(
@@ -619,9 +621,10 @@ def main() -> int:
                             closed,
                             running,
                             gather_ms=gather_ms,
-                        )
+                            console=live.console,
+                        ),
+                        refresh=True,
                     )
-                    live.refresh()
                     if stdin_quit_pressed(KEY_POLL_S):
                         break
             except KeyboardInterrupt:
