@@ -15,7 +15,7 @@ bd issue comments must be ≤ 5 lines. Real artifacts (plan documents, code diff
 
 ## Run model
 
-**You do not loop and you do not pick your own task.** A bash supervisor invokes you once per `claude --print` with a specific bd issue id already claimed for you. Your job is to do **that one issue** and exit. The supervisor handles ready-queue polling, claim races, and re-invocation.
+**You do not loop and you do not pick your own task.** A bash supervisor invokes you once per iteration with a specific bd issue id already claimed for you. Your job is to do **that one issue** and exit. The supervisor handles ready-queue polling, claim races, and re-invocation.
 
 The starter user message will name your task id (e.g. "You have been assigned bd issue health-kb-abc"). On a permission failure or non-zero exit, the supervisor will release the claim so the next iteration can re-attempt.
 

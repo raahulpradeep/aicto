@@ -1,15 +1,15 @@
 # aicto
 
-An AI **CTO workspace**: a parent directory that owns a small fleet of "team" git repos. Each team has its own beads tracker and a tiny org chart of Claude Code agents — a manager, a configurable number of developers, and a configurable number of reviewers — running in parallel as tmux windows.
+An AI **CTO workspace**: a parent directory that owns a small fleet of "team" git repos. Each team has its own beads tracker and a tiny org chart of AI agents — a manager, a configurable number of developers, and a configurable number of reviewers — running in parallel as tmux windows. Agents can be Claude Code or Kimi Code CLI.
 
-You sit in this directory in a Claude Code session and play the human CTO: file epics, approve breakdowns and plans, ask for status. The teams do the work.
+You sit in this directory in an AI coding assistant session and play the human CTO: file epics, approve breakdowns and plans, ask for status. The teams do the work.
 
 ## How it works
 
 ```
-aicto/                     ← you are here, in a claude session
+aicto/                     ← you are here, in the CTO session
 ├── bin/cto                ← the CLI you use
-├── templates/             ← role prompts & per-team CLAUDE.md
+├── templates/             ← role prompts & per-team agent docs
 └── teams/
     └── <team-name>/       ← one repo per team
         ├── .beads/        ← team's own bd tracker
@@ -48,16 +48,16 @@ Two CTO gates total per epic: breakdown approval, then plan approval. Code revie
 This repo expects:
 
 - `bd` (beads CLI) on `PATH`
-- `claude` (Claude Code CLI) on `PATH`
+- `claude` (Claude Code CLI) or `kimi` (Kimi Code CLI) on `PATH`
 - `git`, `tmux`, `jq`, `python3`, `uv` (the last only for the MCP server)
 
 `bd init` has already been run in this directory.
 
-## MCP server (for the CTO claude session)
+## MCP server (for the CTO session)
 
-When you open a Claude Code session in this directory, an MCP server named **`cto`** is auto-loaded from `.mcp.json`. It exposes every `bin/cto` subcommand as a structured tool (`mcp__cto__team_create`, `mcp__cto__inbox`, `mcp__cto__approve`, `mcp__cto__update`, `mcp__cto__read_artifact`, etc.) so you can drive the CTO workflow as tool calls instead of shelling out.
+When you open an AI coding assistant session in this directory, an MCP server named **`cto`** is auto-loaded from `.mcp.json`. It exposes every `bin/cto` subcommand as a structured tool (`mcp__cto__team_create`, `mcp__cto__inbox`, `mcp__cto__approve`, `mcp__cto__update`, `mcp__cto__read_artifact`, etc.) so you can drive the CTO workflow as tool calls instead of shelling out.
 
-The MCP is **scoped to this workspace only**. Team Claude Code sessions run inside `teams/<name>/`, which is a separate project root with its own `.git`, so they do not load this MCP. Teams use `bd` directly via their role prompts; only the CTO has the higher-level cto tools.
+The MCP is **scoped to this workspace only**. Team agent sessions run inside `teams/<name>/`, which is a separate project root with its own `.git`, so they do not load this MCP. Teams use `bd` directly via their role prompts; only the CTO has the higher-level cto tools.
 
 The server lives at `mcp/server.py` and is launched by `uv run --with mcp python mcp/server.py`. No global Python deps needed — `uv` resolves `mcp` on first run.
 
@@ -68,6 +68,8 @@ The server lives at `mcp/server.py` and is launched by `uv run --with mcp python
 bin/cto team create demo-app
 #   …with options:
 bin/cto team create demo-app --developers 3 --reviewers 2 --container-use
+#   …using Kimi Code CLI instead of Claude Code:
+bin/cto team create demo-app --agent-provider kimi
 #   …from a remote git URL:
 bin/cto team create demo-app --repo git@github.com:you/demo-app.git
 #   …or adopt an existing local directory (with or without git):
@@ -116,7 +118,7 @@ Run `bin/cto help` for a full list. Common ones:
 | `cto team create <n> …` | scaffold a new team (git init + bd init + role prompts) |
 | `cto team list` | one line per team, with bd & tmux state |
 | `cto team remove <n>` | delete a team (confirms) |
-| `cto config <n> …` | edit `.cto/config.yaml` (devs / reviewers / container-use / mode / model) |
+| `cto config <n> …` | edit `.cto/config.yaml` (devs / reviewers / container-use / mode / model / agent-provider) |
 | `cto task <n> "<t>" --epic` | file an epic for the team |
 | `cto inbox [<n>]` | open issues with `role:cto` — your approval queue |
 | `cto approve <n> <id>` | close a `role:cto` issue (approval) |

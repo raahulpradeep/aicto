@@ -1,8 +1,8 @@
 # {{TEAM}} — team workspace
 
-This repository is a **team workspace** owned by an AI CTO. Multiple Claude Code agents (a manager, developers, and reviewers) work here in parallel, coordinating exclusively through this team's beads tracker.
+This repository is a **team workspace** owned by an AI CTO. Multiple AI agents (a manager, developers, and reviewers) work here in parallel, coordinating exclusively through this team's beads tracker.
 
-> If you are a human reading this: do **not** run interactive `claude` here unless you've read `~/Work/control-room/aicto/README.md`. Use `cto …` from the parent dir.
+> If you are a human reading this: do **not** run interactive agent sessions here unless you've read `~/Work/control-room/aicto/README.md`. Use `cto …` from the parent dir.
 
 ## How this team operates
 

@@ -116,10 +116,11 @@ render_prompts() {
   local tdir; tdir="$(team_dir "$team")"
   local pdir="$tdir/.cto/prompts"
   mkdir -p "$pdir"
-  local n_devs n_revs cuse
+  local n_devs n_revs cuse provider
   n_devs="$(cfg_get "$team" developers 2)"
   n_revs="$(cfg_get "$team" reviewers 1)"
   cuse="$(cfg_get "$team" containerUse false)"
+  provider="$(cfg_get "$team" agentProvider claude)"
 
   for role in manager developer reviewer; do
     local src="$TEMPLATES_DIR/$role.md"
@@ -151,6 +152,17 @@ render_prompts() {
         "$TEMPLATES_DIR/reviewer.md" > "$pdir/review-$i.md"
   done
 
+  # Generate kimi agent YAML specs when provider is kimi.
+  if [[ "$provider" == "kimi" ]]; then
+    _render_kimi_agent "$pdir/manager.md" "$team" "manager" "manager"
+    for i in $(seq 1 "$n_devs"); do
+      _render_kimi_agent "$pdir/dev-$i.md" "$team" "developer" "dev-$i"
+    done
+    for i in $(seq 1 "$n_revs"); do
+      _render_kimi_agent "$pdir/review-$i.md" "$team" "reviewer" "review-$i"
+    done
+  fi
+
   # Clean up stale slot files (e.g. after reducing dev/reviewer count).
   shopt -s nullglob
   for f in "$pdir"/dev-*.md; do
@@ -161,7 +173,49 @@ render_prompts() {
     local slot; slot="$(basename "$f" .md)"; slot="${slot#review-}"
     if (( slot > n_revs )); then rm -f "$f"; fi
   done
+  for f in "$pdir"/dev-*.yaml; do
+    local slot; slot="$(basename "$f" .yaml)"; slot="${slot#dev-}"
+    if (( slot > n_devs )); then rm -f "$f"; fi
+  done
+  for f in "$pdir"/review-*.yaml; do
+    local slot; slot="$(basename "$f" .yaml)"; slot="${slot#review-}"
+    if (( slot > n_revs )); then rm -f "$f"; fi
+  done
+  if [[ "$provider" != "kimi" && -f "$pdir/manager.yaml" ]]; then
+    rm -f "$pdir/manager.yaml"
+  fi
   shopt -u nullglob
+}
+
+# Generate a kimi agent YAML spec that references a rendered role prompt.
+_render_kimi_agent() {
+  local role_file="$1" team="$2" role="$3" slot="$4"
+  local yaml_file="${role_file%.md}.yaml"
+  cat > "$yaml_file" <<EOF
+version: 1
+agent:
+  name: "$team:$slot"
+  system_prompt_path: "$role_file"
+  system_prompt_args: {}
+  tools:
+    - "kimi_cli.tools.agent:Agent"
+    - "kimi_cli.tools.ask_user:AskUserQuestion"
+    - "kimi_cli.tools.todo:SetTodoList"
+    - "kimi_cli.tools.shell:Shell"
+    - "kimi_cli.tools.background:TaskList"
+    - "kimi_cli.tools.background:TaskOutput"
+    - "kimi_cli.tools.background:TaskStop"
+    - "kimi_cli.tools.file:ReadFile"
+    - "kimi_cli.tools.file:ReadMediaFile"
+    - "kimi_cli.tools.file:Glob"
+    - "kimi_cli.tools.file:Grep"
+    - "kimi_cli.tools.file:WriteFile"
+    - "kimi_cli.tools.file:StrReplaceFile"
+    - "kimi_cli.tools.web:SearchWeb"
+    - "kimi_cli.tools.web:FetchURL"
+    - "kimi_cli.tools.plan:ExitPlanMode"
+    - "kimi_cli.tools.plan.enter:EnterPlanMode"
+EOF
 }
 
 # --------------------------------------------------------------------------
@@ -180,11 +234,11 @@ usage() {
 cto — manage AI CTO teams.
 
 Usage:
-  cto team create <name> [--repo <url>] [--developers N] [--reviewers N] [--container-use] [--description "…"]
-  cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use]
+  cto team create <name> [--repo <url>] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi] [--description "…"]
+  cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi]
   cto team list
   cto team remove <name>
-  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M]
+  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
   cto inbox [<team>]
@@ -216,7 +270,7 @@ EOF
 # config.yaml, CLAUDE.md, AGENTS.md, bd init, role prompts, final commit.
 
 _team_scaffold() {
-  local name="$1" devs="$2" revs="$3" cuse="$4"
+  local name="$1" devs="$2" revs="$3" cuse="$4" provider="${5:-claude}"
   local tdir="$TEAMS_DIR/$name"
 
   mkdir -p "$tdir/.cto/prompts" "$tdir/.cto/worktrees" \
@@ -231,6 +285,15 @@ _team_scaffold() {
     printf '\n# cto\n.cto/worktrees/\n.cto/prompts/\n.cto/locks/\n' >> "$tdir/.gitignore"
   fi
 
+  local default_model default_manager_model
+  if [[ "$provider" == "kimi" ]]; then
+    default_model="kimi-code/kimi-for-coding"
+    default_manager_model="kimi-code/kimi-for-coding"
+  else
+    default_model="sonnet"
+    default_manager_model="claude-opus-4-6"
+  fi
+
   cat > "$tdir/.cto/config.yaml" <<EOF
 # AI CTO team config — edit via 'cto config $name …', not by hand.
 developers: $devs
@@ -238,8 +301,9 @@ reviewers: $revs
 manager: true
 permissionMode: bypassPermissions
 containerUse: $cuse
-model: sonnet
-managerModel: claude-opus-4-6
+agentProvider: $provider
+model: $default_model
+managerModel: $default_manager_model
 extraArgs: []
 EOF
 
@@ -284,13 +348,14 @@ EOF
 # ---- team create ---------------------------------------------------------
 
 cmd_team_create() {
-  local name="" repo="" desc="" devs=2 revs=1 cuse=false
+  local name="" repo="" desc="" devs=2 revs=1 cuse=false provider="claude"
   while (( $# )); do
     case "$1" in
       --repo) repo="$2"; shift 2 ;;
       --developers) devs="$2"; shift 2 ;;
       --reviewers)  revs="$2"; shift 2 ;;
       --container-use) cuse=true; shift ;;
+      --agent-provider) provider="$2"; shift 2 ;;
       --description|-d) desc="$2"; shift 2 ;;
       --) shift; break ;;
       -*) die "unknown flag for team create: $1" ;;
@@ -302,9 +367,10 @@ cmd_team_create() {
   [[ ! -e "$TEAMS_DIR/$name" ]] || die "team already exists: $name"
   [[ "$devs" =~ ^[0-9]+$ ]] || die "--developers must be an integer"
   [[ "$revs" =~ ^[0-9]+$ ]] || die "--reviewers must be an integer"
+  [[ "$provider" == "claude" || "$provider" == "kimi" ]] || die "--agent-provider must be claude or kimi"
 
   local tdir="$TEAMS_DIR/$name"
-  info "creating team: $name (devs=$devs, reviewers=$revs, container-use=$cuse)"
+  info "creating team: $name (devs=$devs, reviewers=$revs, container-use=$cuse, agent-provider=$provider)"
 
   if [[ -n "$repo" ]]; then
     git clone "$repo" "$tdir"
@@ -316,7 +382,7 @@ cmd_team_create() {
     git -C "$tdir" -c commit.gpgsign=false commit -m "init team: $name${desc:+ — $desc}" >/dev/null
   fi
 
-  _team_scaffold "$name" "$devs" "$revs" "$cuse"
+  _team_scaffold "$name" "$devs" "$revs" "$cuse" "$provider"
 
   info "team created at: $tdir"
   info "next: cto task $name \"<epic title>\" --epic && cto start $name"
@@ -329,12 +395,13 @@ cmd_team_create() {
 # moved; pass --copy to copy it instead.
 
 cmd_team_adopt() {
-  local name="" src="" devs=2 revs=1 cuse=false copy=false
+  local name="" src="" devs=2 revs=1 cuse=false copy=false provider="claude"
   while (( $# )); do
     case "$1" in
       --developers) devs="$2"; shift 2 ;;
       --reviewers)  revs="$2"; shift 2 ;;
       --container-use) cuse=true; shift ;;
+      --agent-provider) provider="$2"; shift 2 ;;
       --copy) copy=true; shift ;;
       --) shift; break ;;
       -*) die "unknown flag for team adopt: $1" ;;
@@ -346,16 +413,17 @@ cmd_team_adopt() {
         shift ;;
     esac
   done
-  [[ -n "$name" && -n "$src" ]] || die "usage: cto team adopt <name> <path-to-existing-dir> [--copy] [--developers N] [--reviewers N] [--container-use]"
+  [[ -n "$name" && -n "$src" ]] || die "usage: cto team adopt <name> <path-to-existing-dir> [--copy] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi]"
   [[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "invalid team name: $name"
   [[ ! -e "$TEAMS_DIR/$name" ]] || die "team already exists: $name"
   [[ -d "$src" ]] || die "source not found or not a directory: $src"
   src="$(cd "$src" && pwd)"
   [[ "$src" != "$TEAMS_DIR/$name" ]] || die "source is already the team path"
   case "$src" in "$CTO_ROOT"|"$CTO_ROOT"/*) die "cannot adopt a path inside the CTO workspace: $src" ;; esac
+  [[ "$provider" == "claude" || "$provider" == "kimi" ]] || die "--agent-provider must be claude or kimi"
 
   local tdir="$TEAMS_DIR/$name"
-  info "adopting: $src → teams/$name (copy=$copy, devs=$devs, reviewers=$revs, container-use=$cuse)"
+  info "adopting: $src → teams/$name (copy=$copy, devs=$devs, reviewers=$revs, container-use=$cuse, agent-provider=$provider)"
 
   if $copy; then
     mkdir -p "$tdir"
@@ -395,7 +463,7 @@ cmd_team_adopt() {
     git -C "$tdir" -c commit.gpgsign=false commit -m "adopt: init empty repo for $name" >/dev/null
   fi
 
-  _team_scaffold "$name" "$devs" "$revs" "$cuse"
+  _team_scaffold "$name" "$devs" "$revs" "$cuse" "$provider"
 
   info "team adopted at: $tdir"
   info "next: cto task $name \"<epic title>\" --epic && cto start $name"
@@ -406,19 +474,20 @@ cmd_team_adopt() {
 cmd_team_list() {
   shopt -s nullglob
   local found=0
-  printf '%-20s %-8s %-8s %-12s %-7s %s\n' TEAM DEVS REVIEWERS CONTAINER-USE TMUX OPEN-ISSUES
+  printf '%-20s %-8s %-8s %-12s %-7s %-14s %s\n' TEAM DEVS REVIEWERS CONTAINER-USE TMUX AGENT-PROVIDER OPEN-ISSUES
   for d in "$TEAMS_DIR"/*/; do
     local name; name="$(basename "$d")"
     [[ "$name" == ".gitkeep" ]] && continue
     [[ -d "$d/.cto" ]] || continue
     found=1
-    local devs revs cuse alive open
+    local devs revs cuse alive provider open
     devs="$(cfg_get "$name" developers 2)"
     revs="$(cfg_get "$name" reviewers 1)"
     cuse="$(cfg_get "$name" containerUse false)"
+    provider="$(cfg_get "$name" agentProvider claude)"
     if tmux_alive "$name"; then alive=yes; else alive=no; fi
     open="$(cd "$d" && bd list --status open --json 2>/dev/null | jq 'length' 2>/dev/null || echo '?')"
-    printf '%-20s %-8s %-8s %-12s %-7s %s\n' "$name" "$devs" "$revs" "$cuse" "$alive" "$open"
+    printf '%-20s %-8s %-8s %-12s %-7s %-14s %s\n' "$name" "$devs" "$revs" "$cuse" "$alive" "$provider" "$open"
   done
   shopt -u nullglob
   (( found )) || info "no teams yet — try: cto team create <name>"
@@ -457,6 +526,9 @@ cmd_config() {
       --permission-mode) cfg_set "$name" permissionMode "$2";    shift 2 ;;
       --model)           cfg_set "$name" model "$2";             shift 2 ;;
       --manager-model)   cfg_set "$name" managerModel "$2";      shift 2 ;;
+      --agent-provider)
+        [[ "$2" == "claude" || "$2" == "kimi" ]] || die "--agent-provider must be claude or kimi"
+        cfg_set "$name" agentProvider "$2"; shift 2 ;;
       *) die "unknown config flag: $1" ;;
     esac
   done
@@ -829,10 +901,11 @@ cmd_start() {
 
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
-  local mode model manager_model
+  local mode model manager_model provider
   mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
   manager_model="$(cfg_get "$name" managerModel "$model")"
+  provider="$(cfg_get "$name" agentProvider claude)"
   (( dangerous )) && mode="bypassPermissions"
   local n_devs n_revs
   n_devs="$(cfg_get "$name" developers 2)"
@@ -840,35 +913,26 @@ cmd_start() {
 
   local sess; sess="$(tmux_session "$name")"
 
-  # Build the claude command for a given prompt file.
-  # We feed the prompt as the first user message via -p but also keep
-  # stdin interactive — using --append-system-prompt would be cleaner if
-  # available, but `-p` + `--permission-mode` is the documented headless
-  # form. For tmux interactive use, we instead pipe the prompt into an
-  # interactive claude session via heredoc-style stdin.
-  #
-  # Concretely: run `claude --permission-mode <mode> --model <model>`
-  # interactively, but seed it by using `claude` with no args is
-  # interactive; the role prompt is delivered by a `claude` subcommand
-  # that reads the file. The simplest cross-version-safe approach is to
-  # pre-fill the prompt with the role file content via a small wrapper.
+  # Build the agent command for a given prompt file.
+  # Claude: --append-system-prompt with the .md file
+  # Kimi: --agent-file with a .yaml spec that points to the .md file
 
   # Generate a supervisor script. Each tmux window runs this; the bash
-  # loop is what's eternal — claude --print is one-shot per iteration.
+  # loop is what's eternal — the agent CLI is one-shot per iteration.
   # On non-zero exit, the supervisor releases any bd claim it took and,
   # if the failure mentions a permission gap, files a CTO inbox item.
   local launcher="$tdir/.cto/supervisor.sh"
   cat > "$launcher" <<'OUTER'
 #!/usr/bin/env bash
 # generated by cto — per-agent supervisor loop. Do not edit by hand.
-# Args: <team-dir> <role> <slot> <role-prompt-file> <permission-mode> <model>
+# Args: <team-dir> <role> <slot> <role-prompt-file> <permission-mode> <model> <agent-provider>
 set -uo pipefail
-TEAM_DIR="$1"; ROLE="$2"; SLOT="$3"; ROLE_FILE="$4"; PERM="$5"; MODEL="$6"
+TEAM_DIR="$1"; ROLE="$2"; SLOT="$3"; ROLE_FILE="$4"; PERM="$5"; MODEL="$6"; AGENT_PROVIDER="${7:-claude}"
 cd "$TEAM_DIR"
 
 # Globally unique agent identity. Used as the bd assignee, the
 # filesystem-lock owner stamp, and the agent's self-identifier in
-# claude prompts. Team names are unique within the CTO workspace, so
+# agent prompts. Team names are unique within the CTO workspace, so
 # "<team>:<slot>" is unique across every team.
 TEAM=$(basename "$TEAM_DIR")
 AGENT="$TEAM:$SLOT"
@@ -904,7 +968,7 @@ looks_like_permission_block() {
 
 trap 'log "supervisor stopping"; exit 0' INT TERM
 
-log "supervisor up (role=$ROLE, mode=$PERM, model=$MODEL)"
+log "supervisor up (role=$ROLE, provider=$AGENT_PROVIDER, mode=$PERM, model=$MODEL)"
 
 # Boot-time recovery: if a previous instance of this agent was killed
 # mid-iteration (tmux kill, machine reboot, etc.), there may be bd
@@ -975,61 +1039,90 @@ while :; do
     *) log "unknown role: $ROLE"; exit 2 ;;
   esac
 
-  log "invoking claude (task=${task_id:-none})"
-  # Stream events as they happen (tool calls + tool results + text)
-  # so the tmux pane shows what the agent is actually doing in real
-  # time, not just a summary at the end. The jq filter is forgiving:
-  # malformed lines are silently dropped (// empty).
-  claude --print \
-    --output-format stream-json --verbose \
-    --permission-mode "$PERM" \
-    --model "$MODEL" \
-    --append-system-prompt "$(cat "$ROLE_FILE")" \
-    "$starter" \
-    2> >(tee "$err" >&2) \
-  | jq -r --unbuffered '
-      . as $e |
-      if $e.type == "assistant" then
-        ($e.message.content // [])[]?
-        | if .type == "text" and ((.text // "") | length) > 0 then
-            .text
-          elif .type == "tool_use" then
-            "  → " + .name + " " + ((.input // {}) | tostring | if length>140 then .[0:140]+"…" else . end)
-          else empty end
-      elif $e.type == "user" then
-        ($e.message.content // [])[]?
-        | select(.type == "tool_result")
-        | (.content // "" | tostring | if length>200 then .[0:200]+"…" else . end)
-        | "  ← " + .
-      else empty end
-    ' 2>/dev/null
-  rc=${PIPESTATUS[0]}
-
-  if (( rc != 0 )); then
-    log "claude exited $rc"
-    release_claim "$task_id"
-    if looks_like_permission_block "$err"; then
-      escalate_permission "$task_id" "$err"
-      sleep 60   # back off until the human grants permission
-    else
+  if [[ "$AGENT_PROVIDER" == "kimi" ]]; then
+    log "invoking kimi (task=${task_id:-none})"
+    kimi --print \
+      --output-format stream-json \
+      --model "$MODEL" \
+      --agent-file "$ROLE_FILE" \
+      --prompt "$starter" \
+      --work-dir "$TEAM_DIR" \
+      2> >(tee "$err" >&2)
+    rc=$?
+    if (( rc != 0 )); then
+      log "kimi exited $rc"
+      release_claim "$task_id"
       sleep 30
+    else
+      if [[ -n "$task_id" ]]; then
+        st=$(bd show "$task_id" --json 2>/dev/null \
+             | jq -r '.[0].status // ""' 2>/dev/null || true)
+        if [[ "$st" == "in_progress" ]]; then
+          log "agent did not close $task_id (status=$st); resetting to open"
+          bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$LOCKS/$task_id" 2>/dev/null
+      fi
+      log "iteration ok (task=${task_id:-none})"
+      [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
     fi
   else
-    # On success the agent should have closed the bd issue itself.
-    # If it didn't (forgetful agent / context-window cutoff), the
-    # issue is now a zombie: in_progress, assigned to us, but nobody
-    # working it. Reset it so the next iteration re-attempts cleanly.
-    if [[ -n "$task_id" ]]; then
-      st=$(bd show "$task_id" --json 2>/dev/null \
-           | jq -r '.[0].status // ""' 2>/dev/null || true)
-      if [[ "$st" == "in_progress" ]]; then
-        log "agent did not close $task_id (status=$st); resetting to open"
-        bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
+    log "invoking claude (task=${task_id:-none})"
+    # Stream events as they happen (tool calls + tool results + text)
+    # so the tmux pane shows what the agent is actually doing in real
+    # time, not just a summary at the end. The jq filter is forgiving:
+    # malformed lines are silently dropped (// empty).
+    claude --print \
+      --output-format stream-json --verbose \
+      --permission-mode "$PERM" \
+      --model "$MODEL" \
+      --append-system-prompt "$(cat "$ROLE_FILE")" \
+      "$starter" \
+      2> >(tee "$err" >&2) \
+    | jq -r --unbuffered '
+        . as $e |
+        if $e.type == "assistant" then
+          ($e.message.content // [])[]?
+          | if .type == "text" and ((.text // "") | length) > 0 then
+              .text
+            elif .type == "tool_use" then
+              "  → " + .name + " " + ((.input // {}) | tostring | if length>140 then .[0:140]+"…" else . end)
+            else empty end
+        elif $e.type == "user" then
+          ($e.message.content // [])[]?
+          | select(.type == "tool_result")
+          | (.content // "" | tostring | if length>200 then .[0:200]+"…" else . end)
+          | "  ← " + .
+        else empty end
+      ' 2>/dev/null
+    rc=${PIPESTATUS[0]}
+
+    if (( rc != 0 )); then
+      log "claude exited $rc"
+      release_claim "$task_id"
+      if looks_like_permission_block "$err"; then
+        escalate_permission "$task_id" "$err"
+        sleep 60   # back off until the human grants permission
+      else
+        sleep 30
       fi
-      rm -rf "$LOCKS/$task_id" 2>/dev/null
+    else
+      # On success the agent should have closed the bd issue itself.
+      # If it didn't (forgetful agent / context-window cutoff), the
+      # issue is now a zombie: in_progress, assigned to us, but nobody
+      # working it. Reset it so the next iteration re-attempts cleanly.
+      if [[ -n "$task_id" ]]; then
+        st=$(bd show "$task_id" --json 2>/dev/null \
+             | jq -r '.[0].status // ""' 2>/dev/null || true)
+        if [[ "$st" == "in_progress" ]]; then
+          log "agent did not close $task_id (status=$st); resetting to open"
+          bd update "$task_id" --status open --assignee "" >/dev/null 2>&1 || true
+        fi
+        rm -rf "$LOCKS/$task_id" 2>/dev/null
+      fi
+      log "iteration ok (task=${task_id:-none})"
+      [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
     fi
-    log "iteration ok (task=${task_id:-none})"
-    [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
   fi
   rm -f "$err"
 done
@@ -1037,23 +1130,29 @@ OUTER
   chmod +x "$launcher"
 
   # Spawn one tmux window per agent slot.
-  local _new=tmux\ new-session\ -d
+  # For kimi teams, pass the .yaml agent spec; for claude, the .md prompt.
+  local manager_file="$pdir/manager.md"
+  [[ "$provider" == "kimi" ]] && manager_file="$pdir/manager.yaml"
   tmux new-session -d -s "$sess" -n manager -c "$tdir" \
-    "$launcher" "$tdir" manager manager "$pdir/manager.md" "$mode" "$manager_model"
+    "$launcher" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
 
   for i in $(seq 1 "$n_devs"); do
+    local dev_file="$pdir/dev-$i.md"
+    [[ "$provider" == "kimi" ]] && dev_file="$pdir/dev-$i.yaml"
     tmux new-window -t "$sess" -n "dev-$i" -c "$tdir" \
-      "$launcher" "$tdir" developer "dev-$i" "$pdir/dev-$i.md" "$mode" "$model"
+      "$launcher" "$tdir" developer "dev-$i" "$dev_file" "$mode" "$model" "$provider"
   done
 
   for i in $(seq 1 "$n_revs"); do
+    local rev_file="$pdir/review-$i.md"
+    [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
     tmux new-window -t "$sess" -n "review-$i" -c "$tdir" \
-      "$launcher" "$tdir" reviewer "review-$i" "$pdir/review-$i.md" "$mode" "$model"
+      "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
   done
 
   info "started team $name in tmux session: $sess"
   info "  windows: manager, dev-1..$n_devs, review-1..$n_revs"
-  info "  permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
+  info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then
     tmux attach -t "$sess"

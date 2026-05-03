@@ -50,6 +50,7 @@ def team_create(
     developers: int = 2,
     reviewers: int = 1,
     container_use: bool = False,
+    agent_provider: str = "claude",
     description: Optional[str] = None,
 ) -> str:
     """Create a new team workspace under teams/<name>/.
@@ -57,7 +58,7 @@ def team_create(
     Scaffolds a git repo, runs `bd init`, writes .cto/config.yaml with the
     requested agent counts, and renders role prompts. Use repo=<url> to
     clone an existing repo instead of `git init`."""
-    args = ["team", "create", name, "--developers", str(developers), "--reviewers", str(reviewers)]
+    args = ["team", "create", name, "--developers", str(developers), "--reviewers", str(reviewers), "--agent-provider", agent_provider]
     if repo:
         args += ["--repo", repo]
     if container_use:
@@ -75,6 +76,7 @@ def team_adopt(
     developers: int = 2,
     reviewers: int = 1,
     container_use: bool = False,
+    agent_provider: str = "claude",
 ) -> str:
     """Adopt an existing local directory (with or without .git) as a team.
 
@@ -89,7 +91,8 @@ def team_adopt(
     team_create(repo=...) instead."""
     args = ["team", "adopt", name, path,
             "--developers", str(developers),
-            "--reviewers", str(reviewers)]
+            "--reviewers", str(reviewers),
+            "--agent-provider", agent_provider]
     if copy:
         args.append("--copy")
     if container_use:
@@ -130,12 +133,14 @@ def config(
     permission_mode: Optional[str] = None,
     model: Optional[str] = None,
     manager_model: Optional[str] = None,
+    agent_provider: Optional[str] = None,
 ) -> str:
     """Edit teams/<name>/.cto/config.yaml. Any unspecified field is left
     unchanged. After config changes, run restart() to apply them.
 
-    `model` controls developer + reviewer windows (default: sonnet).
-    `manager_model` controls the manager window (default: claude-opus-4-6)."""
+    `model` controls developer + reviewer windows.
+    `manager_model` controls the manager window.
+    `agent_provider` is claude or kimi."""
     args = ["config", name]
     if developers is not None:
         args += ["--developers", str(developers)]
@@ -149,6 +154,8 @@ def config(
         args += ["--model", model]
     if manager_model is not None:
         args += ["--manager-model", manager_model]
+    if agent_provider is not None:
+        args += ["--agent-provider", agent_provider]
     return _run(args)
 
 
@@ -263,10 +270,11 @@ def reject(team: str, issue_id: str, comment: str) -> str:
 def start(name: str, dangerous: bool = False) -> str:
     """Bring a team online: open a tmux session 'cto-<name>' with one
     window per agent (manager, dev-1..N, review-1..M). Each window runs
-    `claude` interactively with the role prompt as system context.
+    the team's configured agent CLI interactively with the role prompt
+    as system context.
 
-    dangerous=True upgrades --permission-mode to bypassPermissions (fully
-    autonomous; only use in trusted workspaces)."""
+    dangerous=True upgrades --permission-mode to bypassPermissions for
+    claude teams (fully autonomous; only use in trusted workspaces)."""
     args = ["start", name]
     if dangerous:
         args.append("--dangerous")

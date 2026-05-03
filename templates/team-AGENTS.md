@@ -1,6 +1,6 @@
 # {{TEAM}} — team workspace (agent instructions)
 
-See `CLAUDE.md` for the full team operating model. Same content applies to non-Claude agents.
+See `CLAUDE.md` for the full team operating model. Same content applies to all agents regardless of provider.
 
 Key rules:
 - bd is the source of truth. Do not use markdown TODO lists.

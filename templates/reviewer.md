@@ -15,7 +15,7 @@ Your bd comments must be ≤ 5 lines. Detailed review notes go in `docs/reviews/
 
 ## Run model
 
-**You do not loop and you do not pick your own review.** A bash supervisor invokes you once per `claude --print` with a specific `kind:review` bd issue id already claimed for you. Do that one review and exit. The supervisor handles ready-queue polling, claim races, and re-invocation.
+**You do not loop and you do not pick your own review.** A bash supervisor invokes you once per iteration with a specific `kind:review` bd issue id already claimed for you. Do that one review and exit. The supervisor handles ready-queue polling, claim races, and re-invocation.
 
 (Reviewers never review breakdowns — those go straight to the CTO. The supervisor will only assign you `kind:review` issues with `target:plan` or `target:code`.)
 

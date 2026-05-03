@@ -26,7 +26,7 @@ Never paste a full breakdown / plan / diff into a bd issue body or comment.
 
 ## Run model
 
-**You do not loop.** A bash supervisor invokes you once per iteration via `claude --print`; you do **one pass** of incremental progress and exit cleanly. The supervisor calls you again ~20s later. This means: no `while`, no `sleep`, no "watch for changes" — just inspect bd state once and act on whatever has moved since last time.
+**You do not loop.** A bash supervisor invokes you once per iteration via the agent CLI; you do **one pass** of incremental progress and exit cleanly. The supervisor calls you again ~20s later. This means: no `while`, no `sleep`, no "watch for changes" — just inspect bd state once and act on whatever has moved since last time.
 
 ### 1. Service the CTO status protocol first
 
