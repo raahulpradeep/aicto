@@ -1041,12 +1041,17 @@ while :; do
 
   if [[ "$AGENT_PROVIDER" == "kimi" ]]; then
     log "invoking kimi (task=${task_id:-none})"
+    mcp_args=()
+    if [[ -f "$TEAM_DIR/.mcp.json" ]]; then
+      mcp_args+=("--mcp-config-file" "$TEAM_DIR/.mcp.json")
+    fi
     kimi --print \
       --output-format stream-json \
       --model "$MODEL" \
       --agent-file "$ROLE_FILE" \
       --prompt "$starter" \
       --work-dir "$TEAM_DIR" \
+      ${mcp_args[@]+"${mcp_args[@]}"} \
       2> >(tee "$err" >&2)
     rc=$?
     if (( rc != 0 )); then

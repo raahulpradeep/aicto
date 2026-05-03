@@ -178,6 +178,25 @@ def _fmt_elapsed(seconds: int) -> str:
 # ---- per-team gather ------------------------------------------------------
 
 
+def _read_team_config(tdir: Path) -> dict:
+    """Parse .cto/config.yaml for agentProvider and model."""
+    cfg = {}
+    cfg_path = tdir / ".cto" / "config.yaml"
+    try:
+        with open(cfg_path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].rstrip()
+                if not line or ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                k = k.strip()
+                v = v.strip().strip('"\'')
+                cfg[k] = v
+    except OSError:
+        pass
+    return cfg
+
+
 def _gather_team(team: str, tdir: Path):
     """Return (agent_rows, inbox_rows, open_rows, closed_rows) or None.
 
@@ -189,6 +208,10 @@ def _gather_team(team: str, tdir: Path):
         return None
 
     windows = tmux_windows(sess)
+    cfg = _read_team_config(tdir)
+    provider = cfg.get("agentProvider", "claude")
+    model = cfg.get("model", "—")
+
     f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
     f_open = _POOL.submit(_bd_json, ["list", "--status", "open"], tdir)
     f_closed = _POOL.submit(
@@ -207,6 +230,8 @@ def _gather_team(team: str, tdir: Path):
             "team": team,
             "window": w,
             "issue": ip_by_assignee.get(f"{team}:{w}"),
+            "provider": provider,
+            "model": model,
         }
         for w in windows
     ]
@@ -275,6 +300,8 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
     t.add_column("AGENT", overflow="fold")
     t.add_column("TEAM", overflow="fold")
     t.add_column("WINDOW", overflow="fold")
+    t.add_column("PROVIDER", overflow="fold")
+    t.add_column("MODEL", overflow="fold")
     t.add_column("STATUS", overflow="fold")
     t.add_column("ISSUE", overflow="fold", ratio=2)
     t.add_column("ELAPSED", justify="right", overflow="fold")
@@ -283,6 +310,8 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
         agent = row["agent"]
         team = row["team"]
         w = row["window"]
+        provider = row.get("provider", "claude")
+        model = row.get("model", "—")
         issue = row["issue"]
         if issue:
             started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
@@ -293,17 +322,19 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
                 agent,
                 team,
                 w,
+                provider,
+                model,
                 Text("working", style="green"),
                 Text(f"{issue['id']}  {title}"),
                 Text(elapsed, style="green"),
             )
         elif w == "manager":
             t.add_row(
-                agent, team, w, Text("active", style="yellow"), Text("—", style="dim"), "—"
+                agent, team, w, provider, model, Text("active", style="yellow"), Text("—", style="dim"), "—"
             )
         else:
             t.add_row(
-                agent, team, w, Text("idle", style="dim"), Text("—", style="dim"), "—"
+                agent, team, w, provider, model, Text("idle", style="dim"), Text("—", style="dim"), "—"
             )
     return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
 
