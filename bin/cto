@@ -184,7 +184,7 @@ Usage:
   cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use]
   cto team list
   cto team remove <name>
-  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M]
+  cto config <name> [--developers N] [--reviewers N] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M]
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
   cto inbox [<team>]
@@ -239,6 +239,7 @@ manager: true
 permissionMode: acceptEdits
 containerUse: $cuse
 model: sonnet
+managerModel: claude-opus-4-6
 extraArgs: []
 EOF
 
@@ -455,6 +456,7 @@ cmd_config() {
         shift 2 ;;
       --permission-mode) cfg_set "$name" permissionMode "$2";    shift 2 ;;
       --model)           cfg_set "$name" model "$2";             shift 2 ;;
+      --manager-model)   cfg_set "$name" managerModel "$2";      shift 2 ;;
       *) die "unknown config flag: $1" ;;
     esac
   done
@@ -827,9 +829,10 @@ cmd_start() {
 
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
-  local mode model
+  local mode model manager_model
   mode="$(cfg_get "$name" permissionMode acceptEdits)"
   model="$(cfg_get "$name" model sonnet)"
+  manager_model="$(cfg_get "$name" managerModel "$model")"
   (( dangerous )) && mode="bypassPermissions"
   local n_devs n_revs
   n_devs="$(cfg_get "$name" developers 2)"
@@ -1036,7 +1039,7 @@ OUTER
   # Spawn one tmux window per agent slot.
   local _new=tmux\ new-session\ -d
   tmux new-session -d -s "$sess" -n manager -c "$tdir" \
-    "$launcher" "$tdir" manager manager "$pdir/manager.md" "$mode" "$model"
+    "$launcher" "$tdir" manager manager "$pdir/manager.md" "$mode" "$manager_model"
 
   for i in $(seq 1 "$n_devs"); do
     tmux new-window -t "$sess" -n "dev-$i" -c "$tdir" \
@@ -1050,7 +1053,7 @@ OUTER
 
   info "started team $name in tmux session: $sess"
   info "  windows: manager, dev-1..$n_devs, review-1..$n_revs"
-  info "  permissionMode: $mode, model: $model"
+  info "  permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then
     tmux attach -t "$sess"

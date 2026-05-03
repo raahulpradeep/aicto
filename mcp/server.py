@@ -129,9 +129,13 @@ def config(
     container_use: Optional[bool] = None,
     permission_mode: Optional[str] = None,
     model: Optional[str] = None,
+    manager_model: Optional[str] = None,
 ) -> str:
     """Edit teams/<name>/.cto/config.yaml. Any unspecified field is left
-    unchanged. After config changes, run restart() to apply them."""
+    unchanged. After config changes, run restart() to apply them.
+
+    `model` controls developer + reviewer windows (default: sonnet).
+    `manager_model` controls the manager window (default: claude-opus-4-6)."""
     args = ["config", name]
     if developers is not None:
         args += ["--developers", str(developers)]
@@ -143,6 +147,8 @@ def config(
         args += ["--permission-mode", permission_mode]
     if model is not None:
         args += ["--model", model]
+    if manager_model is not None:
+        args += ["--manager-model", manager_model]
     return _run(args)
 
 
