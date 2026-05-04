@@ -34,7 +34,7 @@ For plans:
 cat .cto/worktrees/<plan-id>/plans/<epic-id>.md
 ```
 
-For code (diff against the **epic** base, not `main`):
+For code (diff against the **epic** base, not the trunk branch):
 ```
 EPIC_ID=$(bd show <review-id> --json | jq -r '.[0].description' | grep -oE 'epic:[[:space:]]*[A-Za-z0-9._-]+' | head -1 | awk -F: '{print $2}' | tr -d '[:space:]')
 git -C .cto/worktrees/<dev-id> diff epic/$EPIC_ID...HEAD
@@ -88,7 +88,7 @@ bd dep <review-id> --blocks <APPROVAL_ID>
 
 #### B. Approved, upstream is `kind:dev`
 
-The merge target is the epic feature branch, **not** `main`. The manager will execute it.
+The merge target is the epic feature branch, **not** the trunk branch. The manager will execute it.
 
 ```
 bd close <review-id> -r "approved; see docs/reviews/<review-id>.md"

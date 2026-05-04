@@ -296,7 +296,7 @@ Usage:
   cto team remove <name>
   cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
 
-  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
+  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--parent-branch <branch>]
   cto inbox [<team>] [--json]
   cto approve <team> <id> [--comment "…"]
   cto reject <team> <id> --comment "…"
@@ -312,7 +312,7 @@ Usage:
   cto reconciler-sync <team> [--force]
   cto top                                   # live top-style dashboard
 
-  cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into main
+  cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into its parent branch
   cto worktrees <team>
   cto worktrees prune <team>
   cto exec <team> -- <cmd…>
@@ -681,7 +681,7 @@ cmd_config() {
 cmd_task() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local title="" desc="" prio=2 kind=epic ops=0
+  local title="" desc="" prio=2 kind=epic ops=0 parent_branch=""
   while (( $# )); do
     case "$1" in
       -d|--description) desc="$2"; shift 2 ;;
@@ -690,6 +690,7 @@ cmd_task() {
       --dev)  kind=dev;  shift ;;
       --plan) kind=plan; shift ;;
       --ops)  ops=1;     shift ;;
+      --parent-branch)  parent_branch="$2"; shift 2 ;;
       --) shift ;;
       -*) die "unknown task flag: $1" ;;
       *) [[ -z "$title" ]] && title="$1" || die "extra arg: $1"; shift ;;
@@ -699,13 +700,21 @@ cmd_task() {
   if (( ops )) && [[ "$kind" != "epic" ]]; then
     die "--ops only applies to epics"
   fi
+  if [[ "$kind" == "epic" && -z "$parent_branch" ]]; then
+    die "--parent-branch is required when creating an epic"
+  fi
 
   local labels="role:manager,kind:$kind"
   (( ops )) && labels="$labels,class:ops"
+  local full_desc="${desc:-(no description)}"
+  if [[ -n "$parent_branch" ]]; then
+    full_desc="parent_branch: $parent_branch
+$full_desc"
+  fi
   local id
   id=$(cd "$(team_dir "$name")" && bd create -t task \
         -l "$labels" -p "$prio" \
-        -d "${desc:-(no description)}" \
+        -d "$full_desc" \
         --silent \
         "$title")
 
@@ -728,7 +737,7 @@ except Exception:
   if (( ops )); then
     info "filed $id (ops epic, role:manager) in team $name — reconciler will file a single dev, no breakdown/plan/review"
   else
-    info "filed $id ($kind, role:manager) in team $name"
+    info "filed $id ($kind, role:manager${parent_branch:+, parent_branch: $parent_branch}) in team $name"
   fi
 }
 
