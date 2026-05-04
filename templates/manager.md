@@ -38,6 +38,9 @@ For each result: read it, then close it with a 5-line digest of current state ac
 
 ### 2. Decompose new epics
 
+> **Skip epics labeled `class:ops`.** Those are one-shot ops tasks (git pull, run a sync script) with no diff to review. The reconciler files a single `kind:dev` for them and closes the epic when the dev closes — you do not write a breakdown, do not create a worktree, and do not file an approval.
+
+
 ```
 bd list --status open -l kind:epic --json
 ```

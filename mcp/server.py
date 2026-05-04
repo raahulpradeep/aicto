@@ -168,13 +168,24 @@ def task(
     description: Optional[str] = None,
     priority: int = 2,
     kind: str = "epic",
+    ops: bool = False,
 ) -> str:
     """File a bd task on a team. Defaults to kind='epic' (the only kind the
     CTO normally files — the manager decomposes from there). Other kinds
-    ('dev', 'plan') exist as escape hatches but bypass the breakdown gate."""
+    ('dev', 'plan') exist as escape hatches but bypass the breakdown gate.
+
+    Set ops=True for one-shot ops epics (git pull, run a sync script, etc.)
+    that don't produce a diff. The reconciler files a single kind:dev for
+    them and closes the epic when the dev closes — no breakdown, plan,
+    review, or merge ceremony. ops=True only applies to kind='epic'.
+    """
     if kind not in ("epic", "dev", "plan"):
         raise ValueError(f"kind must be epic|dev|plan, got {kind!r}")
+    if ops and kind != "epic":
+        raise ValueError("ops=True only applies to kind='epic'")
     args = ["task", team, title, "-p", str(priority), f"--{kind}"]
+    if ops:
+        args.append("--ops")
     if description:
         args += ["-d", description]
     return _run(args)

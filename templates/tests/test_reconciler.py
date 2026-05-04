@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconciler import (  # noqa: E402
     AddLabel,
+    CloseIssue,
     FileIssue,
     FilePair,
     Issue,
@@ -52,6 +53,13 @@ def _epic(id: str = "e1", title: str = "Test epic") -> Issue:
     return Issue(
         id=id, title=title, description="", status="open",
         labels=("kind:epic", "role:manager"),
+    )
+
+
+def _ops_epic(id: str = "e-ops", title: str = "git pull") -> Issue:
+    return Issue(
+        id=id, title=title, description="", status="open",
+        labels=("kind:epic", "role:manager", "class:ops"),
     )
 
 
@@ -350,6 +358,69 @@ def test_running_reconciler_twice_emits_nothing_second_time():
     second = reconcile(s2)
     assert all(not isinstance(a, (FileIssue, FilePair)) for a in second), \
         f"unexpected re-filing on second tick: {second}"
+
+
+# ---------- Tests: ops-epic shortcut FSM ----------
+
+def test_ops_epic_files_single_dev_no_review_no_pair():
+    s = _state(_ops_epic())
+    actions = reconcile(s)
+    # Exactly one FileIssue (the dev). No FilePair, no review.
+    file_issues = [a for a in actions if isinstance(a, FileIssue)]
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(file_issues) == 1
+    assert pairs == []
+    dev = file_issues[0]
+    assert "kind:dev" in dev.labels
+    assert "role:developer" in dev.labels
+    assert "class:ops" in dev.labels
+
+
+def test_ops_epic_skips_breakdown_plan_review_merge():
+    s = _state(_ops_epic())
+    actions = reconcile(s)
+    # No breakdown-approval, no plan, no review, no merge actions.
+    for a in _all_file_issues(actions):
+        kinds = {l for l in a.labels if l.startswith("kind:")}
+        assert kinds & {"kind:plan", "kind:breakdown",
+                        "kind:review", "kind:merge", "kind:approval"} == set(), \
+            f"ops epic emitted forbidden kind: {a}"
+
+
+def test_ops_epic_idempotent():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer",
+               description="epic: e-ops\nidem: file-ops-dev:e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    assert [a for a in actions if isinstance(a, FileIssue)] == []
+
+
+def test_ops_epic_closes_when_dev_closes():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e-ops\nidem: file-ops-dev:e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    closes = [a for a in actions if isinstance(a, CloseIssue) and a.issue_id == "e-ops"]
+    assert len(closes) == 1
+    assert "d1" in closes[0].reason
+
+
+def test_ops_epic_does_not_file_epic_merge():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    epic_merges = _file_issues(actions, kind="merge", target="epic")
+    assert epic_merges == []
 
 
 # ---------- Tests: pair linkage (today's bug — review claimable too early) ----------

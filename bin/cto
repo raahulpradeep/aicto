@@ -677,7 +677,7 @@ cmd_config() {
 cmd_task() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local title="" desc="" prio=2 kind=epic
+  local title="" desc="" prio=2 kind=epic ops=0
   while (( $# )); do
     case "$1" in
       -d|--description) desc="$2"; shift 2 ;;
@@ -685,21 +685,30 @@ cmd_task() {
       --epic) kind=epic; shift ;;
       --dev)  kind=dev;  shift ;;
       --plan) kind=plan; shift ;;
+      --ops)  ops=1;     shift ;;
       --) shift ;;
       -*) die "unknown task flag: $1" ;;
       *) [[ -z "$title" ]] && title="$1" || die "extra arg: $1"; shift ;;
     esac
   done
   [[ -n "$title" ]] || die "task title required"
+  if (( ops )) && [[ "$kind" != "epic" ]]; then
+    die "--ops only applies to epics"
+  fi
 
   local labels="role:manager,kind:$kind"
+  (( ops )) && labels="$labels,class:ops"
   local id
   id=$(cd "$(team_dir "$name")" && bd create -t task \
         -l "$labels" -p "$prio" \
         -d "${desc:-(no description)}" \
         --silent \
         "$title")
-  info "filed $id ($kind, role:manager) in team $name"
+  if (( ops )); then
+    info "filed $id (ops epic, role:manager) in team $name — reconciler will file a single dev, no breakdown/plan/review"
+  else
+    info "filed $id ($kind, role:manager) in team $name"
+  fi
 }
 
 # ---- merge ---------------------------------------------------------------

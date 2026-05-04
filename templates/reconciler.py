@@ -75,6 +75,13 @@ class Issue:
             or "verdict:changes-requested" in self.labels
         )
 
+    @property
+    def is_ops(self) -> bool:
+        """Lightweight epic that bypasses breakdown/plan/review/merge.
+        Use for one-shot ops tasks (git pull, run a sync script, etc.)
+        where there is no diff to review."""
+        return "class:ops" in self.labels
+
 
 @dataclass(frozen=True)
 class State:
@@ -142,7 +149,13 @@ class ReopenIssue:
     comment: str
 
 
-Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue]
+@dataclass(frozen=True)
+class CloseIssue:
+    issue_id: str
+    reason: str
+
+
+Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue, CloseIssue]
 
 
 # ---------- Idempotency keys ----------
@@ -152,6 +165,40 @@ def idem(*parts: str) -> str:
 
 
 # ---------- Per-epic reconcile ----------
+
+def _reconcile_ops_epic(epic: Issue, state: State) -> list[Action]:
+    """Lightweight FSM for `class:ops` epics: file a single dev, close the
+    epic when it closes. No breakdown, plan, review, merge, or worktree.
+    Intended for one-shot tasks that don't produce a diff (git pull, run a
+    sync script, restart something)."""
+    actions: list[Action] = []
+    children = state.children_of(epic.id)
+    devs = [c for c in children if c.kind == "dev"]
+
+    if not devs:
+        dev_idem = idem("file-ops-dev", epic.id)
+        if not state.has_idem(dev_idem):
+            actions.append(FileIssue(
+                title=f"Ops: {epic.title}",
+                description=(
+                    f"epic: {epic.id}\n"
+                    f"idem: {dev_idem}\n"
+                    f"Ops task — work directly in the team's main worktree. "
+                    f"No branch, no diff expected. Close when done."
+                ),
+                labels=("role:developer", "kind:dev", "class:ops"),
+                priority=2,
+            ))
+        return actions
+
+    # Single dev exists. Close the epic when it closes.
+    if all(not d.is_open for d in devs):
+        actions.append(CloseIssue(
+            issue_id=epic.id,
+            reason=f"ops complete via {devs[0].id}",
+        ))
+    return actions
+
 
 def reconcile_epic(
     epic: Issue,
@@ -163,6 +210,9 @@ def reconcile_epic(
     `plan_chunks_for(epic_id) -> list[(letter, desc)]` reads the merged plan
     from disk to determine dev-task chunks. Tests inject a stub.
     """
+    if epic.is_ops:
+        return _reconcile_ops_epic(epic, state)
+
     children = state.children_of(epic.id)
     actions: list[Action] = []
 
@@ -440,6 +490,13 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
             if not dry_run:
                 subprocess.run(
                     ["bd", "reopen", a.issue_id],
+                    check=False, capture_output=True,
+                )
+        elif isinstance(a, CloseIssue):
+            log.append(f"close: {a.issue_id} reason={a.reason!r}")
+            if not dry_run:
+                subprocess.run(
+                    ["bd", "close", a.issue_id, "-r", a.reason],
                     check=False, capture_output=True,
                 )
     return log
