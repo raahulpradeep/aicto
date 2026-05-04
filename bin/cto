@@ -1282,6 +1282,7 @@ while :; do
 
 $starter"
     codex exec \
+      --workdir "$TEAM_DIR" \
       "${codex_args[@]}" \
       "$full_prompt" \
       2> >(tee "$err" >&2)
