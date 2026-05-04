@@ -1270,10 +1270,10 @@ while :; do
     rc=$?
   elif [[ "$AGENT_PROVIDER" == "codex" ]]; then
     log "invoking codex (task=${task_id:-none})"
-    # Codex exec is the non-interactive subcommand.  --full-auto auto-approves
-    # edits and commands; without it codex defaults to suggest/read-only.
+    # Codex exec is the non-interactive subcommand.  --sandbox workspace-write
+    # auto-approves edits and commands within the workdir.
     local codex_args=()
-    [[ "$PERM" == "bypassPermissions" ]] && codex_args+=("--full-auto")
+    [[ "$PERM" == "bypassPermissions" ]] && codex_args+=("--sandbox" "workspace-write")
     codex_args+=("--model" "$MODEL")
     # Codex exec has no --append-system-prompt; prepend the role prompt to the
     # user instruction so the agent still receives its role context.
