@@ -1270,15 +1270,20 @@ while :; do
     rc=$?
   elif [[ "$AGENT_PROVIDER" == "codex" ]]; then
     log "invoking codex (task=${task_id:-none})"
-    case "$PERM" in
-      bypassPermissions) approval="full-auto" ;;
-      *) approval="suggest" ;;
-    esac
-    codex --quiet \
-      --approval-mode "$approval" \
-      --model "$MODEL" \
-      --config experimental_instructions_file="$ROLE_FILE" \
-      "$starter" \
+    # Codex exec is the non-interactive subcommand.  --full-auto auto-approves
+    # edits and commands; without it codex defaults to suggest/read-only.
+    local codex_args=()
+    [[ "$PERM" == "bypassPermissions" ]] && codex_args+=("--full-auto")
+    codex_args+=("--model" "$MODEL")
+    # Codex exec has no --append-system-prompt; prepend the role prompt to the
+    # user instruction so the agent still receives its role context.
+    local full_prompt
+    full_prompt="$(cat "$ROLE_FILE")
+
+$starter"
+    codex exec \
+      "${codex_args[@]}" \
+      "$full_prompt" \
       2> >(tee "$err" >&2)
     rc=$?
   else
