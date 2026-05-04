@@ -297,9 +297,10 @@ Usage:
   cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan]
-  cto inbox [<team>]
+  cto inbox [<team>] [--json]
   cto approve <team> <id> [--comment "…"]
   cto reject <team> <id> --comment "…"
+  cto review                                # interactive TUI inbox
 
   cto start <team> [--attach] [--dangerous]
   cto stop <team>
@@ -677,7 +678,7 @@ cmd_config() {
 cmd_task() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local title="" desc="" prio=2 kind=epic
+  local title="" desc="" prio=2 kind=epic ops=0
   while (( $# )); do
     case "$1" in
       -d|--description) desc="$2"; shift 2 ;;
@@ -685,21 +686,30 @@ cmd_task() {
       --epic) kind=epic; shift ;;
       --dev)  kind=dev;  shift ;;
       --plan) kind=plan; shift ;;
+      --ops)  ops=1;     shift ;;
       --) shift ;;
       -*) die "unknown task flag: $1" ;;
       *) [[ -z "$title" ]] && title="$1" || die "extra arg: $1"; shift ;;
     esac
   done
   [[ -n "$title" ]] || die "task title required"
+  if (( ops )) && [[ "$kind" != "epic" ]]; then
+    die "--ops only applies to epics"
+  fi
 
   local labels="role:manager,kind:$kind"
+  (( ops )) && labels="$labels,class:ops"
   local id
   id=$(cd "$(team_dir "$name")" && bd create -t task \
         -l "$labels" -p "$prio" \
         -d "${desc:-(no description)}" \
         --silent \
         "$title")
-  info "filed $id ($kind, role:manager) in team $name"
+  if (( ops )); then
+    info "filed $id (ops epic, role:manager) in team $name — reconciler will file a single dev, no breakdown/plan/review"
+  else
+    info "filed $id ($kind, role:manager) in team $name"
+  fi
 }
 
 # ---- merge ---------------------------------------------------------------
@@ -895,9 +905,17 @@ cmd_promote() {
 # ---- inbox ---------------------------------------------------------------
 
 cmd_inbox() {
-  local target="${1:-}"
+  local target="" json_mode=0
+  while (( $# )); do
+    case "$1" in
+      --json) json_mode=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
   shopt -s nullglob
   local any=0
+  local accum="[]"
   for d in "$TEAMS_DIR"/*/; do
     local name; name="$(basename "$d")"
     [[ -d "$d/.cto" ]] || continue
@@ -907,11 +925,21 @@ cmd_inbox() {
     local count; count="$(jq 'length' <<<"$rows")"
     (( count == 0 )) && continue
     any=1
-    info "── $name ──"
-    jq -r '.[] | "  \(.id)  \(.title)  [\((.labels // []) | join(",") )]"' <<<"$rows"
+    if (( json_mode )); then
+      local tagged
+      tagged="$(jq --arg team "$name" '[.[] | .team = $team]' <<<"$rows")"
+      accum="$(jq -s 'add // []' <<<"$accum"$'\n'"$tagged")"
+    else
+      info "── $name ──"
+      jq -r '.[] | "  \(.id)  \(.title)  [\((.labels // []) | join(",") )]"' <<<"$rows"
+    fi
   done
   shopt -u nullglob
-  (( any )) || info "inbox empty — nothing waiting on the CTO."
+  if (( json_mode )); then
+    echo "$accum"
+  else
+    (( any )) || info "inbox empty — nothing waiting on the CTO."
+  fi
 }
 
 # ---- approve / reject ---------------------------------------------------
@@ -1486,6 +1514,11 @@ cmd_top() {
   exec uv run --quiet --with rich python3 "$CTO_ROOT/dashboard/top.py" "$@"
 }
 
+cmd_review() {
+  require_cmd uv
+  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/cmdcenter.py" "$@"
+}
+
 # ---- exec ----------------------------------------------------------------
 
 cmd_exec() {
@@ -1529,6 +1562,7 @@ main() {
     status)    cmd_status    "$@" ;;
     update)    cmd_update    "$@" ;;
     top)       cmd_top       "$@" ;;
+    review)    cmd_review    "$@" ;;
     worktrees) cmd_worktrees "$@" ;;
     reconciler-sync) cmd_reconciler_sync "$@" ;;
     exec)      cmd_exec      "$@" ;;

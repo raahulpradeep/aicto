@@ -11,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconciler import (  # noqa: E402
     AddLabel,
+    CloseIssue,
     FileIssue,
+    FilePair,
     Issue,
     RemoveLabel,
     State,
@@ -54,17 +56,36 @@ def _epic(id: str = "e1", title: str = "Test epic") -> Issue:
     )
 
 
+def _ops_epic(id: str = "e-ops", title: str = "git pull") -> Issue:
+    return Issue(
+        id=id, title=title, description="", status="open",
+        labels=("kind:epic", "role:manager", "class:ops"),
+    )
+
+
 def _state(*issues: Issue) -> State:
     return State(issues=tuple(issues))
+
+
+def _all_file_issues(actions):
+    """Flatten FileIssue + FilePair (upstream + downstream) into a list of
+    FileIssue. Tests assert against this — both halves of a pair are
+    individually issues that get filed in bd."""
+    out: list[FileIssue] = []
+    for a in actions:
+        if isinstance(a, FileIssue):
+            out.append(a)
+        elif isinstance(a, FilePair):
+            out.append(a.upstream)
+            out.append(a.downstream)
+    return out
 
 
 def _file_issues(actions, *, kind: str, target: str | None = None):
     out = []
     want_kind = f"kind:{kind}"
     want_target = f"target:{target}" if target else None
-    for a in actions:
-        if not isinstance(a, FileIssue):
-            continue
+    for a in _all_file_issues(actions):
         if want_kind not in a.labels:
             continue
         if want_target and want_target not in a.labels:
@@ -204,6 +225,33 @@ def test_epic_merge_idempotent():
 
 # ---------- Tests: dev sub-FSM (changes-requested / re-review) ----------
 
+def test_changes_requested_finds_upstream_via_idem_fallback():
+    """Review with no `upstream:` line, no `task/<id>` reference — only its
+    idem key — must still resolve to the matching dev. (Today's stuck-epic
+    case: aicto-6ud's review predated FilePair.)"""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               status="closed", close_reason="changes-requested"),
+    )
+    actions = reconcile(s)
+    labels = [
+        a for a in actions
+        if isinstance(a, AddLabel) and a.label == "needs-re-review" and a.issue_id == "d1"
+    ]
+    assert len(labels) == 1
+
+
 def test_changes_requested_adds_needs_re_review_label():
     rev = _issue(
         "rc1", "review", role="reviewer", target="code",
@@ -299,6 +347,60 @@ def test_epic_blocked_by_pending_re_review():
     assert _file_issues(actions, kind="merge", target="epic") == []
 
 
+def test_phase4_ignores_historical_changes_requested_when_later_round_approved():
+    """Round-1 changes-requested + round-2 approved + code-merge closed →
+    reconciler must not re-tag the dev with needs-re-review every tick."""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code", status="closed",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               close_reason="changes-requested"),
+        _issue("rc2", "review", role="reviewer", target="code", status="closed",
+               description="epic: e1\nupstream: d1\nidem: file-review-code:e1:d1:round-2",
+               close_reason="approved"),
+        _issue("cm1", "merge", target="code",
+               description="epic: e1", status="closed"),
+    )
+    actions = reconcile(s)
+    label_actions = [a for a in actions if isinstance(a, AddLabel)]
+    assert label_actions == []
+    # And ship is now allowed.
+    assert len(_file_issues(actions, kind="merge", target="epic")) == 1
+
+
+def test_epic_with_historical_changes_requested_but_no_merge_does_not_ship():
+    """Round-1 review closed changes-requested, dev closed, but no code
+    merge ever happened. Without the merge-count guard the ship gate would
+    fire (this is the aicto-6ud stuck case)."""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               status="closed", close_reason="changes-requested"),
+        # No kind:merge,target:code exists.
+    )
+    actions = reconcile(s)
+    assert _file_issues(actions, kind="merge", target="epic") == []
+
+
 def test_epic_blocked_by_open_code_review():
     s = _full_done_state(extra=(
         _issue("d2", "dev", role="developer",
@@ -313,7 +415,7 @@ def test_epic_blocked_by_open_code_review():
 
 def test_running_reconciler_twice_emits_nothing_second_time():
     """Apply the actions from tick 1 to the state, then run tick 2 — should
-    produce no new FileIssue actions for the same bug class."""
+    produce no new FileIssue / FilePair actions for the same bug class."""
     s1 = _state(
         _epic(),
         _issue("b1", "breakdown", description="epic: e1", status="closed"),
@@ -324,17 +426,118 @@ def test_running_reconciler_twice_emits_nothing_second_time():
     assert _file_issues(first, kind="plan")
     new_issues = list(s1.issues)
     counter = 0
-    for a in first:
-        if isinstance(a, FileIssue):
-            counter += 1
-            new_issues.append(Issue(
-                id=f"new-{counter}",
-                title=a.title,
-                description=a.description,
-                status="open",
-                labels=a.labels,
-            ))
+    for a in _all_file_issues(first):
+        counter += 1
+        new_issues.append(Issue(
+            id=f"new-{counter}",
+            title=a.title,
+            description=a.description,
+            status="open",
+            labels=a.labels,
+        ))
     s2 = State(issues=tuple(new_issues))
     second = reconcile(s2)
-    assert all(not isinstance(a, FileIssue) for a in second), \
+    assert all(not isinstance(a, (FileIssue, FilePair)) for a in second), \
         f"unexpected re-filing on second tick: {second}"
+
+
+# ---------- Tests: ops-epic shortcut FSM ----------
+
+def test_ops_epic_files_single_dev_no_review_no_pair():
+    s = _state(_ops_epic())
+    actions = reconcile(s)
+    # Exactly one FileIssue (the dev). No FilePair, no review.
+    file_issues = [a for a in actions if isinstance(a, FileIssue)]
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(file_issues) == 1
+    assert pairs == []
+    dev = file_issues[0]
+    assert "kind:dev" in dev.labels
+    assert "role:developer" in dev.labels
+    assert "class:ops" in dev.labels
+
+
+def test_ops_epic_skips_breakdown_plan_review_merge():
+    s = _state(_ops_epic())
+    actions = reconcile(s)
+    # No breakdown-approval, no plan, no review, no merge actions.
+    for a in _all_file_issues(actions):
+        kinds = {l for l in a.labels if l.startswith("kind:")}
+        assert kinds & {"kind:plan", "kind:breakdown",
+                        "kind:review", "kind:merge", "kind:approval"} == set(), \
+            f"ops epic emitted forbidden kind: {a}"
+
+
+def test_ops_epic_idempotent():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer",
+               description="epic: e-ops\nidem: file-ops-dev:e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    assert [a for a in actions if isinstance(a, FileIssue)] == []
+
+
+def test_ops_epic_closes_when_dev_closes():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e-ops\nidem: file-ops-dev:e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    closes = [a for a in actions if isinstance(a, CloseIssue) and a.issue_id == "e-ops"]
+    assert len(closes) == 1
+    assert "d1" in closes[0].reason
+
+
+def test_ops_epic_does_not_file_epic_merge():
+    s = _state(
+        _ops_epic(),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e-ops",
+               labels_extra=("class:ops",)),
+    )
+    actions = reconcile(s)
+    epic_merges = _file_issues(actions, kind="merge", target="epic")
+    assert epic_merges == []
+
+
+# ---------- Tests: pair linkage (today's bug — review claimable too early) ----------
+
+def test_plan_and_plan_review_filed_as_blocked_pair():
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+    )
+    actions = reconcile(s)
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert "kind:plan" in pair.upstream.labels
+    assert "kind:review" in pair.downstream.labels
+    assert "target:plan" in pair.downstream.labels
+
+
+def test_dev_and_code_review_filed_as_blocked_pair_per_chunk():
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+    )
+    chunks = [("A", "alpha"), ("B", "beta")]
+    actions = reconcile(s, plan_chunks_for=lambda _e: chunks)
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(pairs) == 2
+    for p in pairs:
+        assert "kind:dev" in p.upstream.labels
+        assert "kind:review" in p.downstream.labels
+        assert "target:code" in p.downstream.labels
