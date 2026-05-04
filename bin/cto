@@ -347,6 +347,9 @@ _team_scaffold() {
   if [[ "$provider" == "kimi" ]]; then
     default_model="kimi-code/kimi-for-coding"
     default_manager_model="kimi-code/kimi-for-coding"
+  elif [[ "$provider" == "codex" ]]; then
+    default_model="codex-1"
+    default_manager_model="codex-1"
   else
     default_model="sonnet"
     default_manager_model="claude-opus-4-6"
@@ -425,7 +428,7 @@ cmd_team_create() {
   [[ ! -e "$TEAMS_DIR/$name" ]] || die "team already exists: $name"
   [[ "$devs" =~ ^[0-9]+$ ]] || die "--developers must be an integer"
   [[ "$revs" =~ ^[0-9]+$ ]] || die "--reviewers must be an integer"
-  [[ "$provider" == "claude" || "$provider" == "kimi" ]] || die "--agent-provider must be claude or kimi"
+  [[ "$provider" == "claude" || "$provider" == "kimi" || "$provider" == "codex" ]] || die "--agent-provider must be claude, kimi, or codex"
 
   local tdir="$TEAMS_DIR/$name"
   info "creating team: $name (devs=$devs, reviewers=$revs, container-use=$cuse, agent-provider=$provider)"
@@ -478,7 +481,7 @@ cmd_team_adopt() {
   src="$(cd "$src" && pwd)"
   [[ "$src" != "$TEAMS_DIR/$name" ]] || die "source is already the team path"
   case "$src" in "$CTO_ROOT"|"$CTO_ROOT"/*) die "cannot adopt a path inside the CTO workspace: $src" ;; esac
-  [[ "$provider" == "claude" || "$provider" == "kimi" ]] || die "--agent-provider must be claude or kimi"
+  [[ "$provider" == "claude" || "$provider" == "kimi" || "$provider" == "codex" ]] || die "--agent-provider must be claude, kimi, or codex"
 
   local tdir="$TEAMS_DIR/$name"
   info "adopting: $src → teams/$name (copy=$copy, devs=$devs, reviewers=$revs, container-use=$cuse, agent-provider=$provider)"
@@ -657,7 +660,7 @@ cmd_config() {
       --model)           cfg_set "$name" model "$2";             shift 2 ;;
       --manager-model)   cfg_set "$name" managerModel "$2";      shift 2 ;;
       --agent-provider)
-        [[ "$2" == "claude" || "$2" == "kimi" ]] || die "--agent-provider must be claude or kimi"
+        [[ "$2" == "claude" || "$2" == "kimi" || "$2" == "codex" ]] || die "--agent-provider must be claude, kimi, or codex"
         cfg_set "$name" agentProvider "$2"; shift 2 ;;
       *) die "unknown config flag: $1" ;;
     esac
@@ -1256,6 +1259,19 @@ while :; do
       ${mcp_args[@]+"${mcp_args[@]}"} \
       2> >(tee "$err" >&2)
     rc=$?
+  elif [[ "$AGENT_PROVIDER" == "codex" ]]; then
+    log "invoking codex (task=${task_id:-none})"
+    case "$PERM" in
+      bypassPermissions) approval="full-auto" ;;
+      *) approval="suggest" ;;
+    esac
+    codex --quiet \
+      --approval-mode "$approval" \
+      --model "$MODEL" \
+      --config experimental_instructions_file="$ROLE_FILE" \
+      "$starter" \
+      2> >(tee "$err" >&2)
+    rc=$?
   else
     log "invoking claude (task=${task_id:-none})"
     # Stream events as they happen (tool calls + tool results + text)
@@ -1291,7 +1307,7 @@ while :; do
   if (( rc != 0 )); then
     log "$AGENT_PROVIDER exited $rc"
     release_claim "$task_id"
-    if [[ "$AGENT_PROVIDER" != "kimi" ]] && looks_like_permission_block "$err"; then
+    if [[ "$AGENT_PROVIDER" == "claude" ]] && looks_like_permission_block "$err"; then
       escalate_permission "$task_id" "$err"
       sleep 60   # back off until the human grants permission
     else

@@ -140,7 +140,7 @@ def config(
 
     `model` controls developer + reviewer windows.
     `manager_model` controls the manager window.
-    `agent_provider` is claude or kimi."""
+    `agent_provider` is claude, kimi, or codex."""
     args = ["config", name]
     if developers is not None:
         args += ["--developers", str(developers)]

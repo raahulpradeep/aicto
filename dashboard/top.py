@@ -371,6 +371,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
 
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
+    t.add_column("PROVIDER", overflow="ellipsis", no_wrap=True)
     t.add_column("MODEL", overflow="ellipsis", no_wrap=True)
     t.add_column("STATUS", overflow="ellipsis", no_wrap=True)
     t.add_column("ISSUE", overflow="ellipsis", no_wrap=True, ratio=2)
@@ -379,6 +380,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
     for row in agents:
         stale = row.get("stale", False)
         agent = ("~" if stale else "") + row["agent"]
+        provider = row.get("provider", "—")
         model = row.get("model", "—")
         issue = row["issue"]
         row_style = "dim" if stale else ""
@@ -389,6 +391,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
             title = _truncate(issue.get("title", ""), 50)
             t.add_row(
                 Text(agent, style=row_style),
+                Text(provider, style=row_style),
                 Text(model, style=row_style),
                 Text("working", style="green" if not stale else "dim"),
                 Text(f"{issue['id']}  {title}", style=row_style),
@@ -397,6 +400,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
         else:
             t.add_row(
                 Text(agent, style=row_style),
+                Text(provider, style=row_style),
                 Text(model, style=row_style),
                 Text("idle", style="dim"),
                 Text("—", style="dim"),

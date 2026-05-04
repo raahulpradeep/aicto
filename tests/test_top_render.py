@@ -69,13 +69,14 @@ def _agent_row(
     window: str = "manager",
     issue: dict | None = None,
     stale: bool = False,
+    provider: str = "claude",
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "agent": f"{team}:{window}",
         "team": team,
         "window": window,
         "issue": issue,
-        "provider": "claude",
+        "provider": provider,
         "model": "claude-sonnet-4-6",
     }
     if stale:
@@ -119,6 +120,22 @@ class TestAgentPanel:
         agents = [_agent_row(issue=issue)]
         result = top._agent_panel(agents, ["myteam"], NOW)
         assert isinstance(result, Panel)
+
+    def test_provider_column_shown(self):
+        from io import StringIO
+        from rich.console import Console
+
+        agents = [
+            _agent_row(team="alpha", provider="codex"),
+            _agent_row(team="beta", provider="kimi"),
+        ]
+        buf = StringIO()
+        c = Console(file=buf, width=120, no_color=True, highlight=False)
+        panel = top._agent_panel(agents, ["alpha", "beta"], NOW)
+        c.print(panel)
+        text = buf.getvalue()
+        assert "codex" in text
+        assert "kimi" in text
 
 
 class TestInboxPanel:
