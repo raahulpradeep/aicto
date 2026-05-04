@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from reconciler import (  # noqa: E402
     AddLabel,
     FileIssue,
+    FilePair,
     Issue,
     RemoveLabel,
     State,
@@ -58,13 +59,25 @@ def _state(*issues: Issue) -> State:
     return State(issues=tuple(issues))
 
 
+def _all_file_issues(actions):
+    """Flatten FileIssue + FilePair (upstream + downstream) into a list of
+    FileIssue. Tests assert against this — both halves of a pair are
+    individually issues that get filed in bd."""
+    out: list[FileIssue] = []
+    for a in actions:
+        if isinstance(a, FileIssue):
+            out.append(a)
+        elif isinstance(a, FilePair):
+            out.append(a.upstream)
+            out.append(a.downstream)
+    return out
+
+
 def _file_issues(actions, *, kind: str, target: str | None = None):
     out = []
     want_kind = f"kind:{kind}"
     want_target = f"target:{target}" if target else None
-    for a in actions:
-        if not isinstance(a, FileIssue):
-            continue
+    for a in _all_file_issues(actions):
         if want_kind not in a.labels:
             continue
         if want_target and want_target not in a.labels:
@@ -313,7 +326,7 @@ def test_epic_blocked_by_open_code_review():
 
 def test_running_reconciler_twice_emits_nothing_second_time():
     """Apply the actions from tick 1 to the state, then run tick 2 — should
-    produce no new FileIssue actions for the same bug class."""
+    produce no new FileIssue / FilePair actions for the same bug class."""
     s1 = _state(
         _epic(),
         _issue("b1", "breakdown", description="epic: e1", status="closed"),
@@ -324,17 +337,55 @@ def test_running_reconciler_twice_emits_nothing_second_time():
     assert _file_issues(first, kind="plan")
     new_issues = list(s1.issues)
     counter = 0
-    for a in first:
-        if isinstance(a, FileIssue):
-            counter += 1
-            new_issues.append(Issue(
-                id=f"new-{counter}",
-                title=a.title,
-                description=a.description,
-                status="open",
-                labels=a.labels,
-            ))
+    for a in _all_file_issues(first):
+        counter += 1
+        new_issues.append(Issue(
+            id=f"new-{counter}",
+            title=a.title,
+            description=a.description,
+            status="open",
+            labels=a.labels,
+        ))
     s2 = State(issues=tuple(new_issues))
     second = reconcile(s2)
-    assert all(not isinstance(a, FileIssue) for a in second), \
+    assert all(not isinstance(a, (FileIssue, FilePair)) for a in second), \
         f"unexpected re-filing on second tick: {second}"
+
+
+# ---------- Tests: pair linkage (today's bug — review claimable too early) ----------
+
+def test_plan_and_plan_review_filed_as_blocked_pair():
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+    )
+    actions = reconcile(s)
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert "kind:plan" in pair.upstream.labels
+    assert "kind:review" in pair.downstream.labels
+    assert "target:plan" in pair.downstream.labels
+
+
+def test_dev_and_code_review_filed_as_blocked_pair_per_chunk():
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+    )
+    chunks = [("A", "alpha"), ("B", "beta")]
+    actions = reconcile(s, plan_chunks_for=lambda _e: chunks)
+    pairs = [a for a in actions if isinstance(a, FilePair)]
+    assert len(pairs) == 2
+    for p in pairs:
+        assert "kind:dev" in p.upstream.labels
+        assert "kind:review" in p.downstream.labels
+        assert "target:code" in p.downstream.labels

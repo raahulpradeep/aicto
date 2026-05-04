@@ -111,6 +111,20 @@ class FileIssue:
 
 
 @dataclass(frozen=True)
+class FilePair:
+    """File two issues atomically and link them with a `blocks` dependency.
+
+    `upstream` is filed first; its bd-assigned id is then used as the
+    `blocks` target for `downstream`, so `downstream` does not appear in
+    `bd ready` until `upstream` closes. Used for plan↔review-plan,
+    dev↔review-code, and dev↔re-review pairs — without this, reviewers
+    claim review issues before the upstream artifact exists.
+    """
+    upstream: FileIssue
+    downstream: FileIssue
+
+
+@dataclass(frozen=True)
 class AddLabel:
     issue_id: str
     label: str
@@ -128,7 +142,7 @@ class ReopenIssue:
     comment: str
 
 
-Action = Union[FileIssue, AddLabel, RemoveLabel, ReopenIssue]
+Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue]
 
 
 # ---------- Idempotency keys ----------
@@ -172,28 +186,29 @@ def reconcile_epic(
     # ---- Phase 2: after breakdown merge, ensure plan + plan-review filed.
     if breakdown_merges_closed and not plans:
         plan_idem = idem("file-plan", epic.id)
-        if not state.has_idem(plan_idem):
-            actions.append(FileIssue(
-                title=f"Plan: {epic.title}",
-                description=(
-                    f"epic: {epic.id}\n"
-                    f"idem: {plan_idem}\n"
-                    f"Author plans/{epic.id}.md on a task branch off epic/{epic.id}."
-                ),
-                labels=("role:developer", "kind:plan"),
-                priority=2,
-            ))
         review_idem = idem("file-review-plan", epic.id)
-        if not state.has_idem(review_idem):
-            actions.append(FileIssue(
-                title=f"Review plan: {epic.title}",
-                description=(
-                    f"epic: {epic.id}\n"
-                    f"idem: {review_idem}\n"
-                    f"Review plans/{epic.id}.md on the plan branch."
+        if not state.has_idem(plan_idem) and not state.has_idem(review_idem):
+            actions.append(FilePair(
+                upstream=FileIssue(
+                    title=f"Plan: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"idem: {plan_idem}\n"
+                        f"Author plans/{epic.id}.md on a task branch off epic/{epic.id}."
+                    ),
+                    labels=("role:developer", "kind:plan"),
+                    priority=2,
                 ),
-                labels=("role:reviewer", "kind:review", "target:plan"),
-                priority=2,
+                downstream=FileIssue(
+                    title=f"Review plan: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"idem: {review_idem}\n"
+                        f"Review plans/{epic.id}.md on the plan branch."
+                    ),
+                    labels=("role:reviewer", "kind:review", "target:plan"),
+                    priority=2,
+                ),
             ))
 
     # ---- Phase 3: after plan merge, ensure dev + review:code per chunk.
@@ -206,33 +221,36 @@ def reconcile_epic(
         for letter, desc in chunks:
             slot = letter or "full"
             dev_key = idem("file-dev", epic.id, slot)
-            if not state.has_idem(dev_key):
-                if letter:
-                    title = f"Implement {desc}"
-                    body = (
-                        f"epic: {epic.id}\n"
-                        f"idem: {dev_key}\n"
-                        f"Per plans/{epic.id}.md §{letter} — {desc}.\n"
-                        f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
-                    )
-                else:
-                    title = f"Implement {epic.title}"
-                    body = (
-                        f"epic: {epic.id}\n"
-                        f"idem: {dev_key}\n"
-                        f"Implement deliverables from the merged plan for epic {epic.id}.\n"
-                        f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
-                    )
-                actions.append(FileIssue(
-                    title=title,
-                    description=body,
+            rev_key = idem("file-review-code", epic.id, slot, "round-1")
+            if state.has_idem(dev_key) or state.has_idem(rev_key):
+                continue
+            if letter:
+                dev_title = f"Implement {desc}"
+                dev_body = (
+                    f"epic: {epic.id}\n"
+                    f"idem: {dev_key}\n"
+                    f"Per plans/{epic.id}.md §{letter} — {desc}.\n"
+                    f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
+                )
+                rev_title = f"Review: {desc}"
+            else:
+                dev_title = f"Implement {epic.title}"
+                dev_body = (
+                    f"epic: {epic.id}\n"
+                    f"idem: {dev_key}\n"
+                    f"Implement deliverables from the merged plan for epic {epic.id}.\n"
+                    f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
+                )
+                rev_title = f"Review: {epic.title}"
+            actions.append(FilePair(
+                upstream=FileIssue(
+                    title=dev_title,
+                    description=dev_body,
                     labels=("role:developer", "kind:dev"),
                     priority=2,
-                ))
-            rev_key = idem("file-review-code", epic.id, slot, "round-1")
-            if not state.has_idem(rev_key):
-                actions.append(FileIssue(
-                    title=f"Review: {desc}" if letter else f"Review: {epic.title}",
+                ),
+                downstream=FileIssue(
+                    title=rev_title,
                     description=(
                         f"epic: {epic.id}\n"
                         f"idem: {rev_key}\n"
@@ -240,7 +258,8 @@ def reconcile_epic(
                     ),
                     labels=("role:reviewer", "kind:review", "target:code"),
                     priority=2,
-                ))
+                ),
+            ))
 
     # ---- Phase 4: changes-requested handling (was supervisor Hook 1).
     for rev in code_reviews:
@@ -379,6 +398,29 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
             log.append(f"file: {a.title!r} labels={list(a.labels)}")
             if not dry_run:
                 _bd_file(a)
+        elif isinstance(a, FilePair):
+            log.append(
+                f"pair: {a.upstream.title!r} → {a.downstream.title!r} "
+                f"(downstream blocked by upstream)"
+            )
+            if not dry_run:
+                up_id = _bd_file(a.upstream)
+                if up_id:
+                    down_action = FileIssue(
+                        title=a.downstream.title,
+                        description=a.downstream.description,
+                        labels=a.downstream.labels,
+                        priority=a.downstream.priority,
+                        blocks=None,
+                    )
+                    down_id = _bd_file(down_action)
+                    if down_id:
+                        # Upstream blocks downstream: downstream stays out of
+                        # `bd ready` until upstream closes.
+                        subprocess.run(
+                            ["bd", "dep", up_id, "--blocks", down_id],
+                            check=False, capture_output=True,
+                        )
         elif isinstance(a, AddLabel):
             log.append(f"label+: {a.issue_id} +{a.label}")
             if not dry_run:
