@@ -1204,7 +1204,7 @@ while :; do
           break
         fi
       done
-      if [[ -z "$task_id" ]]; then rm -f "$err"; sleep 15; continue; fi
+      if [[ -z "$task_id" ]]; then rm -f "$err"; sleep 5; continue; fi
 
       # Stamp the bd issue with our globally-unique agent identity and
       # flip it to in_progress so it falls out of `bd ready` for everyone.
@@ -1296,20 +1296,7 @@ while :; do
     fi
     log "iteration ok (task=${task_id:-none})"
 
-    # === WORKFLOW RECONCILER ===
-    # All workflow transitions (Hooks 1-5 + epic-ship gate of the previous
-    # design) are now owned by a single typed reconciler at .cto/reconciler.py.
-    # It is a pure function over bd state; idempotency keys embedded in issue
-    # descriptions prevent duplicate filings if a tick is replayed. Only the
-    # manager invokes it — running it from every role would just emit identical
-    # actions concurrently. See templates/reconciler.py.
-    if [[ "$ROLE" == "manager" && -x "$TEAM_DIR/.cto/reconciler.py" ]]; then
-      python3 "$TEAM_DIR/.cto/reconciler.py" --role manager 2>&1 | while IFS= read -r rline; do
-        log "reconciler: $rline"
-      done
-    fi
-
-    [[ "$ROLE" == "manager" ]] && sleep 20 || sleep 5
+    [[ "$ROLE" == "manager" ]] && sleep 10 || sleep 5
   fi
   rm -f "$err"
 done
@@ -1322,6 +1309,9 @@ OUTER
   [[ "$provider" == "kimi" ]] && manager_file="$pdir/manager.yaml"
   tmux new-session -d -s "$sess" -n manager -c "$tdir" \
     "$launcher" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
+
+  tmux new-window -t "$sess" -n reconciler -c "$tdir" \
+    bash -c 'while :; do python3 "$1/.cto/reconciler.py" --role manager 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; sleep 3; done' bash "$tdir"
 
   for i in $(seq 1 "$n_devs"); do
     local dev_file="$pdir/dev-$i.md"
@@ -1338,7 +1328,7 @@ OUTER
   done
 
   info "started team $name in tmux session: $sess"
-  info "  windows: manager, dev-1..$n_devs, review-1..$n_revs"
+  info "  windows: manager, reconciler, dev-1..$n_devs, review-1..$n_revs"
   info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then
@@ -1511,7 +1501,7 @@ cmd_worktrees() {
 
 cmd_top() {
   require_cmd uv
-  exec uv run --quiet --with rich python3 "$CTO_ROOT/dashboard/top.py" "$@"
+  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/top.py" "$@"
 }
 
 cmd_review() {

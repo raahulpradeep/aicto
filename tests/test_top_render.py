@@ -1,10 +1,7 @@
-"""Regression tests for dashboard/top.py render() and helpers.
+"""Regression tests for dashboard/top.py panel builders and helpers.
 
-Dev 3 of epic aicto-v6t. Tests that do NOT depend on a live terminal or
-running tmux session — everything is driven by synthetic data.
-
-Stale-row tests are marked xfail because the stale-data feature lives in
-Dev 1 (not yet merged into epic/aicto-v6t). Remove xfail once merged.
+Tests that do NOT depend on a live terminal or running tmux session —
+everything is driven by synthetic data.
 """
 from __future__ import annotations
 
@@ -15,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from rich.layout import Layout
+from rich.panel import Panel
 
 # ---------------------------------------------------------------------------
 # Bootstrap: import top.py without executing __main__
@@ -87,19 +84,87 @@ def _agent_row(
 
 
 # ---------------------------------------------------------------------------
-# render() contract tests
+# Panel builder contract tests
 # ---------------------------------------------------------------------------
 
 
-class TestRenderReturnsLayout:
-    def test_empty_state_returns_layout(self):
-        result = top.render([], [], [], [], [])
-        assert isinstance(result, Layout)
+class TestAgentPanel:
+    def test_empty_returns_panel(self):
+        result = top._agent_panel([], [], NOW)
+        assert isinstance(result, Panel)
 
-    def test_with_synthetic_data_returns_layout(self):
+    def test_with_data_returns_panel(self):
         agents = [_agent_row(issue=_issue(assignee="myteam:manager"))]
+        result = top._agent_panel(agents, ["myteam"], NOW)
+        assert isinstance(result, Panel)
+
+    def test_multiple_teams(self):
+        agents = [
+            _agent_row(team="alpha", window="dev-1"),
+            _agent_row(team="beta", window="manager"),
+        ]
+        result = top._agent_panel(agents, ["alpha", "beta"], NOW)
+        assert isinstance(result, Panel)
+
+    def test_idle_agent(self):
+        agents = [_agent_row(issue=None)]
+        result = top._agent_panel(agents, ["myteam"], NOW)
+        assert isinstance(result, Panel)
+
+    def test_working_agent(self):
+        issue = _issue(
+            assignee="myteam:dev-1",
+            started_at="2026-01-01T11:30:00Z",
+        )
+        agents = [_agent_row(issue=issue)]
+        result = top._agent_panel(agents, ["myteam"], NOW)
+        assert isinstance(result, Panel)
+
+
+class TestInboxPanel:
+    def test_empty_returns_panel(self):
+        result = top._inbox_panel([])
+        assert isinstance(result, Panel)
+
+    def test_with_data_returns_panel(self):
         inbox = [{"team": "myteam", **_issue(labels=["role:cto", "kind:approval"])}]
-        open_tasks = [{"team": "myteam", **_issue(labels=["role:developer", "kind:dev"])}]
+        result = top._inbox_panel(inbox)
+        assert isinstance(result, Panel)
+
+
+class TestOpenPanel:
+    def test_empty_returns_panel(self):
+        result = top._open_panel([], NOW)
+        assert isinstance(result, Panel)
+
+    def test_with_data_returns_panel(self):
+        tasks = [{"team": "myteam", **_issue(labels=["role:developer", "kind:dev"])}]
+        result = top._open_panel(tasks, NOW)
+        assert isinstance(result, Panel)
+
+    def test_many_teams(self):
+        tasks = [{"team": f"team{i}", **_issue(id=f"t-{i}")} for i in range(20)]
+        result = top._open_panel(tasks, NOW)
+        assert isinstance(result, Panel)
+
+    def test_very_long_title_truncated(self):
+        long = "A" * 200
+        tasks = [{"team": "t", **_issue(title=long)}]
+        result = top._open_panel(tasks, NOW)
+        assert isinstance(result, Panel)
+
+    def test_unicode_in_titles(self):
+        tasks = [{"team": "t", **_issue(title="日本語 テスト 🚀")}]
+        result = top._open_panel(tasks, NOW)
+        assert isinstance(result, Panel)
+
+
+class TestClosedPanel:
+    def test_empty_returns_panel(self):
+        result = top._closed_panel([])
+        assert isinstance(result, Panel)
+
+    def test_with_data_returns_panel(self):
         closed = [
             {
                 "team": "myteam",
@@ -109,135 +174,50 @@ class TestRenderReturnsLayout:
                 ),
             }
         ]
-        result = top.render(agents, inbox, open_tasks, closed, ["myteam"], gather_ms=42)
-        assert isinstance(result, Layout)
+        result = top._closed_panel(closed)
+        assert isinstance(result, Panel)
 
-    def test_gather_ms_accepted(self):
-        result = top.render([], [], [], [], [], gather_ms=1234)
-        assert isinstance(result, Layout)
-
-    def test_multiple_teams(self):
-        agents = [
-            _agent_row(team="alpha", window="dev-1"),
-            _agent_row(team="beta", window="manager"),
-        ]
-        result = top.render(agents, [], [], [], ["alpha", "beta"])
-        assert isinstance(result, Layout)
-
-
-class TestEmptyStatePanels:
-    """Zero-data edge cases must not crash."""
-
-    def test_no_teams_running(self):
-        # The agent panel should show a "no running teams" placeholder.
-        result = top.render([], [], [], [], [])
-        assert isinstance(result, Layout)
-
-    def test_empty_inbox(self):
-        result = top.render([], [], [{"team": "t", **_issue()}], [], ["t"])
-        assert isinstance(result, Layout)
-
-    def test_empty_open_tasks(self):
-        result = top.render([_agent_row()], [{"team": "t", **_issue()}], [], [], ["t"])
-        assert isinstance(result, Layout)
-
-    def test_empty_closed(self):
-        result = top.render([], [], [], [], ["t"])
-        assert isinstance(result, Layout)
-
-    def test_all_empty(self):
-        result = top.render([], [], [], [], [])
-        assert isinstance(result, Layout)
-
-
-class TestEdgeCases:
-    def test_many_teams_simultaneously(self):
-        agents = [_agent_row(team=f"team{i}", window="manager") for i in range(20)]
-        running = [f"team{i}" for i in range(20)]
-        result = top.render(agents, [], [], [], running)
-        assert isinstance(result, Layout)
-
-    def test_very_long_title_truncated(self):
-        long = "A" * 200
-        issues = [{"team": "t", **_issue(title=long)}]
-        result = top.render([], [], issues, [], ["t"])
-        assert isinstance(result, Layout)
-
-    def test_unicode_in_titles(self):
-        issues = [{"team": "t", **_issue(title="日本語 テスト 🚀")}]
-        result = top.render([], [], issues, [], ["t"])
-        assert isinstance(result, Layout)
-
-    def test_agent_idle(self):
-        agents = [_agent_row(issue=None)]
-        result = top.render(agents, [], [], [], ["myteam"])
-        assert isinstance(result, Layout)
-
-    def test_agent_working(self):
-        issue = _issue(
-            assignee="myteam:dev-1",
-            started_at="2026-01-01T11:30:00Z",
-        )
-        agents = [_agent_row(issue=issue)]
-        result = top.render(agents, [], [], [], ["myteam"])
-        assert isinstance(result, Layout)
-
-    def test_closed_panel_many_rows(self):
+    def test_many_rows(self):
         closed = [
             {"team": "t", **_issue(id=f"t-{i}", closed_at="2026-01-01T11:00:00Z")}
             for i in range(50)
         ]
-        result = top.render([], [], [], closed, ["t"])
-        assert isinstance(result, Layout)
+        result = top._closed_panel(closed)
+        assert isinstance(result, Panel)
 
 
 # ---------------------------------------------------------------------------
-# Stale-data tests (xfail until Dev 1 is merged)
+# Stale-data tests
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="Stale-row '~' prefix requires Dev 1 (stale-data fallback) to be merged",
-    strict=False,
-)
 class TestStaleRows:
-    """When a row has stale=True, the team name should be prefixed with '~'.
-
-    These tests document the contract established by the plan (§Dev 1).
-    They are expected to fail until task/aicto-bi5 dev-1 is merged into
-    epic/aicto-v6t.
-    """
-
     def _render_to_text(self, **kwargs) -> str:
         from io import StringIO
         from rich.console import Console
 
         buf = StringIO()
         c = Console(file=buf, width=120, no_color=True, highlight=False)
-        layout = top.render(**kwargs)
-        c.print(layout)
+        panel = top._agent_panel(**kwargs)
+        c.print(panel)
         return buf.getvalue()
 
     def test_stale_agent_shows_tilde_prefix(self):
         agents = [_agent_row(team="myteam", stale=True)]
-        text = self._render_to_text(
-            agents=agents, inbox=[], open_tasks=[], closed=[], running=["myteam"]
-        )
+        text = self._render_to_text(agents=agents, running=["myteam"], now=NOW)
         assert "~myteam" in text
 
     def test_stale_open_task_shows_tilde_prefix(self):
         row = {"team": "myteam", "stale": True, **_issue()}
-        text = self._render_to_text(
-            agents=[], inbox=[], open_tasks=[row], closed=[], running=["myteam"]
-        )
-        assert "~myteam" in text
+        from io import StringIO
+        from rich.console import Console
 
-    def test_all_stale_footer_shows_count(self):
-        agents = [_agent_row(team="myteam", stale=True)]
-        text = self._render_to_text(
-            agents=agents, inbox=[], open_tasks=[], closed=[], running=["myteam"]
-        )
-        assert "stale" in text.lower()
+        buf = StringIO()
+        c = Console(file=buf, width=120, no_color=True, highlight=False)
+        panel = top._open_panel([row], NOW)
+        c.print(panel)
+        text = buf.getvalue()
+        assert "~myteam" in text
 
 
 # ---------------------------------------------------------------------------
@@ -298,18 +278,6 @@ class TestClassifyClosed:
     def test_no_labels(self):
         issue = {"labels": []}
         assert top._classify_closed(issue) == "—"
-
-
-class TestPanelHeight:
-    def test_zero_rows_returns_row_plus_overhead(self):
-        # max(4, 0+6) = 6 — overhead dominates at zero rows
-        assert top._panel_height(0) == 6
-
-    def test_small_row_count(self):
-        assert top._panel_height(1) == 7
-
-    def test_larger_row_count(self):
-        assert top._panel_height(10) == 16
 
 
 class TestTruncate:

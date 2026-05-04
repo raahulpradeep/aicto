@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --quiet --with rich python
+#!/usr/bin/env -S uv run --quiet --with textual,rich python
 """Live `top`-style dashboard for the AI CTO workspace.
 
 Four panels:
@@ -7,7 +7,7 @@ Four panels:
   3. Open tasks   — open work nobody's holding (excludes role:cto + status meta).
   4. Recently closed — last 5 closures across all teams.
 
-Refreshes ~1s. Quit with `q`, `Q`, `Esc`, or Ctrl-C. Read-only.
+Quit with q, Q, Esc, or Ctrl-C. Read-only.
 
 Known limitation: `bd list --status closed --json` doesn't include the
 `assignee` or `started_at` fields, so:
@@ -22,39 +22,32 @@ import datetime as dt
 import json
 import os
 import re
-import select
 import subprocess
 import sys
-import termios
 import time
-import tty
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from pathlib import Path
 import concurrent.futures
+import threading
 
-from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
+from textual.widgets import Static
+
 ROOT = Path(__file__).resolve().parent.parent
 TEAMS_DIR = ROOT / "teams"
-KEY_POLL_S = 0.25  # how often we wake to check stdin for q
+KEY_POLL_S = 0.25  # how often the gather worker is re-triggered
 RECENT_CLOSED_LIMIT = 10
 RECENT_CLOSED_SCAN_PER_TEAM = 0  # 0 = unlimited; bd ordering is not chronological, so we fetch all and sort in Python
 # Module-level executor reused across refreshes — bd subprocesses are
 # expensive (each invocation cold-starts dolt), so we run the per-team
 # queries in parallel.
 _POOL = ThreadPoolExecutor(max_workers=12)
-
-_MIN_PANEL_H = 8
-_MAX_TOP_ROWS = 6
-
-_layout_heights: dict[str, int] = {}
-_prev_console_size: tuple[int, int] = (0, 0)
 
 _prev_data: dict[str, tuple] = {}
 
@@ -538,144 +531,124 @@ def _closed_panel(closed: list[dict]) -> Panel:
     )
 
 
-# ---- render ---------------------------------------------------------------
+# ---- textual app ----------------------------------------------------------
 
 
-def _compute_layout_heights(term_h: int) -> dict[str, int]:
-    """Compute stable panel-height budget from terminal height."""
-    usable = max(term_h - 1, 3 * _MIN_PANEL_H)
-    top_h = max(_MIN_PANEL_H, usable * 4 // 10)
-    remaining = usable - top_h
-    open_h = max(_MIN_PANEL_H, remaining // 2)
-    closed_h = max(_MIN_PANEL_H, remaining - open_h)
-    return {"top": top_h, "open": open_h, "closed": closed_h, "footer": 1}
+class TopApp(App):
+    """Textual TUI for the CTO top dashboard."""
 
-
-def _panel_height(row_count: int) -> int:
-    """Minimum rows to display a table with N data rows without clipping.
-
-    Panel top border (1) + table top border (1) + header (1) + separator (1) +
-    N rows + table bottom border (1) + panel bottom border (1) = N + 6.
+    CSS = """
+    #top { height: 2fr; }
+    #agents { width: 60%; height: 100%; }
+    #inbox { width: 40%; height: 100%; }
+    #open { height: 1fr; }
+    #closed { height: 1fr; }
+    #footer { height: 1; }
     """
-    return max(4, row_count + 6)
 
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("Q", "quit", "Quit"),
+        ("escape", "quit", "Quit"),
+    ]
 
-def render(
-    agents: list[dict],
-    inbox: list[dict],
-    open_tasks: list[dict],
-    closed: list[dict],
-    running: list[str],
-    gather_ms: int = 0,
-    console: Console | None = None,
-) -> Layout:
-    global _prev_console_size, _layout_heights
+    snapshot = reactive(None)
+    gather_ms = reactive(0)
+    data_ts = reactive(0.0)
 
-    now = dt.datetime.now(dt.timezone.utc)
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="top"):
+            yield Static("", id="agents")
+            yield Static("", id="inbox")
+        yield Static("", id="open")
+        yield Static("", id="closed")
+        yield Static("", id="footer")
 
-    agent_panel = _agent_panel(agents, running, now)
-    inbox_panel = _inbox_panel(inbox)
-    open_panel = _open_panel(open_tasks, now)
-    closed_panel = _closed_panel(closed)
+    def on_mount(self) -> None:
+        self._gather_lock = threading.Lock()
+        self.poll_data()
+        self.set_interval(KEY_POLL_S, self.poll_data)
+        self.set_interval(KEY_POLL_S, self._tick_footer)
 
-    ts = dt.datetime.now().strftime("%H:%M:%S")
-    teams_summary = ", ".join(running) if running else "—"
-    footer = Text(
-        f"q quit · gather {gather_ms}ms · teams: {teams_summary} · {ts}",
-        style="dim",
-        justify="center",
-    )
+    def poll_data(self) -> None:
+        if self._gather_lock.acquire(blocking=False):
+            self.run_worker(self._poll_worker, thread=True)
 
-    # Only recompute the height budget when the terminal is resized; this
-    # prevents row-jump flicker caused by per-cycle panel height fluctuations.
-    if console is None:
-        console = Console()
-    cur_size = (console.size.width, console.size.height)
-    if cur_size != _prev_console_size or not _layout_heights:
-        _layout_heights = _compute_layout_heights(console.height)
-        _prev_console_size = cur_size
+    def _poll_worker(self) -> None:
+        try:
+            t0 = time.monotonic()
+            agents, inbox, open_tasks, closed, running = gather()
+            gather_ms = int((time.monotonic() - t0) * 1000)
+            self.call_from_thread(
+                self._apply_data,
+                agents,
+                inbox,
+                open_tasks,
+                closed,
+                running,
+                gather_ms,
+                time.monotonic(),
+            )
+        finally:
+            self._gather_lock.release()
 
-    top_h = _layout_heights["top"]
-    open_h = _layout_heights["open"]
-    closed_h = _layout_heights["closed"]
-    footer_h = _layout_heights["footer"]
+    def _apply_data(
+        self,
+        agents: list[dict],
+        inbox: list[dict],
+        open_tasks: list[dict],
+        closed: list[dict],
+        running: list[str],
+        gather_ms: int,
+        data_ts: float,
+    ) -> None:
+        self.gather_ms = gather_ms
+        self.data_ts = data_ts
+        self.snapshot = (agents, inbox, open_tasks, closed, running, gather_ms, data_ts)
 
-    layout = Layout()
-    layout.split_column(
-        Layout(name="top", size=top_h),
-        Layout(name="open", size=open_h),
-        Layout(name="closed", size=closed_h),
-        Layout(footer, name="footer", size=footer_h),
-    )
-    layout["top"].split_row(
-        Layout(agent_panel, name="agents", ratio=3),
-        Layout(inbox_panel, name="inbox", ratio=2),
-    )
-    layout["open"].update(open_panel)
-    layout["closed"].update(closed_panel)
-    return layout
+    def watch_snapshot(self, snapshot) -> None:
+        if snapshot is None:
+            return
+        agents, inbox, open_tasks, closed, running, _gather_ms, _data_ts = snapshot
+        now = dt.datetime.now(dt.timezone.utc)
 
+        prev = getattr(self, "_prev_snapshot", None)
+        if prev is None or prev[0] != agents or prev[4] != running:
+            self.query_one("#agents", Static).update(_agent_panel(agents, running, now))
+        if prev is None or prev[1] != inbox:
+            self.query_one("#inbox", Static).update(_inbox_panel(inbox))
+        if prev is None or prev[2] != open_tasks:
+            self.query_one("#open", Static).update(_open_panel(open_tasks, now))
+        if prev is None or prev[3] != closed:
+            self.query_one("#closed", Static).update(_closed_panel(closed))
 
-# ---- input loop -----------------------------------------------------------
+        self._prev_snapshot = snapshot
 
-
-@contextmanager
-def cbreak_stdin():
-    """Put stdin into cbreak mode so we can poll for keypresses without Enter."""
-    if not sys.stdin.isatty():
-        yield
-        return
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        yield
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def stdin_quit_pressed(timeout: float) -> bool:
-    """Block up to `timeout` seconds; return True if the user pressed q/Q/Esc."""
-    if not sys.stdin.isatty():
-        time.sleep(timeout)
-        return False
-    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-    if not rlist:
-        return False
-    try:
-        ch = os.read(sys.stdin.fileno(), 1)
-    except OSError:
-        return False
-    return ch in (b"q", b"Q", b"\x1b")  # q, Q, Esc
+    def _tick_footer(self) -> None:
+        data_age_ms = (
+            int((time.monotonic() - self.data_ts) * 1000)
+            if self.data_ts
+            else 999999
+        )
+        fresh = data_age_ms < 2000
+        indicator = "● live" if fresh else "○ stale"
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        teams_summary = ", ".join(self.snapshot[4] if self.snapshot else [])
+        if not teams_summary:
+            teams_summary = "—"
+        text = Text(
+            f"q quit · {indicator} · gather {self.gather_ms}ms · teams: {teams_summary} · {ts}",
+            style="dim",
+            justify="center",
+        )
+        self.query_one("#footer", Static).update(text)
 
 
 # ---- main -----------------------------------------------------------------
 
 
 def main() -> int:
-    with cbreak_stdin():
-        with Live(screen=False, auto_refresh=False, transient=True, vertical_overflow="crop") as live:
-            try:
-                while True:
-                    t0 = time.monotonic()
-                    agents, inbox, open_tasks, closed, running = gather()
-                    gather_ms = int((time.monotonic() - t0) * 1000)
-                    live.update(
-                        render(
-                            agents,
-                            inbox,
-                            open_tasks,
-                            closed,
-                            running,
-                            gather_ms=gather_ms,
-                            console=live.console,
-                        ),
-                        refresh=True,
-                    )
-                    if stdin_quit_pressed(KEY_POLL_S):
-                        break
-            except KeyboardInterrupt:
-                pass
+    TopApp().run()
     return 0
 
 
