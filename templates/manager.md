@@ -102,21 +102,15 @@ For each ready `merge` issue:
    ```
 6. Close the merge issue: `bd close <merge-id> -r "merged into epic/<epic-id>"`.
 
-### 4. After a breakdown merge: plan + review:plan — AUTOMATED
+### 4. Workflow transitions — AUTOMATED by reconciler
 
-**The supervisor hook handles this automatically.** After a `kind:merge target:breakdown` closes, the supervisor scans for it and files `kind:plan` + `kind:review target:plan` for the epic. Do **not** do this manually.
+A typed reconciler at `.cto/reconciler.py` runs after every manager iteration and owns **every** workflow transition: filing the plan + review-plan after a breakdown merge, filing dev + review-code pairs (one per `## Dev <Letter>` chunk in the merged plan) after a plan merge, tagging upstream issues with `needs-re-review` when a review closes `changes-requested`, filing the next round of review when a dev with `needs-re-review` closes again, and filing the CTO-bound `kind:merge target:epic` once an epic is genuinely ready to ship.
 
-*(If you see an epic stuck without a plan after a breakdown merge, the hook may have failed — check the supervisor logs in the manager tmux pane.)*
-
-### 5. After a plan merge: dev + review:code pairs — AUTOMATED
-
-**The supervisor hook handles this automatically.** After a `kind:merge target:plan` closes, the supervisor reads the merged plan, parses `## Dev Chunks` for chunk boundaries, and files one `kind:dev` + `kind:review target:code` pair per chunk. If no chunks are found, it files a single dev + review for the full plan. Do **not** do this manually.
-
-*(If you see an epic stuck without dev tasks after a plan merge, the hook may have failed — check the supervisor logs.)*
+Do **not** do any of this manually. If something looks stuck, check the supervisor logs in the manager tmux pane — lines prefixed `reconciler:` show what it emitted (or `Noop`'d). The reconciler is idempotent: re-running it never duplicates filings.
 
 You do **not** file `kind:approval,target:plan` — that is the reviewer's job after their own approval. Do not pre-emptively merge. Wait for explicit `merge` issues.
 
-### 6. Status digest
+### 5. Status digest
 
 Maintain exactly one open `kind:status-digest` issue per epic (or a single team-wide one — pick one and stick with it). On each loop iteration where state has changed (a merge happened, an approval landed, a dev claimed an issue), update the digest's description with:
 
@@ -132,19 +126,11 @@ EOF
 )"
 ```
 
-### 7. Ship epics (CTO-only merge to main) — AUTOMATED
+### 6. Ship epics — AUTOMATED by reconciler
 
-**The supervisor hook handles this automatically, running LAST after all other hooks have filed new work.** The gate is:
+The reconciler files the CTO-bound `kind:merge target:epic` exactly when the epic is in `phase:ready-to-ship` (breakdown merged, plan merged, every dev/review/sub-merge closed, no `needs-re-review` outstanding, no `changes-requested` review, and no existing epic-merge). The CTO ships via `cto merge-epic {{TEAM}} <epic-id>` or `cto approve {{TEAM}} <merge-id>`. Do **not** file the epic merge yourself, do **not** close the epic, do **not** merge into `main`, and do **not** prune the epic worktree.
 
-1. All linked children of the epic are closed (`bd dep list <epic> --direction=up` shows no `open`).
-2. **AND** there are no open `kind:dev` or `kind:review` issues whose description references this epic (`bd list --status open -l kind:dev,kind:review --json` filtered by `epic: <epic-id>`).
-3. **AND** no epic-merge issue is already open for this epic.
-
-Only if all three conditions pass does the supervisor file `kind:merge target:epic` for the CTO inbox. Do **not** do this manually.
-
-The CTO ships the epic via `cto merge-epic {{TEAM}} <epic-id>` or `cto approve {{TEAM}} <merge-id>`. Do **not** close the epic itself, do **not** merge into `main`, and do **not** prune the epic worktree.
-
-### 8. Exit
+### 7. Exit
 
 After completing your one pass, exit cleanly. The supervisor will run you again. Do **not** try to claim other agents' work, do **not** edit code outside `breakdowns/`, and do **not** loop or sleep yourself.
 

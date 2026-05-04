@@ -225,6 +225,62 @@ EOF
 tmux_session() { printf 'cto-%s' "$1"; }
 tmux_alive()   { tmux has-session -t "$(tmux_session "$1")" 2>/dev/null; }
 
+# Compute SHA-256 of a file (BSD-or-GNU portable). Empty string if missing.
+_file_sha() {
+  local f="$1"
+  [[ -f "$f" ]] || { printf ''; return; }
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
+# reconciler_sync <team> <team-dir> [--force]
+# Copies templates/reconciler.py into <team>/.cto/reconciler.py if absent
+# or matching. If the team's copy has been hand-edited (hash mismatch),
+# refuse to proceed unless --force is passed. Returns 0 on success.
+reconciler_sync() {
+  local name="$1" tdir="$2" force="${3:-}"
+  local src="$TEMPLATES_DIR/reconciler.py"
+  local dst="$tdir/.cto/reconciler.py"
+  [[ -f "$src" ]] || die "missing template: $src"
+  mkdir -p "$tdir/.cto"
+  if [[ -f "$dst" && "$force" != "--force" ]]; then
+    local sa sb
+    sa="$(_file_sha "$src")"
+    sb="$(_file_sha "$dst")"
+    if [[ -n "$sa" && -n "$sb" && "$sa" != "$sb" ]]; then
+      printf 'cto: reconciler drift in %s\n' "$dst" >&2
+      printf '  template sha: %s\n  team sha:     %s\n' "$sa" "$sb" >&2
+      printf '  diff:\n' >&2
+      diff -u "$dst" "$src" | sed 's/^/    /' >&2 || true
+      return 1
+    fi
+  fi
+  cp "$src" "$dst"
+  chmod +x "$dst"
+  return 0
+}
+
+cmd_reconciler_sync() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "usage: cto reconciler-sync <team> [--force]"
+  local force=""
+  for arg in "$@"; do
+    [[ "$arg" == "--force" ]] && force="--force"
+  done
+  local tdir; tdir="$(team_dir "$name")"
+  [[ -d "$tdir" ]] || die "no such team: $name"
+  if reconciler_sync "$name" "$tdir" "$force"; then
+    info "reconciler synced: $tdir/.cto/reconciler.py"
+  else
+    exit 1
+  fi
+}
+
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -252,6 +308,7 @@ Usage:
 
   cto status [<team>]
   cto update <team> [--fresh]
+  cto reconciler-sync <team> [--force]
   cto top                                   # live top-style dashboard
 
   cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into main
@@ -1011,6 +1068,12 @@ cmd_start() {
   # Claude: --append-system-prompt with the .md file
   # Kimi: --agent-file with a .yaml spec that points to the .md file
 
+  # Sync the reconciler into the team. The supervisor invokes it after
+  # every manager iteration to perform all workflow transitions. Refuse to
+  # start if the team's existing copy diverges from the template — a stale
+  # reconciler is the kind of thing that has burned us before.
+  reconciler_sync "$name" "$tdir" || die "reconciler drift detected; run: cto reconciler-sync $name --force"
+
   # Generate a supervisor script. Each tmux window runs this; the bash
   # loop is what's eternal — the agent CLI is one-shot per iteration.
   # On non-zero exit, the supervisor releases any bd claim it took and,
@@ -1205,155 +1268,16 @@ while :; do
     fi
     log "iteration ok (task=${task_id:-none})"
 
-    # === WORKFLOW HOOKS ===
-    # These run after every successful iteration to file transitions
-    # that agents would otherwise forget.
-
-    # Hook 1: reviewer tags upstream with needs-re-review on changes-requested
-    if [[ "$ROLE" == "reviewer" && -n "$task_id" ]]; then
-      close_reason=$(bd show "$task_id" --json 2>/dev/null \
-                     | jq -r '.[0].close_reason // ""' 2>/dev/null || true)
-      if [[ "$close_reason" == *"changes-requested"* ]]; then
-        upstream=$(bd dep list "$task_id" --json 2>/dev/null \
-                   | jq -r '.dependencies[]? | select(.type=="blocks" or .type=="parent" or .type=="depends_on") | .target_id' \
-                   | head -1 || true)
-        if [[ -n "$upstream" && "$upstream" != "null" ]]; then
-          bd label add "$upstream" "needs-re-review" >/dev/null 2>&1 || true
-          log "tagged upstream $upstream with needs-re-review (review $task_id closed changes-requested)"
-        fi
-      fi
-    fi
-
-    # Hook 2: developer files re-review when closing a task tagged needs-re-review
-    if [[ "$ROLE" == "developer" && -n "$task_id" ]]; then
-      task_info=$(bd show "$task_id" --json 2>/dev/null || true)
-      st=$(echo "$task_info" | jq -r '.[0].status // ""' 2>/dev/null || true)
-      labels=$(echo "$task_info" | jq -r '.[0].labels // [] | join(",")' 2>/dev/null || true)
-      if [[ "$st" == "closed" && "$labels" == *"needs-re-review"* ]]; then
-        target="code"
-        [[ "$labels" == *"kind:plan"* ]] && target="plan"
-        epic=$(echo "$task_info" | jq -r '.[0].description // ""' 2>/dev/null \
-               | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
-        if [[ -n "$epic" ]]; then
-          new_review=$(bd create -t task -l "role:reviewer,kind:review,target:$target" -p 2 \
-                       -d "target: $target
-upstream: $task_id
-epic: $epic" \
-                       "Re-review $target for $task_id" 2>/dev/null \
-                       | head -1 || true)
-          if [[ -n "$new_review" ]]; then
-            bd dep "$new_review" --blocks "$task_id" >/dev/null 2>&1 || true
-            bd label remove "$task_id" "needs-re-review" >/dev/null 2>&1 || true
-            log "filed re-review $new_review for $task_id (target=$target, epic=$epic)"
-          fi
-        fi
-      fi
-    fi
-
-    # Hook 4: after breakdown merge, file plan + review:plan
-    if [[ "$ROLE" == "manager" ]]; then
-      for merge in $(bd list --status closed -l kind:merge,target:breakdown --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
-        epic=$(bd show "$merge" --json 2>/dev/null | jq -r '.[0].description // ""' 2>/dev/null | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
-        if [[ -n "$epic" ]]; then
-          has_plan=$(bd list -l kind:plan --json 2>/dev/null | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
-          if [[ "$has_plan" == "0" ]]; then
-            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
-            plan_id=$(bd create -t task -l "role:developer,kind:plan" -p 2 \
-                      -d "epic: $epic
-Produce plans/$epic.md per breakdowns/$epic.md. Base your worktree on epic/$epic." \
-                      "Plan: $epic_title" 2>/dev/null | head -1 || true)
-            if [[ -n "$plan_id" ]]; then
-              review_id=$(bd create -t task -l "role:reviewer,kind:review,target:plan" -p 2 \
-                          -d "epic: $epic
-Read plans/$epic.md on branch task/$plan_id." \
-                          "Review plan: $epic_title" 2>/dev/null | head -1 || true)
-              if [[ -n "$review_id" ]]; then
-                bd dep "$plan_id" --blocks "$review_id" >/dev/null 2>&1 || true
-                log "filed plan $plan_id + review:plan $review_id for epic $epic"
-              fi
-            fi
-          fi
-        fi
-      done
-    fi
-
-    # Hook 5: after plan merge, file dev + review:code pairs
-    if [[ "$ROLE" == "manager" ]]; then
-      for merge in $(bd list --status closed -l kind:merge,target:plan --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
-        epic=$(bd show "$merge" --json 2>/dev/null | jq -r '.[0].description // ""' 2>/dev/null | grep -oE 'epic:[^ ]+' | head -1 | cut -d: -f2 | tr -d ' ' || true)
-        if [[ -n "$epic" ]]; then
-          has_dev=$(bd list -l kind:dev --json 2>/dev/null | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
-          if [[ "$has_dev" == "0" ]]; then
-            epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
-            plan_file=""
-            for pf in .cto/worktrees/"$epic"/plans/"$epic"*.md; do
-              [[ -f "$pf" ]] && { plan_file="$pf"; break; }
-            done
-            chunks=""
-            if [[ -n "$plan_file" && -f "$plan_file" ]]; then
-              chunks=$(grep -E '^### Dev [A-Z].*—' "$plan_file" 2>/dev/null | sed 's/^### Dev \([A-Z]\)[^—]*—[[:space:]]*\(.*\)$/\1|\2/' || true)
-            fi
-            if [[ -n "$chunks" ]]; then
-              while IFS='|' read -r dev_letter chunk_desc; do
-                dev_id=$(bd create -t task -l "role:developer,kind:dev" -p 2 \
-                         -d "epic: $epic
-Per plans/$(basename "$plan_file") §$dev_letter — $chunk_desc. Worktree: .cto/worktrees/<dev-id> off epic/$epic." \
-                         "$chunk_desc" 2>/dev/null | head -1 || true)
-                if [[ -n "$dev_id" ]]; then
-                  rev_id=$(bd create -t task -l "role:reviewer,kind:review,target:code" -p 2 \
-                           -d "epic: $epic
-Review diff on branch task/$dev_id against epic/$epic." \
-                           "Review: $chunk_desc" 2>/dev/null | head -1 || true)
-                  if [[ -n "$rev_id" ]]; then
-                    bd dep "$dev_id" --blocks "$rev_id" >/dev/null 2>&1 || true
-                    log "filed dev $dev_id + review:code $rev_id for epic $epic (chunk $dev_letter)"
-                  fi
-                fi
-              done <<< "$chunks"
-            else
-              dev_id=$(bd create -t task -l "role:developer,kind:dev" -p 2 \
-                       -d "epic: $epic
-Implement all deliverables from the merged plan for epic $epic. Read the plan document(s) in .cto/worktrees/$epic/plans/ for details. Worktree: .cto/worktrees/<dev-id> off epic/$epic." \
-                       "Implement $epic_title" 2>/dev/null | head -1 || true)
-              if [[ -n "$dev_id" ]]; then
-                rev_id=$(bd create -t task -l "role:reviewer,kind:review,target:code" -p 2 \
-                         -d "epic: $epic
-Review diff on branch task/$dev_id against epic/$epic." \
-                         "Review: $epic_title" 2>/dev/null | head -1 || true)
-                if [[ -n "$rev_id" ]]; then
-                  bd dep "$dev_id" --blocks "$rev_id" >/dev/null 2>&1 || true
-                  log "filed dev $dev_id + review:code $rev_id for epic $epic (full plan)"
-                fi
-              fi
-            fi
-          fi
-        fi
-      done
-    fi
-
-    # Hook 3: manager files epic merge when all children are closed
-    # This runs LAST so that Hooks 4 and 5 have a chance to file new
-    # children before we evaluate the "all done" condition.
-    if [[ "$ROLE" == "manager" ]]; then
-      for epic in $(bd list --status open -l kind:epic --json 2>/dev/null | jq -r '.[].id' 2>/dev/null || true); do
-        open_children=$(bd dep list "$epic" --direction=up 2>/dev/null | grep -c "open" || true)
-        if [[ "$open_children" == "0" ]]; then
-          # Gate: also check for any open dev/review issues referencing this epic
-          open_work=$(bd list --status open -l kind:dev,kind:review --json 2>/dev/null \
-                      | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
-          if [[ "$open_work" == "0" ]]; then
-            existing=$(bd list --status open -l kind:merge,target:epic --json 2>/dev/null \
-                       | jq -r --arg e "$epic" '[.[] | select(.description | contains($e))] | length' 2>/dev/null || true)
-            if [[ "$existing" == "0" ]]; then
-              epic_title=$(bd show "$epic" --json 2>/dev/null | jq -r '.[0].title // "epic"' 2>/dev/null || true)
-              bd create -t task -l "role:cto,kind:merge,target:epic" -p 1 \
-                -d "epic: $epic
-epic-branch: epic/$epic" \
-                "Merge epic: $epic_title" >/dev/null 2>&1 || true
-              log "filed epic merge for $epic"
-            fi
-          fi
-        fi
+    # === WORKFLOW RECONCILER ===
+    # All workflow transitions (Hooks 1-5 + epic-ship gate of the previous
+    # design) are now owned by a single typed reconciler at .cto/reconciler.py.
+    # It is a pure function over bd state; idempotency keys embedded in issue
+    # descriptions prevent duplicate filings if a tick is replayed. Only the
+    # manager invokes it — running it from every role would just emit identical
+    # actions concurrently. See templates/reconciler.py.
+    if [[ "$ROLE" == "manager" && -x "$TEAM_DIR/.cto/reconciler.py" ]]; then
+      python3 "$TEAM_DIR/.cto/reconciler.py" --role manager 2>&1 | while IFS= read -r rline; do
+        log "reconciler: $rline"
       done
     fi
 
@@ -1606,6 +1530,7 @@ main() {
     update)    cmd_update    "$@" ;;
     top)       cmd_top       "$@" ;;
     worktrees) cmd_worktrees "$@" ;;
+    reconciler-sync) cmd_reconciler_sync "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
   esac

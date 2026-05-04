@@ -107,15 +107,13 @@ bd dep <review-id> --blocks <MERGE_ID>
 
 #### C. Changes requested (either type)
 
-Reopen the upstream issue with a 3-line gist pointing at your review notes:
+Reopen the upstream and close your review with a `changes-requested` reason. The reconciler will tag the upstream `needs-re-review` and file the next-round review automatically once the developer/planner re-closes the upstream — you do not need to file the follow-up review yourself.
 
 ```
 bd reopen <upstream-id>
 bd comment <upstream-id> "Changes requested. See docs/reviews/<review-id>.md (N blockers, M suggestions)."
 bd close <review-id> -r "changes-requested; see docs/reviews/<review-id>.md"
 ```
-
-The developer / planner will pick the upstream up again, address the asks, and re-close. A new `kind:review` for the same target may need to be filed by the manager (or you can file it yourself with `role:reviewer` blocked by the upstream).
 
 ### 6. Exit
 
