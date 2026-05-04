@@ -354,6 +354,13 @@ def reconcile_epic(
         actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
 
     # ---- Phase 6: ship gate (was supervisor Hook 3, with all guards).
+    # We don't gate on "no review ever closed changes-requested" — that's
+    # historical state and can be cleared by an approved round-2. The
+    # active gate is: every dev closed, no dev still carries
+    # `needs-re-review`, no review or code-merge open, AND there are at
+    # least as many code-merges as devs (so every dev's branch was merged
+    # — without this, an epic with a changes-requested review and no
+    # follow-up merge ships prematurely).
     ship_ready = (
         bool(breakdowns)
         and bool(breakdown_merges_closed)
@@ -363,8 +370,8 @@ def reconcile_epic(
         and all(not d.is_open for d in devs)
         and not any(d.has_label("needs-re-review") for d in devs)
         and all(not r.is_open for r in code_reviews)
-        and not any(r.changes_requested() for r in code_reviews)
         and all(not m.is_open for m in code_merges)
+        and len(code_merges) >= len(devs)
         and not any(em.is_open for em in epic_merges)
     )
     if ship_ready:
@@ -404,6 +411,17 @@ def _upstream_of_review(review: Issue, state: State) -> Optional[str]:
         cand = m.group(1)
         if state.by_id(cand):
             return cand
+    # Fallback: derive upstream via idem-key shape. Reviews filed by the
+    # reconciler carry idem `file-review-code:<epic>:<slot>:round-N`; their
+    # paired dev carries `file-dev:<epic>:<slot>`. Used for code reviews
+    # that predate FilePair (no description-level link to the dev).
+    m = re.search(r"^idem:\s*file-review-code:([^:]+):([^:]+):", review.description, re.MULTILINE)
+    if m:
+        epic_id, slot = m.group(1), m.group(2)
+        dev_idem = f"idem: file-dev:{epic_id}:{slot}"
+        for i in state.issues:
+            if i.kind == "dev" and dev_idem in i.description:
+                return i.id
     return None
 
 

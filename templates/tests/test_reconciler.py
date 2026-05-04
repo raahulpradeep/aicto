@@ -225,6 +225,33 @@ def test_epic_merge_idempotent():
 
 # ---------- Tests: dev sub-FSM (changes-requested / re-review) ----------
 
+def test_changes_requested_finds_upstream_via_idem_fallback():
+    """Review with no `upstream:` line, no `task/<id>` reference — only its
+    idem key — must still resolve to the matching dev. (Today's stuck-epic
+    case: aicto-6ud's review predated FilePair.)"""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               status="closed", close_reason="changes-requested"),
+    )
+    actions = reconcile(s)
+    labels = [
+        a for a in actions
+        if isinstance(a, AddLabel) and a.label == "needs-re-review" and a.issue_id == "d1"
+    ]
+    assert len(labels) == 1
+
+
 def test_changes_requested_adds_needs_re_review_label():
     rev = _issue(
         "rc1", "review", role="reviewer", target="code",
@@ -316,6 +343,30 @@ def test_epic_blocked_by_pending_re_review():
                description="epic: e1\nupstream: d2", status="closed",
                close_reason="changes-requested"),
     ))
+    actions = reconcile(s)
+    assert _file_issues(actions, kind="merge", target="epic") == []
+
+
+def test_epic_with_historical_changes_requested_but_no_merge_does_not_ship():
+    """Round-1 review closed changes-requested, dev closed, but no code
+    merge ever happened. Without the merge-count guard the ship gate would
+    fire (this is the aicto-6ud stuck case)."""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               status="closed", close_reason="changes-requested"),
+        # No kind:merge,target:code exists.
+    )
     actions = reconcile(s)
     assert _file_issues(actions, kind="merge", target="epic") == []
 
