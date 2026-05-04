@@ -348,8 +348,8 @@ _team_scaffold() {
     default_model="kimi-code/kimi-for-coding"
     default_manager_model="kimi-code/kimi-for-coding"
   elif [[ "$provider" == "codex" ]]; then
-    default_model="codex-1"
-    default_manager_model="codex-1"
+    default_model="gpt-5.4"
+    default_manager_model="gpt-5.4"
   else
     default_model="sonnet"
     default_manager_model="claude-opus-4-6"
