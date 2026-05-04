@@ -705,6 +705,23 @@ cmd_task() {
         -d "${desc:-(no description)}" \
         --silent \
         "$title")
+
+  # Self-heal: verify labels were persisted (bd occasionally drops them)
+  local actual_labels
+  actual_labels=$(cd "$(team_dir "$name")" && bd show "$id" --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    labels = data[0].get('labels', []) if data else []
+    print(','.join(labels))
+except Exception:
+    print('')
+")
+  if [[ "$actual_labels" != *"kind:$kind"* ]]; then
+    (cd "$(team_dir "$name")" && bd update "$id" --add-label "$labels" >/dev/null)
+    info "label self-heal applied to $id"
+  fi
+
   if (( ops )); then
     info "filed $id (ops epic, role:manager) in team $name — reconciler will file a single dev, no breakdown/plan/review"
   else

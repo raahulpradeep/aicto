@@ -14,6 +14,7 @@ thing in the system that may file or relabel workflow-control issues
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
@@ -33,6 +34,8 @@ class Issue:
     status: str  # "open" | "in_progress" | "closed"
     labels: tuple[str, ...]
     close_reason: str = ""
+    issue_type: str = ""
+    created_at: str = ""
 
     @property
     def kind(self) -> Optional[str]:
@@ -94,7 +97,10 @@ class State:
         return None
 
     def epics(self) -> list[Issue]:
-        return [i for i in self.issues if i.kind == "epic"]
+        return [
+            i for i in self.issues
+            if i.kind == "epic" or i.issue_type == "epic"
+        ]
 
     def children_of(self, epic_id: str) -> list[Issue]:
         return [
@@ -104,6 +110,29 @@ class State:
 
     def has_idem(self, key: str) -> bool:
         return any(i.has_idem(key) for i in self.issues)
+
+
+# ---------- Ops heuristics ----------
+
+_OPS_RE = re.compile(
+    r"\b(sync|pull|fetch|merge\s+(origin|remote))\b.*\b(main|origin|remote)\b|"
+    r"\b(restart|cleanup|refresh)\b.*\b(service|env|cache|remote|main)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_ops(epic: Issue, state: State) -> bool:
+    """Detect regular epics that are actually ops tasks (git sync, restart,
+    cleanup) filed without --ops. Only converts if the epic hasn't progressed
+    to dev yet, to avoid misfiring on legitimate feature work."""
+    if epic.is_ops:
+        return False
+    text = f"{epic.title} {epic.description}"
+    if not _OPS_RE.search(text):
+        return False
+    children = state.children_of(epic.id)
+    devs = [c for c in children if c.kind == "dev"]
+    return not devs
 
 
 # ---------- Action types ----------
@@ -210,6 +239,10 @@ def reconcile_epic(
     `plan_chunks_for(epic_id) -> list[(letter, desc)]` reads the merged plan
     from disk to determine dev-task chunks. Tests inject a stub.
     """
+    # ---- Auto-detect ops-shaped regular epics ----
+    if not epic.is_ops and _looks_like_ops(epic, state):
+        return [AddLabel(epic.id, "class:ops")]
+
     if epic.is_ops:
         return _reconcile_ops_epic(epic, state)
 
@@ -414,12 +447,65 @@ def reconcile_epic(
     return actions
 
 
+def _reconcile_leaks(state: State) -> list[Action]:
+    """Detect open epics that have been orphaned (no children) for too long,
+    and auto-heal epics created without workflow labels."""
+    actions: list[Action] = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for epic in state.epics():
+        if not epic.is_open:
+            continue
+
+        # Auto-heal missing labels so the epic becomes visible to the
+        # normal workflow engine on the next tick.
+        if epic.issue_type == "epic" and epic.kind != "epic":
+            actions.append(AddLabel(epic.id, "kind:epic"))
+            if epic.role != "manager":
+                actions.append(AddLabel(epic.id, "role:manager"))
+
+        children = state.children_of(epic.id)
+        if children:
+            continue
+
+        # Only alert after a 15-minute grace period for new epics.
+        try:
+            created = datetime.datetime.fromisoformat(
+                epic.created_at.replace("Z", "+00:00")
+            )
+            age_seconds = (now - created).total_seconds()
+        except Exception:
+            age_seconds = 0
+
+        if age_seconds < 900:
+            continue
+
+        idem_key = idem("leak-detect", epic.id)
+        if state.has_idem(idem_key):
+            continue
+
+        actions.append(FileIssue(
+            title=f"Leak: epic {epic.id} has no sub-tasks after {int(age_seconds/60)}m",
+            description=(
+                f"epic: {epic.id}\n"
+                f"idem: {idem_key}\n"
+                f"Epic '{epic.title}' has been open for {int(age_seconds/60)} minutes "
+                f"with no breakdown, plan, or dev tasks filed. "
+                f"It may have been orphaned due to missing labels or was filed "
+                f"as a regular epic when it should have been ops."
+            ),
+            labels=("role:cto", "kind:leak-detect"),
+            priority=1,
+        ))
+    return actions
+
+
 def reconcile(state: State, plan_chunks_for=None) -> list[Action]:
     out: list[Action] = []
     for epic in state.epics():
         if not epic.is_open:
             continue
         out.extend(reconcile_epic(epic, state, plan_chunks_for=plan_chunks_for))
+    out.extend(_reconcile_leaks(state))
     return out
 
 
@@ -606,6 +692,10 @@ def load_state() -> State:
                 labels=tuple(raw.get("labels", [])),
                 close_reason=raw.get("close_reason", "")
                               or raw.get("closeReason", ""),
+                issue_type=raw.get("issue_type", "")
+                           or raw.get("issueType", ""),
+                created_at=raw.get("created_at", "")
+                           or raw.get("createdAt", ""),
             )
     return State(issues=tuple(seen.values()))
 
