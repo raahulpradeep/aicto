@@ -312,11 +312,22 @@ def reconcile_epic(
             ))
 
     # ---- Phase 4: changes-requested handling (was supervisor Hook 1).
+    # Only react to the LATEST closed review per upstream. A round-1 that
+    # closed changes-requested is historical once round-2+ exists — we'd
+    # otherwise infinitely re-tag the dev with needs-re-review on every
+    # tick, even after the approved round and the code-merge landed.
+    by_upstream: dict[str, list[Issue]] = {}
     for rev in code_reviews:
-        if rev.is_open or not rev.changes_requested():
+        if rev.is_open:
             continue
-        upstream_id = _upstream_of_review(rev, state)
-        if not upstream_id:
+        u = _upstream_of_review(rev, state)
+        if not u:
+            continue
+        by_upstream.setdefault(u, []).append(rev)
+    for upstream_id, revs in by_upstream.items():
+        revs.sort(key=lambda r: _review_round_number(r))
+        latest = revs[-1]
+        if not latest.changes_requested():
             continue
         upstream = state.by_id(upstream_id)
         if upstream is None or upstream.has_label("needs-re-review"):
@@ -334,6 +345,18 @@ def reconcile_epic(
             for r in code_reviews
         )
         if open_review_covers_dev:
+            actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
+            continue
+        # If the latest closed review for this dev is approved, the
+        # `needs-re-review` label is stale — strip it instead of filing a
+        # new round. This prevents an infinite re-review loop after a
+        # post-approval ghost or a manual label add.
+        d_reviews = sorted(
+            (r for r in code_reviews
+             if not r.is_open and _upstream_of_review(r, state) == d.id),
+            key=_review_round_number,
+        )
+        if d_reviews and not d_reviews[-1].changes_requested():
             actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
             continue
         round_n = _next_review_round(d, state)
@@ -423,6 +446,13 @@ def _upstream_of_review(review: Issue, state: State) -> Optional[str]:
             if i.kind == "dev" and dev_idem in i.description:
                 return i.id
     return None
+
+
+def _review_round_number(review: Issue) -> int:
+    """Extract the round-N number from a review's idem key. Defaults to 1
+    for legacy reviews without a parseable round."""
+    m = re.search(r"round-(\d+)", review.description)
+    return int(m.group(1)) if m else 1
 
 
 def _next_review_round(dev: Issue, state: State) -> int:

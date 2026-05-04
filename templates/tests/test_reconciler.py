@@ -347,6 +347,36 @@ def test_epic_blocked_by_pending_re_review():
     assert _file_issues(actions, kind="merge", target="epic") == []
 
 
+def test_phase4_ignores_historical_changes_requested_when_later_round_approved():
+    """Round-1 changes-requested + round-2 approved + code-merge closed →
+    reconciler must not re-tag the dev with needs-re-review every tick."""
+    s = _state(
+        _epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer", status="closed",
+               description="epic: e1\nidem: file-dev:e1:A"),
+        _issue("rc1", "review", role="reviewer", target="code", status="closed",
+               description="epic: e1\nidem: file-review-code:e1:A:round-1",
+               close_reason="changes-requested"),
+        _issue("rc2", "review", role="reviewer", target="code", status="closed",
+               description="epic: e1\nupstream: d1\nidem: file-review-code:e1:d1:round-2",
+               close_reason="approved"),
+        _issue("cm1", "merge", target="code",
+               description="epic: e1", status="closed"),
+    )
+    actions = reconcile(s)
+    label_actions = [a for a in actions if isinstance(a, AddLabel)]
+    assert label_actions == []
+    # And ship is now allowed.
+    assert len(_file_issues(actions, kind="merge", target="epic")) == 1
+
+
 def test_epic_with_historical_changes_requested_but_no_merge_does_not_ship():
     """Round-1 review closed changes-requested, dev closed, but no code
     merge ever happened. Without the merge-count guard the ship gate would
