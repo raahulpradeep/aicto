@@ -257,6 +257,7 @@ class CommandCenter(App):
     #inbox-pane { width: 40%; height: 1fr; }
     #detail-pane { width: 60%; height: 1fr; }
     #detail-meta { height: auto; max-height: 6; }
+    #action-bar { height: 3; }
     #detail-scroll { height: 1fr; }
     #detail-md { height: auto; }
     DataTable { height: 1fr; }
@@ -284,10 +285,13 @@ class CommandCenter(App):
                 yield DataTable(id="inbox-table")
             with Vertical(id="detail-pane"):
                 yield Static("", id="detail-meta")
+                with Horizontal(id="action-bar"):
+                    yield Button("Approve (a)", variant="success", id="btn-approve")
+                    yield Button("Reject (r)", variant="error", id="btn-reject")
                 with VerticalScroll(id="detail-scroll"):
                     yield Markdown(id="detail-md")
         yield Static(
-            "[a]pprove  [r]eject  [o]pen-in-editor  [R]efresh  [q]uit",
+            "↑/↓ select · a approve · r reject · o open · R refresh · q quit",
             id="footer",
         )
 
@@ -327,6 +331,12 @@ class CommandCenter(App):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self._update_detail()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-approve":
+            self.action_approve()
+        elif event.button.id == "btn-reject":
+            self.action_reject()
 
     # -- detail rendering ---------------------------------------------------
 
