@@ -30,6 +30,12 @@ from typing import Any, Optional, Union
 from event_bus import EventBus
 from state_store import StateStore
 
+# Re-export Phase 3/4 components for callers that import them off `reconciler`.
+# These live in src/ alongside this template; the migration plan has them
+# eventually replacing this file's body.
+from health_auditor import HealthAuditor, HealKind, HealAction  # noqa: F401
+from action_queue import ActionQueue  # noqa: F401
+
 
 # ---------- Domain types ----------
 
@@ -1158,6 +1164,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--role", default="manager",
                    help="Only role=manager performs reconciliation.")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--preview", action="store_true",
+                   help="Shadow mode: run health auditor and print proposed "
+                        "heal actions without executing anything.")
     p.add_argument("--team-dir", type=Path, default=Path("."),
                    help="Path to team directory (for event bus init).")
     args = p.parse_args(argv)
@@ -1166,6 +1175,27 @@ def main(argv: list[str]) -> int:
         return 0
 
     state = load_state()
+
+    if args.preview:
+        from workflow import State as WState, Issue as WIssue
+        wstate = WState(issues=tuple(
+            WIssue(
+                id=i.id, title=i.title, description=i.description,
+                status=i.status, labels=i.labels,
+                close_reason=i.close_reason, issue_type=i.issue_type,
+                created_at=i.created_at, updated_at=i.updated_at,
+                assignee=i.assignee,
+            )
+            for i in state.issues
+        ))
+        auditor = HealthAuditor()
+        for heal in auditor.audit(wstate):
+            tag = "auto" if heal.is_auto_safe else "escalate"
+            print(f"heal[{tag}] {heal.kind.name} "
+                  f"issue={heal.issue_id or heal.target_id} "
+                  f"epic={heal.epic_id} reason={heal.reason!r}")
+        return 0
+
     actions = reconcile(state, plan_chunks_for=parse_plan_chunks)
     for line in execute(actions, dry_run=args.dry_run, team_dir=args.team_dir):
         print(line)
