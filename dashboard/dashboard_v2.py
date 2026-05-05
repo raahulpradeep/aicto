@@ -142,11 +142,76 @@ def _kind(labels: list[str]) -> str:
     return "—"
 
 
+def _agent_status_from_activity(team_name: str, team_dir: Path) -> dict[str, dict]:
+    """Derive per-slot agent status by scanning the tail of activity.jsonl.
+
+    Returns {slot: {"status": str, "last_ts": datetime|None,
+                    "task_id": str|None}}.
+
+    Status values:
+        working      -- iteration_start without a matching iteration_end
+        idle         -- iteration_end is the latest event
+        stuck        -- working for > 15 minutes (likely zombie)
+        unknown      -- no activity events seen
+    """
+    log_path = team_dir / ".cto" / "activity.jsonl"
+    if not log_path.exists():
+        return {}
+
+    # Tail the last ~1MB to keep this cheap; agents emit small lines.
+    try:
+        size = log_path.stat().st_size
+        offset = max(0, size - 1_000_000)
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(offset)
+            if offset:
+                f.readline()  # discard partial first line
+            lines = f.readlines()
+    except OSError:
+        return {}
+
+    latest: dict[str, dict] = {}
+    prefix = f"{team_name}:"
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        evt = ev.get("event") or ev.get("topic") or ""
+        if evt not in ("agent_iteration_start", "agent_iteration_end"):
+            continue
+        agent = ev.get("agent") or ""
+        if not agent.startswith(prefix):
+            continue
+        slot = agent[len(prefix):]
+        latest[slot] = {
+            "event": evt,
+            "ts_str": ev.get("ts") or ev.get("created_at") or "",
+            "task_id": ev.get("task_id") or "",
+        }
+
+    now = dt.datetime.now(dt.timezone.utc)
+    out: dict[str, dict] = {}
+    for slot, info in latest.items():
+        ts = _parse_iso(info["ts_str"])
+        age = (now - ts).total_seconds() if ts else None
+        if info["event"] == "agent_iteration_start":
+            status = "stuck" if age is not None and age > 900 else "working"
+        else:
+            status = "idle"
+        out[slot] = {"status": status, "last_ts": ts, "task_id": info["task_id"]}
+    return out
+
+
 def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict]]:
     # Agents
     agents: list[dict] = []
     sess = f"cto-{team_name}"
     windows = tmux_windows(sess) if tmux_alive(sess) else []
+    activity_status = _agent_status_from_activity(team_name, team_dir)
     proc = _bd_popen(["ready", "--label", f"role:developer", "--json"], team_dir)
     dev_rows = _read_bd_proc(proc)
     dev_map = {r["id"]: r for r in dev_rows}
@@ -165,8 +230,14 @@ def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict]
         parts = w.split(":", 1)
         slot = parts[1] if len(parts) > 1 else w
         issue = role_map.get(slot)
-        agents.append({"agent": f"{team_name}:{slot}", "issue": issue, "team": team_name,
-                       "provider": "claude", "model": "sonnet", "window": slot})
+        act = activity_status.get(slot, {})
+        agents.append({
+            "agent": f"{team_name}:{slot}", "issue": issue, "team": team_name,
+            "provider": "claude", "model": "sonnet", "window": slot,
+            "activity_status": act.get("status"),  # working|idle|stuck|None
+            "activity_last_ts": act.get("last_ts"),
+            "activity_task_id": act.get("task_id"),
+        })
 
     # Inbox (role:cto)
     inbox = _bd_json(["list", "--status", "open", "--label", "role:cto", "--json"], team_dir)
@@ -540,17 +611,36 @@ class DashboardApp(App):
             stale = row.get("stale", False)
             agent = ("~" if stale else "") + row["agent"]
             issue = row.get("issue")
+            act_status = row.get("activity_status")
+            act_ts = row.get("activity_last_ts")
 
             if issue:
                 started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
-                secs = int((now - started).total_seconds()) if started else 0
-                elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
-                title = _truncate(issue.get("title", ""), 40)
-                status = "🟢 working" if not stale else "dim"
-                issue_text = f"{issue['id']}  {title}"
             else:
-                elapsed = "—"
-                status = "⚪ idle" if not stale else "dim"
+                started = act_ts
+            secs = int((now - started).total_seconds()) if started else 0
+            elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
+
+            # Prefer activity-derived status (real signal); fall back to bd lookup.
+            if act_status == "working":
+                status = "🟢 working"
+            elif act_status == "stuck":
+                status = "🟡 stuck"
+            elif act_status == "idle":
+                status = "⚪ idle"
+            elif issue:
+                status = "🟢 working"
+            else:
+                status = "⚪ idle"
+            if stale:
+                status = f"💤 {status}"
+
+            if issue:
+                title = _truncate(issue.get("title", ""), 40)
+                issue_text = f"{issue['id']}  {title}"
+            elif row.get("activity_task_id"):
+                issue_text = row["activity_task_id"]
+            else:
                 issue_text = "—"
 
             model = f"{row.get('provider', '—')}:{row.get('model', '—')}"
