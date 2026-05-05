@@ -3,8 +3,8 @@
 
 Screens:
   Overview    — agents, inbox, epic pipeline, activity stream, open tasks
-  EpicDetail  — per-epic drill-down (Phase 3)
-  AgentDetail — per-agent log tail + controls (Phase 3)
+  EpicDetail  — per-epic drill-down
+  AgentDetail — per-agent log tail + controls
 
 Quit with q, Q, Esc, or Ctrl-C.
 """
@@ -17,10 +17,7 @@ import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import concurrent.futures
-import threading
 
 from rich.panel import Panel
 from rich.table import Table
@@ -43,11 +40,11 @@ from textual.widgets import (
 )
 
 from dashboard.notify import notify
-from dashboard.widgets.activity_stream import ActivityStream
+from dashboard.widgets.activity_stream import ActivityStream, _format_event
 from dashboard.widgets.epic_pipeline import EpicPipeline
+
 TEAMS_DIR = ROOT / "teams"
-KEY_POLL_S = 0.25
-_POOL = ThreadPoolExecutor(max_workers=12)
+KEY_POLL_S = 1.0  # poll once per second — fast enough for "real-time" feel
 _prev_data: dict[str, tuple] = {}
 
 
@@ -176,7 +173,7 @@ def _fmt_elapsed(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
-# ---- per-team gather (copied from top.py) ---------------------------------
+# ---- per-team gather (synchronous, no thread pools) -----------------------
 
 
 def _read_team_config(tdir: Path) -> dict:
@@ -198,6 +195,7 @@ def _read_team_config(tdir: Path) -> dict:
 
 
 def _gather_team(team: str, tdir: Path):
+    """Gather data for a single team. Runs synchronously (caller is already in a bg thread)."""
     sess = f"cto-{team}"
     if not tmux_alive(sess):
         return None
@@ -207,12 +205,10 @@ def _gather_team(team: str, tdir: Path):
     provider = cfg.get("agentProvider", "claude")
     model = cfg.get("model", "—")
 
-    f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
-    f_open = _POOL.submit(_bd_json, ["list", "--status", "open"], tdir)
-    f_closed = _POOL.submit(_bd_json, ["list", "--status", "closed", "-n", "0"], tdir)
-    ip = f_ip.result()
-    op = f_open.result()
-    cl = f_closed.result()
+    # synchronous subprocess calls — fine because we're in a bg thread
+    ip = _bd_json(["list", "--status", "in_progress"], tdir)
+    op = _bd_json(["list", "--status", "open"], tdir)
+    cl = _bd_json(["list", "--status", "closed", "-n", "0"], tdir)
 
     ip_by_assignee = {i["assignee"]: i for i in ip if i.get("assignee")}
     agent_rows = [
@@ -233,6 +229,7 @@ def _gather_team(team: str, tdir: Path):
 
 
 def gather():
+    """Gather all team data. Runs in a background thread."""
     agents: list[dict] = []
     inbox: list[dict] = []
     open_tasks: list[dict] = []
@@ -248,16 +245,15 @@ def gather():
         if gone not in live_team_names:
             del _prev_data[gone]
 
-    futures = {team.name: _POOL.submit(_gather_team, team.name, team) for team in teams}
-    for team_name, fut in futures.items():
+    for team in teams:
         result = None
         try:
-            result = fut.result(timeout=10.0)
-        except (concurrent.futures.TimeoutError, Exception):
+            result = _gather_team(team.name, team)
+        except Exception:
             pass
 
         if result is None:
-            cached = _prev_data.get(team_name)
+            cached = _prev_data.get(team.name)
             if cached is None:
                 continue
             a_rows, i_rows, o_rows, c_rows = cached
@@ -267,9 +263,9 @@ def gather():
             c_rows = [{**r, "stale": True} for r in c_rows]
         else:
             a_rows, i_rows, o_rows, c_rows = result
-            _prev_data[team_name] = result
+            _prev_data[team.name] = result
 
-        running.append(team_name)
+        running.append(team.name)
         agents.extend(a_rows)
         inbox.extend(i_rows)
         open_tasks.extend(o_rows)
@@ -278,6 +274,53 @@ def gather():
     closed.sort(key=lambda r: r.get("closed_at") or "", reverse=True)
     closed_recent = closed[:10]
     return agents, inbox, open_tasks, closed_recent, running
+
+
+# ---- pipeline gather (imported from widget, gathered centrally) -----------
+
+from dashboard.widgets.epic_pipeline import _gather_team_pipelines  # noqa: E402
+
+
+def gather_pipelines():
+    """Gather epic pipeline data for all teams."""
+    pipes: list[dict] = []
+    if not TEAMS_DIR.is_dir():
+        return pipes
+    for team_dir in sorted(TEAMS_DIR.iterdir()):
+        if not (team_dir / ".cto").is_dir():
+            continue
+        try:
+            pipes.extend(_gather_team_pipelines(team_dir))
+        except Exception:
+            pass
+    return pipes
+
+
+# ---- activity gather (imported from widget, gathered centrally) -----------
+
+from dashboard.telemetry import ActivityLog  # noqa: E402
+
+
+def gather_events(limit: int = 20):
+    """Gather recent activity events from all teams."""
+    all_events: list[tuple[dt.datetime, dict]] = []
+    if not TEAMS_DIR.is_dir():
+        return []
+    for team_dir in sorted(TEAMS_DIR.iterdir()):
+        if not (team_dir / ".cto").is_dir():
+            continue
+        try:
+            log = ActivityLog(team_dir)
+            for ev in log.tail(n=limit):
+                try:
+                    ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    continue
+                all_events.append((ts, ev))
+        except Exception:
+            pass
+    all_events.sort(key=lambda x: x[0], reverse=True)
+    return [ev for _, ev in all_events[:limit]]
 
 
 # ---- panel builders (copied from top.py) ----------------------------------
@@ -386,6 +429,28 @@ def _open_panel(open_tasks: list[dict], now: dt.datetime, has_focus: bool = Fals
             Text("—", style="dim"), Text("—", style="dim"),
         )
     return Panel(t, title=f"Open tasks ({len(open_tasks)})", border_style="bright_blue" if has_focus else ("blue" if open_tasks else "dim"))
+
+
+def _activity_panel(events: list[dict], has_focus: bool = False) -> Panel:
+    t = Table(expand=True, show_header=False, show_lines=False, pad_edge=False)
+    t.add_column("TIME", overflow="ellipsis", no_wrap=True, width=8)
+    t.add_column("EVENT", overflow="ellipsis", no_wrap=True, ratio=1)
+
+    for ev in events:
+        ts_str = ""
+        try:
+            ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
+            ts_str = ts.astimezone().strftime("%H:%M:%S")
+        except (KeyError, ValueError):
+            pass
+        text = _format_event(ev)
+        t.add_row(Text(ts_str, style="dim"), text)
+
+    if not events:
+        t.add_row(Text("—", style="dim"), Text("(no activity yet)", style="dim"))
+
+    border = "bright_blue" if has_focus else "blue"
+    return Panel(t, title=f"Activity ({len(events)})", border_style=border)
 
 
 # ---- modals ---------------------------------------------------------------
@@ -579,6 +644,7 @@ class DashboardApp(App):
     inbox_items = reactive[list[dict]]([])
     selected_inbox_index = reactive(0)
     _notified_ids: set[str] = set()
+    _poll_in_flight: bool = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -592,58 +658,91 @@ class DashboardApp(App):
         yield Static("", id="footer")
 
     def on_mount(self) -> None:
-        self._gather_lock = threading.Lock()
         self.poll_data()
         self.set_interval(KEY_POLL_S, self.poll_data)
         self.set_interval(KEY_POLL_S, self._tick_footer)
 
     def poll_data(self) -> None:
-        if self._gather_lock.acquire(blocking=False):
-            self.run_worker(self._poll_worker, thread=True)
+        if self._poll_in_flight:
+            return
+        self._poll_in_flight = True
+        self.run_worker(self._poll_worker, thread=True)
 
     def _poll_worker(self) -> None:
+        """Runs in a background thread. Gathers ALL data and pushes to main thread."""
+        error_msg: str | None = None
         try:
             t0 = time.monotonic()
+
             agents, inbox, open_tasks, closed, running = gather()
+            pipelines = gather_pipelines()
+            events = gather_events(limit=20)
+
             gather_ms = int((time.monotonic() - t0) * 1000)
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self._apply_data,
-                agents, inbox, open_tasks, closed, running, gather_ms, time.monotonic(),
+                agents, inbox, open_tasks, closed, running,
+                pipelines, events, gather_ms,
             )
+        except Exception as exc:
+            error_msg = str(exc)
+            self.app.call_from_thread(self._handle_poll_error, error_msg)
         finally:
-            self._gather_lock.release()
+            self.app.call_from_thread(self._clear_poll_flag)
 
     def _apply_data(
         self, agents: list[dict], inbox: list[dict], open_tasks: list[dict],
-        closed: list[dict], running: list[str], gather_ms: int, data_ts: float,
+        closed: list[dict], running: list[str], pipelines: list[dict],
+        events: list[dict], gather_ms: int,
     ) -> None:
         self.gather_ms = gather_ms
-        self.data_ts = data_ts
-        self.snapshot = (agents, inbox, open_tasks, closed, running, gather_ms, data_ts)
+        self.data_ts = time.monotonic()
+        self.snapshot = (agents, inbox, open_tasks, closed, running)
         self.inbox_items = inbox
+
+        # Push pipeline + activity data to their widgets
+        try:
+            self.query_one("#pipeline", EpicPipeline).set_pipelines(pipelines)
+        except Exception:
+            pass
+        try:
+            self.query_one("#activity", ActivityStream).set_events(events)
+        except Exception:
+            pass
+
+    def _handle_poll_error(self, msg: str) -> None:
+        self.notify(f"Poll error: {msg}", severity="error", timeout=2)
+
+    def _clear_poll_flag(self) -> None:
+        self._poll_in_flight = False
 
     def watch_snapshot(self, snapshot) -> None:
         if snapshot is None:
             return
-        agents, inbox, open_tasks, closed, running, _gather_ms, _data_ts = snapshot
+        agents, inbox, open_tasks, closed, running = snapshot
         now = dt.datetime.now(dt.timezone.utc)
-
-        prev = getattr(self, "_prev_snapshot", None)
 
         focused = self.app.focused
         agents_focus = focused is not None and focused.id == "agents"
         inbox_focus = focused is not None and focused.id == "inbox"
         open_focus = focused is not None and focused.id == "open"
 
-        self.query_one("#agents", Static).update(_agent_panel(agents, running, now, has_focus=agents_focus))
-        self.query_one("#inbox", Static).update(_inbox_panel(inbox, selected_index=self.selected_inbox_index, has_focus=inbox_focus))
-        self.query_one("#open", Static).update(_open_panel(open_tasks, now, has_focus=open_focus))
-
-        self._prev_snapshot = snapshot
+        try:
+            self.query_one("#agents", Static).update(_agent_panel(agents, running, now, has_focus=agents_focus))
+        except Exception:
+            pass
+        try:
+            self.query_one("#inbox", Static).update(_inbox_panel(inbox, selected_index=self.selected_inbox_index, has_focus=inbox_focus))
+        except Exception:
+            pass
+        try:
+            self.query_one("#open", Static).update(_open_panel(open_tasks, now, has_focus=open_focus))
+        except Exception:
+            pass
 
     def _tick_footer(self) -> None:
         data_age_ms = int((time.monotonic() - self.data_ts) * 1000) if self.data_ts else 999999
-        fresh = data_age_ms < 2000
+        fresh = data_age_ms < 3000
         indicator = "● live" if fresh else "○ stale"
         ts = dt.datetime.now().strftime("%H:%M:%S")
         teams_summary = ", ".join(self.snapshot[4] if self.snapshot else [])
@@ -654,7 +753,10 @@ class DashboardApp(App):
             f"{indicator} · gather {self.gather_ms}ms · teams: {teams_summary} · {ts}",
             style="dim", justify="center",
         )
-        self.query_one("#footer", Static).update(text)
+        try:
+            self.query_one("#footer", Static).update(text)
+        except Exception:
+            pass
 
     # -- inbox notification watcher ----------------------------------------
 

@@ -2,13 +2,16 @@
 
 Shows one swimlane per open epic with columns for each workflow stage:
 Epic → Breakdown → Plan → Dev → Review → Merge → Ship.
+
+This widget is PASSIVE — the parent DashboardApp gathers data in a single
+background worker and pushes it here via set_pipelines().  This eliminates
+the thread-pool deadlock and overlapping-poll problems that caused blanking.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +23,6 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
-_POOL = ThreadPoolExecutor(max_workers=12)
 
 
 def _run(cmd: list[str], cwd: Path, timeout: float = 4.0) -> str:
@@ -63,39 +65,16 @@ def _human_age(seconds: int) -> str:
 class EpicPipeline(Static):
     """Rich widget showing epic swimlanes.
 
-    All bd I/O is done in a background worker so the Textual event loop
-    never stalls — this prevents the screen from blanking.
+    PASSIVE: the parent DashboardApp pushes data via set_pipelines().
     """
 
     pipelines = reactive[list[dict[str, Any]]]([])
     selected_index = reactive(0)
     can_focus = True
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-    def on_mount(self) -> None:
-        self.run_worker(self._refresh_worker, thread=True)
-        self.set_interval(5, lambda: self.run_worker(self._refresh_worker, thread=True))
-
-    def _refresh_worker(self) -> None:
-        pipes: list[dict[str, Any]] = []
-        try:
-            if TEAMS_DIR.is_dir():
-                teams = [p for p in sorted(TEAMS_DIR.iterdir()) if (p / ".cto").is_dir()]
-                futures = {t.name: _POOL.submit(_gather_team_pipelines, t) for t in teams}
-                for team_name, fut in futures.items():
-                    try:
-                        result = fut.result(timeout=10.0)
-                        pipes.extend(result)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self.app.call_from_thread(self._set_pipelines, pipes)
-
-    def _set_pipelines(self, pipes: list[dict[str, Any]]) -> None:
-        self.pipelines = pipes
+    def set_pipelines(self, pipelines: list[dict[str, Any]]) -> None:
+        """Called by the parent app after gathering data."""
+        self.pipelines = pipelines
         if self.selected_index >= len(self.pipelines):
             self.selected_index = max(0, len(self.pipelines) - 1)
 
@@ -160,8 +139,6 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime, selected: bool 
     created = _parse_iso(pipe.get("created_at", ""))
     age = _human_age(int((now - created).total_seconds())) if created else "—"
 
-    row_style = "reverse" if selected else ""
-
     def cell(stage: str) -> Text:
         s = stages.get(stage, {"status": "none"})
         status = s["status"]
@@ -175,9 +152,10 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime, selected: bool 
             return Text("●", style="dim")
         return Text("—", style="dim")
 
+    sel = " reverse" if selected else ""
     return [
-        Text(team, style="cyan" + (" reverse" if selected else "")),
-        Text(epic_title, style="white" + (" reverse" if selected else "")),
+        Text(team, style="cyan" + sel),
+        Text(epic_title, style="white" + sel),
         cell("breakdown"),
         cell("plan"),
         cell("dev"),
@@ -189,8 +167,12 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime, selected: bool 
 
 
 def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
-    issues = _bd_json(["list", "--status", "open"], team_dir)
-    issues += _bd_json(["list", "--status", "in_progress"], team_dir)
+    """Gather epic pipeline data for a single team."""
+    try:
+        issues = _bd_json(["list", "--status", "open"], team_dir)
+        issues += _bd_json(["list", "--status", "in_progress"], team_dir)
+    except Exception:
+        return []
 
     epics: list[dict[str, Any]] = []
     by_epic: dict[str, list[dict[str, Any]]] = {}
@@ -208,7 +190,11 @@ def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
         if epic_id:
             by_epic.setdefault(epic_id, []).append(i)
 
-    closed_issues = _bd_json(["list", "--status", "closed", "--limit", "50"], team_dir)
+    try:
+        closed_issues = _bd_json(["list", "--status", "closed", "--limit", "50"], team_dir)
+    except Exception:
+        closed_issues = []
+
     for i in closed_issues:
         epic_id = None
         desc = i.get("description", "")

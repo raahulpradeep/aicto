@@ -2,6 +2,10 @@
 
 Shows a chronological feed of recent workflow events across all teams,
 read from the per-team telemetry JSONL logs.
+
+This widget is PASSIVE — the parent DashboardApp gathers data in a single
+background worker and pushes it here via set_events().  This eliminates
+the overlapping-poll problems that contributed to blanking.
 """
 from __future__ import annotations
 
@@ -18,16 +22,11 @@ from textual.widgets import Static
 
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
 
-import sys
-sys.path.insert(0, str(TEAMS_DIR.parent))
-from dashboard.telemetry import ActivityLog  # noqa: E402
-
 
 class ActivityStream(Static):
     """Rich widget that renders the last N workflow events.
 
-    All I/O is done in a background worker so the Textual event loop
-    never stalls — this prevents the screen from blanking.
+    PASSIVE: the parent DashboardApp pushes data via set_events().
     """
 
     events = reactive[list[dict[str, Any]]]([])
@@ -37,32 +36,9 @@ class ActivityStream(Static):
         super().__init__(*args, **kwargs)
         self.limit = limit
 
-    def on_mount(self) -> None:
-        self.run_worker(self._refresh_worker, thread=True)
-        self.set_interval(2, lambda: self.run_worker(self._refresh_worker, thread=True))
-
-    def _refresh_worker(self) -> None:
-        all_events: list[tuple[dt.datetime, dict[str, Any]]] = []
-        try:
-            if TEAMS_DIR.is_dir():
-                for team_dir in sorted(TEAMS_DIR.iterdir()):
-                    if not (team_dir / ".cto").is_dir():
-                        continue
-                    log = ActivityLog(team_dir)
-                    for ev in log.tail(n=self.limit):
-                        try:
-                            ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
-                        except (KeyError, ValueError):
-                            continue
-                        all_events.append((ts, ev))
-            all_events.sort(key=lambda x: x[0], reverse=True)
-            new_events = [ev for _, ev in all_events[: self.limit]]
-        except Exception:
-            new_events = []
-        self.app.call_from_thread(self._set_events, new_events)
-
-    def _set_events(self, new_events: list[dict[str, Any]]) -> None:
-        self.events = new_events
+    def set_events(self, events: list[dict[str, Any]]) -> None:
+        """Called by the parent app after gathering data."""
+        self.events = events
 
     def render(self) -> Panel:
         try:
