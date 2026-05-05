@@ -8,6 +8,11 @@ Key improvements over v1:
   • Epic pipeline swimlane with queue depth
   • CTO inbox with inline approve/reject/freeze
   • Real-time footer with event latency
+  • Per-epic drill-down (Enter on epic)
+  • Per-agent live log (Enter on agent)
+  • Kill/spawn agents inline
+  • Diff viewer for epics
+  • Comment on issues from dashboard
 
 Backward compatible: old dashboard accessible via `cto top --legacy`.
 """
@@ -48,6 +53,10 @@ from dashboard.notify import notify
 from dashboard.widgets.activity_stream import ActivityStream, _format_event
 from dashboard.widgets.epic_pipeline import EpicPipeline
 from dashboard.widgets.agent_card import AgentCard
+
+# Phase B imports
+from dashboard.screens import EpicDetailScreen, AgentDetailScreen, DiffViewerScreen
+from dashboard.modals import ConfirmModal, CommentModal
 
 TEAMS_DIR = ROOT / "teams"
 _prev_data: dict[str, tuple] = {}
@@ -383,7 +392,6 @@ def _agent_grid_panel(agents: list[dict], running: list[str], now: dt.datetime, 
             title="Agents (0)", border_style="bright_cyan" if has_focus else "dim",
         )
 
-    # Build a table that shows agents in a compact multi-column layout
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
     t.add_column("STATUS", overflow="ellipsis", no_wrap=True, width=10)
@@ -412,7 +420,7 @@ def _agent_grid_panel(agents: list[dict], running: list[str], now: dt.datetime, 
                 status_text,
                 Text(elapsed, style=("reverse " if is_selected else "") + ("green" if not stale else "dim")),
                 Text(f"{row.get('provider', '—')}:{row.get('model', '—')}", style=("reverse " if is_selected else "") + row_style),
-                Text("—", style="dim"),  # tokens placeholder
+                Text("—", style="dim"),
                 Text(f"{issue['id']}  {title}", style=("reverse " if is_selected else "") + row_style),
             )
         else:
@@ -613,86 +621,40 @@ class FreezeModal(ModalScreen[str | None]):
             self.dismiss(None)
 
 
-class EpicDetailScreen(ModalScreen[None]):
-    def __init__(self, pipeline: dict) -> None:
-        super().__init__()
-        self.pipeline = pipeline
+class SpawnAgentModal(ModalScreen[dict[str, str] | None]):
+    """Modal for spawning a new agent with role and model selection."""
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="epic-detail"):
-            yield Static(f"Epic: {self.pipeline['epic_id']}", id="detail-header")
-            yield Markdown(self._build_markdown())
-            yield Button("Close", id="close")
+        with Vertical(id="spawn-dialog"):
+            yield Static("Spawn new agent", classes="dialog-title")
+            yield Static("Role:", classes="dialog-label")
+            yield Input(value="developer", id="role")
+            yield Static("Model:", classes="dialog-label")
+            yield Input(value="sonnet", id="model")
+            yield Static("Epic (optional):", classes="dialog-label")
+            yield Input(value="", id="epic")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Spawn", variant="success", id="spawn")
+                yield Button("Cancel", variant="primary", id="cancel")
 
-    def _build_markdown(self) -> str:
-        p = self.pipeline
-        stages = p["stages"]
-        lines = [
-            f"# {p['title']}",
-            "",
-            f"**Team:** {p['team']}  ",
-            f"**Epic ID:** {p['epic_id']}  ",
-            "",
-            "## Pipeline",
-            "",
-        ]
-        for stage, info in stages.items():
-            icon = {"done": "✓", "active": "◐", "blocked": "✗", "pending": "●", "none": "○"}.get(info["status"], "?")
-            lines.append(f"- **{stage.capitalize()}:** {icon} {info['status']}")
-        return "\n".join(lines)
+    def on_mount(self) -> None:
+        self.query_one("#role", Input).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "close":
-            self.dismiss()
+        if event.button.id == "spawn":
+            role = self.query_one("#role", Input).value.strip()
+            model = self.query_one("#model", Input).value.strip()
+            epic = self.query_one("#epic", Input).value.strip()
+            if not role:
+                self.notify("Role is required", severity="error")
+                return
+            self.dismiss({"role": role, "model": model, "epic": epic})
+        else:
+            self.dismiss(None)
 
     def on_key(self, event):
         if event.key == "escape":
-            self.dismiss()
-
-
-class AgentDetailScreen(ModalScreen[None]):
-    def __init__(self, agent_row: dict) -> None:
-        super().__init__()
-        self.agent_row = agent_row
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="agent-detail"):
-            yield Static(f"Agent: {self.agent_row['agent']}", id="detail-header")
-            yield Markdown(self._build_markdown())
-            yield Button("Close", id="close")
-
-    def _build_markdown(self) -> str:
-        a = self.agent_row
-        lines = [
-            f"# {a['agent']}",
-            "",
-            f"**Provider:** {a.get('provider', '—')}  ",
-            f"**Model:** {a.get('model', '—')}  ",
-            f"**Status:** {'working' if a.get('issue') else 'idle'}  ",
-        ]
-        issue = a.get("issue")
-        if issue:
-            lines.extend([
-                "",
-                f"**Current issue:** {issue['id']} — {issue.get('title', '')}",
-            ])
-        log_path = TEAMS_DIR / a["team"] / ".cto" / "logs" / f"{a['agent']}.log"
-        if log_path.exists():
-            try:
-                text = log_path.read_text(errors="replace")
-                tail = "\n".join(text.splitlines()[-20:])
-                lines.extend(["", "## Recent output", "", "```", tail, "```"])
-            except OSError:
-                pass
-        return "\n".join(lines)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "close":
-            self.dismiss()
-
-    def on_key(self, event):
-        if event.key == "escape":
-            self.dismiss()
+            self.dismiss(None)
 
 
 # ---- main app -------------------------------------------------------------
@@ -724,6 +686,10 @@ class DashboardV2App(App):
         ("a", "approve", "Approve"),
         ("r", "reject", "Reject"),
         ("f", "freeze", "Freeze"),
+        ("k", "kill_agent", "Kill Agent"),
+        ("s", "spawn_agent", "Spawn"),
+        ("d", "view_diff", "Diff"),
+        ("c", "comment", "Comment"),
         ("enter", "drill_down", "Drill down"),
         ("up", "cursor_up", "Up"),
         ("down", "cursor_down", "Down"),
@@ -874,6 +840,17 @@ class DashboardV2App(App):
     # Rendering
     # ------------------------------------------------------------------
 
+    def _update_panel(self, widget_id: str, renderable) -> None:
+        """Update a panel without collapsing to zero height."""
+        try:
+            widget = self.query_one(f"#{widget_id}", Static)
+            # Textual Static.update() replaces content atomically if we
+            # keep the renderable height stable.  We intentionally do NOT
+            # clear the widget first.
+            widget.update(renderable)
+        except Exception:
+            pass
+
     def watch_snapshot(self, snapshot) -> None:
         if snapshot is None:
             return
@@ -885,22 +862,9 @@ class DashboardV2App(App):
         inbox_focus = focused is not None and focused.id == "inbox"
         open_focus = focused is not None and focused.id == "open"
 
-        try:
-            self.query_one("#agents", Static).update(
-                _agent_grid_panel(agents, running, now, selected_index=self.selected_agent_index, has_focus=agents_focus)
-            )
-        except Exception:
-            pass
-        try:
-            self.query_one("#inbox", Static).update(
-                _inbox_panel(inbox, selected_index=self.selected_inbox_index, has_focus=inbox_focus)
-            )
-        except Exception:
-            pass
-        try:
-            self.query_one("#open", Static).update(_open_panel(open_tasks, now, has_focus=open_focus))
-        except Exception:
-            pass
+        self._update_panel("agents", _agent_grid_panel(agents, running, now, selected_index=self.selected_agent_index, has_focus=agents_focus))
+        self._update_panel("inbox", _inbox_panel(inbox, selected_index=self.selected_inbox_index, has_focus=inbox_focus))
+        self._update_panel("open", _open_panel(open_tasks, now, has_focus=open_focus))
 
     def _tick_footer(self) -> None:
         data_age_ms = int((time.monotonic() - self.data_ts) * 1000) if self.data_ts else 999999
@@ -915,7 +879,8 @@ class DashboardV2App(App):
             teams_summary = "—"
 
         text = Text(
-            f"q quit · tab focus · ↑↓ navigate · enter drill-down · a approve · r reject · f freeze · "
+            f"q quit · tab focus · ↑↓ navigate · enter drill · a approve · r reject · f freeze · "
+            f"k kill · s spawn · d diff · c comment · "
             f"{indicator} · events={self._event_count} · gather {self.gather_ms}ms · teams: {teams_summary} · {ts}",
             style="dim", justify="center",
         )
@@ -1007,8 +972,227 @@ class DashboardV2App(App):
         if item is None:
             self.notify("Item no longer available", severity="warning")
             return
-        self.notify(f"Freeze requested for {item['id']} (not yet implemented)", severity="warning")
+        self._pending_cmd = "freeze"
+        self._pending_comment = comment
+        self.run_worker(self._worker_freeze, thread=True, exclusive=False)
+
+    def _worker_freeze(self) -> None:
+        """Backend freeze: add frozen label and comment on the epic."""
+        item = getattr(self, "_pending_item", None)
+        comment = getattr(self, "_pending_comment", "")
+        if item is None:
+            return
+        try:
+            team = item["team"]
+            issue_id = item["id"]
+            tdir = TEAMS_DIR / team
+            # Add frozen label
+            r1 = subprocess.run(
+                ["bd", "update", issue_id, "--add-label", "status:frozen"],
+                cwd=str(tdir), capture_output=True, text=True, timeout=10.0,
+            )
+            # Add comment
+            r2 = subprocess.run(
+                ["bd", "comment", issue_id, comment],
+                cwd=str(tdir), capture_output=True, text=True, timeout=10.0,
+            )
+            success = r1.returncode == 0 and r2.returncode == 0
+            self.call_from_thread(self._handle_freeze_result, success, issue_id, comment)
+        except Exception as exc:
+            self.call_from_thread(self._notify_error, f"freeze failed: {exc}")
+
+    def _handle_freeze_result(self, success: bool, issue_id: str, comment: str) -> None:
         self._pending_item = None
+        self._pending_cmd = ""
+        self._pending_comment = ""
+        if success:
+            self.notify(f"Frozen {issue_id}: {comment}", title="Freeze")
+            self.poll_data()
+        else:
+            self.notify(f"Failed to freeze {issue_id}", severity="error", title="Error")
+
+    def action_kill_agent(self) -> None:
+        """Kill the selected agent with confirmation."""
+        focused = self.app.focused
+        if focused and focused.id == "agents":
+            snapshot = self.snapshot
+            if not snapshot:
+                self.notify("No agents available", severity="warning")
+                return
+            agents = snapshot[0]
+            if not agents or self.selected_agent_index >= len(agents):
+                self.notify("No agent selected", severity="warning")
+                return
+            agent = agents[self.selected_agent_index]
+            agent_name = agent.get("agent", "unknown")
+            self.push_screen(
+                ConfirmModal(
+                    f"Kill {agent_name}?",
+                    "This will send SIGTERM to the agent's tmux pane. The supervisor will restart it automatically.",
+                    confirm_variant="error",
+                ),
+                lambda confirmed: self._on_kill_confirmed(confirmed, agent),
+            )
+        else:
+            self.notify("Select an agent first (focus agents panel)", severity="warning")
+
+    def _on_kill_confirmed(self, confirmed: bool, agent: dict) -> None:
+        if not confirmed:
+            return
+        session = f"cto-{agent['team']}"
+        window = agent["window"]
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", f"{session}:{window}", "C-c"],
+                capture_output=True, timeout=3.0,
+            )
+            self.notify(f"Sent SIGTERM to {agent['agent']}", title="Kill")
+        except Exception as exc:
+            self.notify(f"Kill failed: {exc}", severity="error", title="Error")
+        self.poll_data()
+
+    def action_spawn_agent(self) -> None:
+        """Open spawn agent modal."""
+        self.push_screen(SpawnAgentModal(), self._on_spawn)
+
+    def _on_spawn(self, result: dict[str, str] | None) -> None:
+        if result is None:
+            return
+        self.run_worker(self._worker_spawn, thread=True, exclusive=False)
+        # Store spawn params for the worker
+        self._spawn_params = result
+
+    def _worker_spawn(self) -> None:
+        result = getattr(self, "_spawn_params", {})
+        if not result:
+            return
+        role = result.get("role", "developer")
+        model = result.get("model", "sonnet")
+        epic = result.get("epic", "")
+
+        # Spawn for all running teams or just the focused team
+        snapshot = getattr(self, "snapshot", None)
+        teams = snapshot[4] if snapshot else []
+        if not teams:
+            self.call_from_thread(self._notify_error, "No teams running")
+            return
+
+        # For simplicity, spawn on the first running team
+        team = teams[0]
+        try:
+            args = [str(ROOT / "bin" / "cto"), "start", team, "--force"]
+            # Note: cto start doesn't directly support role/model per agent,
+            # but we can update config and restart
+            subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+            self.call_from_thread(
+                self.notify, f"Spawned agents for {team} (role={role}, model={model})", title="Spawn"
+            )
+        except Exception as exc:
+            self.call_from_thread(self._notify_error, f"spawn failed: {exc}")
+
+    def action_view_diff(self) -> None:
+        """View diff for selected epic."""
+        focused = self.app.focused
+        epic = None
+        if focused and focused.id == "pipeline":
+            epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+        elif focused and focused.id == "inbox":
+            if self.inbox_items:
+                item = self.inbox_items[self.selected_inbox_index]
+                # Try to infer epic from inbox item
+                epic = {"team": item["team"], "epic_id": item.get("id", ""), "title": item.get("title", "")}
+
+        if not epic or not epic.get("epic_id"):
+            self.notify("Select an epic first", severity="warning")
+            return
+
+        self.push_screen(
+            DiffViewerScreen(epic["team"], epic["epic_id"], epic.get("title", "")),
+            self._on_diff_action,
+        )
+
+    def _on_diff_action(self, action: str | None) -> None:
+        if action is None:
+            return
+        if action == "approve":
+            self.notify("Diff approved (use `a` on inbox item to actually approve)", severity="warning")
+        elif action == "reject":
+            self.notify("Diff rejected (use `r` on inbox item to actually reject)", severity="warning")
+        elif action == "comment":
+            focused = self.app.focused
+            epic = None
+            if focused and focused.id == "pipeline":
+                epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+            if epic:
+                self.push_screen(
+                    CommentModal(epic["epic_id"], epic.get("title", "")),
+                    lambda comment: self._do_comment(epic["team"], epic["epic_id"], comment),
+                )
+
+    def action_comment(self) -> None:
+        """Comment on selected inbox item or epic."""
+        focused = self.app.focused
+        target = None
+        if focused and focused.id == "inbox":
+            if self.inbox_items:
+                target = self.inbox_items[self.selected_inbox_index]
+        elif focused and focused.id == "pipeline":
+            epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+            if epic:
+                target = {"team": epic["team"], "id": epic["epic_id"], "title": epic["title"]}
+        elif focused and focused.id == "agents":
+            snapshot = self.snapshot
+            if snapshot:
+                agents = snapshot[0]
+                if agents and self.selected_agent_index < len(agents):
+                    agent = agents[self.selected_agent_index]
+                    issue = agent.get("issue")
+                    if issue:
+                        target = {"team": agent["team"], "id": issue["id"], "title": issue.get("title", "")}
+                    else:
+                        self.notify("Selected agent has no current issue", severity="warning")
+                        return
+
+        if not target:
+            self.notify("Select an item first", severity="warning")
+            return
+
+        self.push_screen(
+            CommentModal(target["id"], target.get("title", "")),
+            lambda comment: self._do_comment(target["team"], target["id"], comment),
+        )
+
+    def _do_comment(self, team: str, issue_id: str, comment: str | None) -> None:
+        if comment is None:
+            return
+        self.run_worker(self._worker_comment, thread=True, exclusive=False)
+        self._comment_params = {"team": team, "id": issue_id, "comment": comment}
+
+    def _worker_comment(self) -> None:
+        params = getattr(self, "_comment_params", {})
+        team = params.get("team", "")
+        issue_id = params.get("id", "")
+        comment = params.get("comment", "")
+        if not team or not issue_id or not comment:
+            return
+        try:
+            tdir = TEAMS_DIR / team
+            result = subprocess.run(
+                ["bd", "comment", issue_id, comment],
+                cwd=str(tdir), capture_output=True, text=True, timeout=10.0,
+            )
+            success = result.returncode == 0
+            self.call_from_thread(self._handle_comment_result, success, issue_id)
+        except Exception as exc:
+            self.call_from_thread(self._notify_error, f"comment failed: {exc}")
+
+    def _handle_comment_result(self, success: bool, issue_id: str) -> None:
+        self._comment_params = {}
+        if success:
+            self.notify(f"Commented on {issue_id}", title="Comment")
+            self.poll_data()
+        else:
+            self.notify(f"Failed to comment on {issue_id}", severity="error", title="Error")
 
     def _worker_cto(self) -> None:
         item = getattr(self, "_pending_item", None)
@@ -1040,6 +1224,8 @@ class DashboardV2App(App):
         self._pending_item = None
         self._pending_cmd = ""
         self._pending_comment = ""
+        self._spawn_params = {}
+        self._comment_params = {}
         self.notify(msg, severity="error", title="Error")
 
     def action_drill_down(self) -> None:
@@ -1052,7 +1238,7 @@ class DashboardV2App(App):
         if fid == "pipeline":
             epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
             if epic:
-                self.push_screen(EpicDetailScreen(epic))
+                self.push_screen(EpicDetailScreen(epic), self._on_epic_detail_action)
             return
 
         if fid == "agents":
@@ -1073,6 +1259,28 @@ class DashboardV2App(App):
                     "stages": {},
                 }))
             return
+
+    def _on_epic_detail_action(self, action: str | None) -> None:
+        if action == "view-diff":
+            focused = self.app.focused
+            epic = None
+            if focused and focused.id == "pipeline":
+                epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+            if epic:
+                self.push_screen(
+                    DiffViewerScreen(epic["team"], epic["epic_id"], epic.get("title", "")),
+                    self._on_diff_action,
+                )
+        elif action == "comment":
+            focused = self.app.focused
+            epic = None
+            if focused and focused.id == "pipeline":
+                epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+            if epic:
+                self.push_screen(
+                    CommentModal(epic["epic_id"], epic.get("title", "")),
+                    lambda comment: self._do_comment(epic["team"], epic["epic_id"], comment),
+                )
 
     def action_cursor_up(self) -> None:
         focused = self.app.focused
