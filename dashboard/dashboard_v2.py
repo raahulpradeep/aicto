@@ -524,9 +524,6 @@ class DashboardApp(App):
     # DataTable update methods (in-place, no collapse)
     # ------------------------------------------------------------------
 
-    def _clear_poll_flag(self) -> None:
-        self._poll_in_flight = False
-
     def _update_agents_table(self, agents: list[dict], running: list[str]) -> None:
         table = self._agents_dt
         table.clear()
