@@ -493,6 +493,9 @@ class DashboardApp(App):
         finally:
             self.app.call_from_thread(self._clear_poll_flag)
 
+    def _clear_poll_flag(self) -> None:
+        self._poll_in_flight = False
+
     def _apply_data(
         self, agents: list[dict], inbox: list[dict], open_tasks: list[dict],
         closed: list[dict], running: list[str], pipelines: list[dict],
