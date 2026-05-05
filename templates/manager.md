@@ -75,16 +75,13 @@ For each epic that has **no `kind:breakdown` child** (check via `bd dep list <ep
 artifact: breakdowns/<epic-id>.md @ branch manager/<breakdown-id>"
    # capture the new id, then:
    bd close <new-id> -r "drafted"
-   bd dep <epic-id> --blocks <new-id>     # link as child of epic
+   bd dep <epic-id> --blocks <new-id>     # link as child of epic — breakdown only, NOT approval
 
-   bd create -t task -l role:cto,kind:approval,target:breakdown -p 1 \
-     --set-metadata artifact="breakdowns/<epic-id>.md" \
-     "Approve breakdown: <epic title>" \
-     -d "epic: <epic-id>
-branch: manager/<breakdown-id>
-artifact: breakdowns/<epic-id>.md @ branch manager/<breakdown-id>
-Read breakdowns/<epic-id>.md. Approve via 'cto approve {{TEAM}} <id>' or reject with --comment."
+   # Do NOT run bd dep for the approval issue.
+   # The approval must be immediately available to the CTO; adding any dep would block it.
    ```
+
+   For normal epics, the reconciler will file the `kind:approval target:breakdown` automatically once you close the breakdown. For epics labeled `class:bypass-cto`, the reconciler files `kind:merge target:breakdown` directly instead — no CTO gate.
 
 ### 3. Process ready merges
 
@@ -110,11 +107,20 @@ For each ready `merge` issue:
 
 ### 4. Workflow transitions — AUTOMATED by reconciler
 
-A typed reconciler at `.cto/reconciler.py` runs after every manager iteration and owns **every** workflow transition: filing the plan + review-plan after a breakdown merge, filing dev + review-code pairs (one per `## Dev <Letter>` chunk in the merged plan) after a plan merge, tagging upstream issues with `needs-re-review` when a review closes `changes-requested`, filing the next round of review when a dev with `needs-re-review` closes again, and filing the CTO-bound `kind:merge target:epic` once an epic is genuinely ready to ship.
+A typed reconciler at `.cto/reconciler.py` runs after every manager iteration and owns **every** workflow transition:
+
+- filing `kind:approval target:breakdown` after you close a breakdown (or `kind:merge target:breakdown` for `class:bypass-cto` epics)
+- filing `kind:plan` + `kind:review target:plan` after a breakdown merge
+- filing `kind:approval target:plan` after an approved plan review (or `kind:merge target:plan` for `class:bypass-cto` epics)
+- filing `kind:dev` + `kind:review target:code` pairs after a plan merge
+- tagging upstream issues with `needs-re-review` when a review closes `changes-requested`
+- filing the next round of review when a dev with `needs-re-review` closes again
+- filing `kind:merge target:code` after an approved code review
+- filing the CTO-bound `kind:merge target:epic` once an epic is genuinely ready to ship (or auto-executing the merge for `class:bypass-cto` epics whose `parent_branch != main`)
 
 Do **not** do any of this manually. If something looks stuck, check the supervisor logs in the manager tmux pane — lines prefixed `reconciler:` show what it emitted (or `Noop`'d). The reconciler is idempotent: re-running it never duplicates filings.
 
-You do **not** file `kind:approval,target:plan` — that is the reviewer's job after their own approval. Do not pre-emptively merge. Wait for explicit `merge` issues.
+Wait for explicit `merge` issues before merging. Do not pre-emptively merge.
 
 ### 5. Status digest
 
@@ -144,6 +150,6 @@ After completing your one pass, exit cleanly. The supervisor will run you again.
 
 - Never edit anything outside `breakdowns/` (that's the only file area you write).
 - Never push to remotes. We are local-only by default.
-- Never bypass the CTO gates. Approvals come via `cto approve` closing the relevant `kind:approval` issue.
+- Never bypass the CTO gates (unless the epic is explicitly labeled `class:bypass-cto`). Approvals come via `cto approve` closing the relevant `kind:approval` issue.
 - Never paste full content into bd issues — gists only.
 - If something is ambiguous (e.g. an epic with no description), reopen the issue with a numbered list of clarifying questions for the CTO and stop. Do not guess.

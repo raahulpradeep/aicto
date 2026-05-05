@@ -296,7 +296,7 @@ Usage:
   cto team remove <name>
   cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
 
-  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--parent-branch <branch>]
+  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--ops] [--bypass-cto] [--parent-branch <branch>]
   cto inbox [<team>] [--json]
   cto approve <team> <id> [--comment "…"]
   cto reject <team> <id> --comment "…"
@@ -681,7 +681,7 @@ cmd_config() {
 cmd_task() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local title="" desc="" prio=2 kind=epic ops=0 parent_branch=""
+  local title="" desc="" prio=2 kind=epic ops=0 bypass_cto=0 parent_branch=""
   while (( $# )); do
     case "$1" in
       -d|--description) desc="$2"; shift 2 ;;
@@ -690,6 +690,7 @@ cmd_task() {
       --dev)  kind=dev;  shift ;;
       --plan) kind=plan; shift ;;
       --ops)  ops=1;     shift ;;
+      --bypass-cto)     bypass_cto=1; shift ;;
       --parent-branch)  parent_branch="$2"; shift 2 ;;
       --) shift ;;
       -*) die "unknown task flag: $1" ;;
@@ -700,12 +701,19 @@ cmd_task() {
   if (( ops )) && [[ "$kind" != "epic" ]]; then
     die "--ops only applies to epics"
   fi
+  if (( bypass_cto )) && [[ "$kind" != "epic" ]]; then
+    die "--bypass-cto only applies to epics"
+  fi
+  if (( bypass_cto && ops )); then
+    die "--bypass-cto is incompatible with --ops"
+  fi
   if [[ "$kind" == "epic" && -z "$parent_branch" ]]; then
     die "--parent-branch is required when creating an epic"
   fi
 
   local labels="role:manager,kind:$kind"
   (( ops )) && labels="$labels,class:ops"
+  (( bypass_cto )) && labels="$labels,class:bypass-cto"
   local full_desc="${desc:-(no description)}"
   if [[ -n "$parent_branch" ]]; then
     full_desc="parent_branch: $parent_branch
@@ -736,6 +744,8 @@ except Exception:
 
   if (( ops )); then
     info "filed $id (ops epic, role:manager) in team $name — reconciler will file a single dev, no breakdown/plan/review"
+  elif (( bypass_cto )); then
+    info "filed $id ($kind, role:manager, bypass_cto: true${parent_branch:+, parent_branch: $parent_branch}) in team $name"
   else
     info "filed $id ($kind, role:manager${parent_branch:+, parent_branch: $parent_branch}) in team $name"
   fi
@@ -1008,6 +1018,18 @@ cmd_approve() {
     info "target:epic approval — running cto merge-epic $name $epic_id"
     cmd_merge_epic "$name" "$epic_id" --comment "$comment"
     return
+  fi
+
+  # Remove any dep that makes the epic block this approval — a common
+  # mis-filing by the manager agent that would otherwise hide the approval
+  # from `bd ready` forever.
+  if [[ -n "$desc" ]]; then
+    local epic_id_from_desc
+    epic_id_from_desc=$(grep -oE 'epic:[[:space:]]*[A-Za-z0-9._-]+' <<<"$desc" \
+                        | head -1 | awk -F: '{print $2}' | tr -d '[:space:]' || true)
+    if [[ -n "$epic_id_from_desc" ]]; then
+      (cd "$tdir" && bd dep remove "$epic_id_from_desc" --blocks "$id" 2>/dev/null || true)
+    fi
   fi
 
   ( cd "$tdir" \

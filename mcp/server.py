@@ -169,6 +169,7 @@ def task(
     priority: int = 2,
     kind: str = "epic",
     ops: bool = False,
+    bypass_cto: bool = False,
 ) -> str:
     """File a bd task on a team. Defaults to kind='epic' (the only kind the
     CTO normally files — the manager decomposes from there). Other kinds
@@ -178,14 +179,24 @@ def task(
     that don't produce a diff. The reconciler files a single kind:dev for
     them and closes the epic when the dev closes — no breakdown, plan,
     review, or merge ceremony. ops=True only applies to kind='epic'.
+
+    Set bypass_cto=True to skip manual CTO approvals for normal feature
+    work. Reviewer checks remain mandatory. Final epic merge is automatic
+    when parent_branch != main.
     """
     if kind not in ("epic", "dev", "plan"):
         raise ValueError(f"kind must be epic|dev|plan, got {kind!r}")
     if ops and kind != "epic":
         raise ValueError("ops=True only applies to kind='epic'")
+    if bypass_cto and kind != "epic":
+        raise ValueError("bypass_cto=True only applies to kind='epic'")
+    if bypass_cto and ops:
+        raise ValueError("bypass_cto=True is incompatible with ops=True")
     args = ["task", team, title, "-p", str(priority), f"--{kind}"]
     if ops:
         args.append("--ops")
+    if bypass_cto:
+        args.append("--bypass-cto")
     if description:
         args += ["-d", description]
     return _run(args)

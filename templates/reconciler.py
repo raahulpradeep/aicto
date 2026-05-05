@@ -85,6 +85,15 @@ class Issue:
         where there is no diff to review."""
         return "class:ops" in self.labels
 
+    @property
+    def is_bypass_cto(self) -> bool:
+        return "class:bypass-cto" in self.labels
+
+    @property
+    def parent_branch(self) -> str:
+        m = re.search(r"^parent_branch:\s*(\S+)\s*$", self.description, re.MULTILINE)
+        return m.group(1) if m else "main"
+
 
 @dataclass(frozen=True)
 class State:
@@ -184,7 +193,13 @@ class CloseIssue:
     reason: str
 
 
-Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue, CloseIssue]
+@dataclass(frozen=True)
+class AutoMergeEpic:
+    epic_id: str
+    merge_target: str
+
+
+Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue, CloseIssue, AutoMergeEpic]
 
 
 # ---------- Idempotency keys ----------
@@ -262,9 +277,48 @@ def reconcile_epic(
     code_merges = [c for c in children if c.kind == "merge" and c.target == "code"]
     epic_merges = [c for c in children if c.kind == "merge" and c.target == "epic"]
 
+    plan_reviews = [c for c in children if c.kind == "review" and c.target == "plan"]
+    approvals_breakdown = [c for c in children if c.kind == "approval" and c.target == "breakdown"]
+    approvals_plan = [c for c in children if c.kind == "approval" and c.target == "plan"]
+
     # ---- Phase 1: no breakdown yet → manager fills this in. Reconciler waits.
     if not breakdowns:
         return actions
+
+    # ---- Phase 1.5: breakdown closed → file approval or merge.
+    closed_breakdowns = [b for b in breakdowns if not b.is_open]
+    if closed_breakdowns and not breakdown_merges_closed:
+        if epic.is_bypass_cto:
+            bd_merge_idem = idem("file-breakdown-merge", epic.id, closed_breakdowns[-1].id)
+            if not state.has_idem(bd_merge_idem):
+                actions.append(FileIssue(
+                    title=f"Merge breakdown: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"branch: manager/{closed_breakdowns[-1].id}\n"
+                        f"idem: {bd_merge_idem}\n"
+                        f"Merge manager/{closed_breakdowns[-1].id} into epic/{epic.id}, prune sub-worktree."
+                    ),
+                    labels=("role:manager", "kind:merge", "target:breakdown"),
+                    priority=1,
+                ))
+        else:
+            if not approvals_breakdown:
+                bd_appr_idem = idem("file-approval-breakdown", epic.id)
+                if not state.has_idem(bd_appr_idem):
+                    bd_issue = closed_breakdowns[-1]
+                    actions.append(FileIssue(
+                        title=f"Approve breakdown: {epic.title}",
+                        description=(
+                            f"epic: {epic.id}\n"
+                            f"branch: manager/{bd_issue.id}\n"
+                            f"artifact: breakdowns/{epic.id}.md @ branch manager/{bd_issue.id}\n"
+                            f"idem: {bd_appr_idem}\n"
+                            f"Read breakdowns/{epic.id}.md. Approve via `cto approve` or reject with --comment."
+                        ),
+                        labels=("role:cto", "kind:approval", "target:breakdown"),
+                        priority=1,
+                    ))
 
     # ---- Phase 2: after breakdown merge, ensure plan + plan-review filed.
     if breakdown_merges_closed and not plans:
@@ -293,6 +347,44 @@ def reconcile_epic(
                     priority=2,
                 ),
             ))
+
+    # ---- Phase 2.5: approved plan review → file plan approval or plan merge.
+    closed_approved_plan_reviews = [
+        r for r in plan_reviews
+        if not r.is_open and not r.changes_requested()
+    ]
+    if closed_approved_plan_reviews and not approvals_plan and plans:
+        if epic.is_bypass_cto:
+            plan = plans[-1]
+            pl_merge_idem = idem("file-plan-merge", epic.id, plan.id)
+            if not state.has_idem(pl_merge_idem):
+                actions.append(FileIssue(
+                    title=f"Merge plan: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"branch: task/{plan.id}\n"
+                        f"idem: {pl_merge_idem}\n"
+                        f"Merge task/{plan.id} into epic/{epic.id}, prune sub-worktree."
+                    ),
+                    labels=("role:manager", "kind:merge", "target:plan"),
+                    priority=1,
+                ))
+        else:
+            plan = plans[-1]
+            pl_appr_idem = idem("file-approval-plan", epic.id)
+            if not state.has_idem(pl_appr_idem):
+                actions.append(FileIssue(
+                    title=f"Approve plan: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"branch: task/{plan.id}\n"
+                        f"artifact: plans/{epic.id}.md @ task/{plan.id}\n"
+                        f"idem: {pl_appr_idem}\n"
+                        f"Read plans/{epic.id}.md. Approve via `cto approve` or reject with --comment."
+                    ),
+                    labels=("role:cto", "kind:approval", "target:plan"),
+                    priority=1,
+                ))
 
     # ---- Phase 3: after plan merge, ensure dev + review:code per chunk.
     if plan_merges_closed and not devs:
@@ -409,6 +501,37 @@ def reconcile_epic(
         ))
         actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
 
+    # ---- Phase 5.5: approved code review → file code merge.
+    for upstream_id, revs in by_upstream.items():
+        revs.sort(key=lambda r: _review_round_number(r))
+        latest = revs[-1]
+        if latest.changes_requested():
+            continue
+        merge_key = idem("file-code-merge", epic.id, upstream_id)
+        if state.has_idem(merge_key):
+            continue
+        if any(
+            f"upstream: {upstream_id}" in m.description
+            or f"branch: task/{upstream_id}" in m.description
+            for m in code_merges
+        ):
+            continue
+        dev = state.by_id(upstream_id)
+        if dev is None:
+            continue
+        actions.append(FileIssue(
+            title=f"Merge: {dev.title}",
+            description=(
+                f"epic: {epic.id}\n"
+                f"upstream: {upstream_id}\n"
+                f"branch: task/{upstream_id}\n"
+                f"idem: {merge_key}\n"
+                f"Merge task/{upstream_id} into epic/{epic.id}, prune sub-worktree."
+            ),
+            labels=("role:manager", "kind:merge", "target:code"),
+            priority=1,
+        ))
+
     # ---- Phase 6: ship gate (was supervisor Hook 3, with all guards).
     # We don't gate on "no review ever closed changes-requested" — that's
     # historical state and can be cleared by an approved round-2. The
@@ -431,18 +554,24 @@ def reconcile_epic(
         and not any(em.is_open for em in epic_merges)
     )
     if ship_ready:
-        ship_key = idem("file-epic-merge", epic.id)
-        if not state.has_idem(ship_key):
-            actions.append(FileIssue(
-                title=f"Merge epic: {epic.title}",
-                description=(
-                    f"epic: {epic.id}\n"
-                    f"epic-branch: epic/{epic.id}\n"
-                    f"idem: {ship_key}"
-                ),
-                labels=("role:cto", "kind:merge", "target:epic"),
-                priority=1,
+        if epic.is_bypass_cto and epic.parent_branch != "main":
+            actions.append(AutoMergeEpic(
+                epic_id=epic.id,
+                merge_target=epic.parent_branch,
             ))
+        else:
+            ship_key = idem("file-epic-merge", epic.id)
+            if not state.has_idem(ship_key):
+                actions.append(FileIssue(
+                    title=f"Merge epic: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"epic-branch: epic/{epic.id}\n"
+                        f"idem: {ship_key}"
+                    ),
+                    labels=("role:cto", "kind:merge", "target:epic"),
+                    priority=1,
+                ))
 
     return actions
 
@@ -633,6 +762,10 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
                     ["bd", "close", a.issue_id, "-r", a.reason],
                     check=False, capture_output=True,
                 )
+        elif isinstance(a, AutoMergeEpic):
+            log.append(f"auto-merge: epic/{a.epic_id} into {a.merge_target}")
+            if not dry_run:
+                _auto_merge_epic(a.epic_id, a.merge_target)
     return log
 
 
@@ -659,6 +792,123 @@ def _bd_file(action: FileIssue) -> Optional[str]:
             check=False, capture_output=True,
         )
     return new_id
+
+
+def _auto_merge_epic(epic_id: str, merge_target: str) -> None:
+    """Auto-execute epic merge for bypass-cto epics targeting non-main branches."""
+    tdir = Path(".")
+    epic_branch = f"epic/{epic_id}"
+
+    # Verify epic branch exists.
+    r = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{epic_branch}"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+    if r.returncode != 0:
+        return
+
+    # Verify target branch exists locally or on origin.
+    r = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{merge_target}"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+    if r.returncode != 0:
+        r = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{merge_target}"],
+            cwd=str(tdir), check=False, capture_output=True,
+        )
+        if r.returncode != 0:
+            return
+
+    # Refuse unless main worktree is already on the target branch.
+    head = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=str(tdir), check=False, capture_output=True, text=True,
+    ).stdout.strip()
+    if head != merge_target:
+        return
+
+    # Stash .beads if needed.
+    stashed = False
+    r1 = subprocess.run(
+        ["git", "diff", "--quiet", "--", ".beads"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+    r2 = subprocess.run(
+        ["git", "diff", "--cached", "--quiet", "--", ".beads"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+    if r1.returncode != 0 or r2.returncode != 0:
+        r = subprocess.run(
+            ["git", "stash", "push", "-u", "-m", f"cto-auto-merge-{epic_id}", "--", ".beads"],
+            cwd=str(tdir), check=False, capture_output=True,
+        )
+        if r.returncode == 0:
+            stashed = True
+
+    r = subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", "merge", "--no-ff", epic_branch,
+         "-m", f"merge {epic_branch} into {merge_target}"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+    if r.returncode != 0:
+        if stashed:
+            subprocess.run(
+                ["git", "stash", "pop"], cwd=str(tdir), check=False, capture_output=True,
+            )
+        return
+
+    if stashed:
+        subprocess.run(
+            ["git", "stash", "pop"], cwd=str(tdir), check=False, capture_output=True,
+        )
+
+    # Close any stale open kind:merge target:epic issue.
+    r = subprocess.run(
+        ["bd", "list", "--status", "open", "--label", "kind:merge",
+         "--label", "target:epic", "--json"],
+        cwd=str(tdir), check=False, capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        try:
+            data = json.loads(r.stdout)
+            for item in data:
+                desc = item.get("description", "")
+                if epic_branch in desc or epic_id in desc:
+                    mid = item.get("id")
+                    if mid:
+                        subprocess.run(
+                            ["bd", "comment", mid, "merged by reconciler"],
+                            cwd=str(tdir), check=False, capture_output=True,
+                        )
+                        subprocess.run(
+                            ["bd", "update", mid, "--add-label", "verdict:approved"],
+                            cwd=str(tdir), check=False, capture_output=True,
+                        )
+                        subprocess.run(
+                            ["bd", "close", mid, "-r", "merged by reconciler"],
+                            cwd=str(tdir), check=False, capture_output=True,
+                        )
+        except json.JSONDecodeError:
+            pass
+
+    # Close the epic itself.
+    subprocess.run(
+        ["bd", "close", epic_id, "-r", f"epic merged into {merge_target} by reconciler"],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
+
+    # Prune epic worktree + branch.
+    wt = tdir / ".cto" / "worktrees" / epic_id
+    if wt.is_dir():
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt)],
+            cwd=str(tdir), check=False, capture_output=True,
+        )
+    subprocess.run(
+        ["git", "branch", "-D", epic_branch],
+        cwd=str(tdir), check=False, capture_output=True,
+    )
 
 
 # ---------- Load state from bd ----------

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from reconciler import (  # noqa: E402
     AddLabel,
+    AutoMergeEpic,
     CloseIssue,
     FileIssue,
     FilePair,
@@ -541,3 +542,89 @@ def test_dev_and_code_review_filed_as_blocked_pair_per_chunk():
         assert "kind:dev" in p.upstream.labels
         assert "kind:review" in p.downstream.labels
         assert "target:code" in p.downstream.labels
+
+
+# ---------- Helpers: bypass-cto ----------
+
+def _bypass_epic(id: str = "e1", title: str = "Test epic", parent_branch: str = "main") -> Issue:
+    return Issue(
+        id=id, title=title,
+        description=f"parent_branch: {parent_branch}",
+        status="open",
+        labels=("kind:epic", "role:manager", "class:bypass-cto"),
+    )
+
+
+# ---------- Tests: bypass-cto ----------
+
+def test_bypass_epic_files_breakdown_merge_not_approval():
+    s = _state(
+        _bypass_epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+    )
+    actions = reconcile(s)
+    merges = _file_issues(actions, kind="merge", target="breakdown")
+    approvals = _file_issues(actions, kind="approval", target="breakdown")
+    assert len(merges) == 1
+    assert approvals == []
+    assert "file-breakdown-merge:e1:b1" in merges[0].description
+
+
+def test_bypass_epic_files_plan_merge_not_approval():
+    s = _state(
+        _bypass_epic(),
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pr1", "review", role="reviewer", target="plan",
+               description="epic: e1", status="closed", close_reason="approved"),
+    )
+    actions = reconcile(s)
+    merges = _file_issues(actions, kind="merge", target="plan")
+    approvals = _file_issues(actions, kind="approval", target="plan")
+    assert len(merges) == 1
+    assert approvals == []
+    assert "file-plan-merge:e1:p1" in merges[0].description
+
+
+def test_bypass_epic_targeting_main_files_cto_epic_merge():
+    s = _full_done_state_bypass(parent_branch="main")
+    actions = reconcile(s)
+    epic_merges = _file_issues(actions, kind="merge", target="epic")
+    auto_merges = [a for a in actions if isinstance(a, AutoMergeEpic)]
+    assert len(epic_merges) == 1
+    assert auto_merges == []
+
+
+def test_bypass_epic_targeting_non_main_emits_auto_merge():
+    s = _full_done_state_bypass(parent_branch="develop")
+    actions = reconcile(s)
+    epic_merges = _file_issues(actions, kind="merge", target="epic")
+    auto_merges = [a for a in actions if isinstance(a, AutoMergeEpic)]
+    assert epic_merges == []
+    assert len(auto_merges) == 1
+    assert auto_merges[0].epic_id == "e1"
+    assert auto_merges[0].merge_target == "develop"
+
+
+def _full_done_state_bypass(parent_branch: str = "main", extra: tuple[Issue, ...] = ()):
+    epic = _bypass_epic(parent_branch=parent_branch)
+    base = (
+        epic,
+        _issue("b1", "breakdown", description="epic: e1", status="closed"),
+        _issue("bm1", "merge", target="breakdown",
+               description="epic: e1", status="closed"),
+        _issue("p1", "plan", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("pm1", "merge", target="plan",
+               description="epic: e1", status="closed"),
+        _issue("d1", "dev", role="developer",
+               description="epic: e1", status="closed"),
+        _issue("rc1", "review", role="reviewer", target="code",
+               description="epic: e1\nupstream: d1", status="closed"),
+        _issue("cm1", "merge", target="code",
+               description="epic: e1", status="closed"),
+    )
+    return _state(*base, *extra)

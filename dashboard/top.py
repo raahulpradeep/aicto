@@ -617,12 +617,12 @@ class TopApp(App):
         now = dt.datetime.now(dt.timezone.utc)
 
         prev = getattr(self, "_prev_snapshot", None)
-        if prev is None or prev[0] != agents or prev[4] != running:
-            self.query_one("#agents", Static).update(_agent_panel(agents, running, now))
+        # Always re-render: ELAPSED column is computed from `now` at render time.
+        self.query_one("#agents", Static).update(_agent_panel(agents, running, now))
         if prev is None or prev[1] != inbox:
             self.query_one("#inbox", Static).update(_inbox_panel(inbox))
-        if prev is None or prev[2] != open_tasks:
-            self.query_one("#open", Static).update(_open_panel(open_tasks, now))
+        # Always re-render: AGE column is computed from `now` at render time.
+        self.query_one("#open", Static).update(_open_panel(open_tasks, now))
         if prev is None or prev[3] != closed:
             self.query_one("#closed", Static).update(_closed_panel(closed))
 
