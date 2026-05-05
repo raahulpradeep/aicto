@@ -628,3 +628,113 @@ def _full_done_state_bypass(parent_branch: str = "main", extra: tuple[Issue, ...
                description="epic: e1", status="closed"),
     )
     return _state(*base, *extra)
+
+
+# ---------- Health watchdog tests ----------
+
+import datetime as dt
+
+
+def _issue_with_ts(
+    id: str,
+    kind: str,
+    *,
+    role: str = "manager",
+    target: str | None = None,
+    status: str = "open",
+    description: str = "",
+    title: str | None = None,
+    labels_extra: tuple[str, ...] = (),
+    close_reason: str = "",
+    updated_at: str = "",
+    assignee: str = "",
+) -> Issue:
+    labels = [f"kind:{kind}", f"role:{role}"]
+    if target:
+        labels.append(f"target:{target}")
+    labels.extend(labels_extra)
+    return Issue(
+        id=id,
+        title=title or f"{kind} {id}",
+        description=description,
+        status=status,
+        labels=tuple(labels),
+        close_reason=close_reason,
+        updated_at=updated_at,
+        assignee=assignee,
+    )
+
+
+def test_zombie_issue_gets_unclaimed():
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)).isoformat()
+    epic = _epic()
+    zombie = _issue_with_ts("z1", "dev", role="developer", status="in_progress", updated_at=old, assignee="demo:dev-1")
+    s = _state(epic, zombie)
+    actions = reconcile(s)
+    labels = [a for a in actions if isinstance(a, AddLabel) and a.issue_id == "z1"]
+    reopens = [a for a in actions if isinstance(a, __import__("reconciler", fromlist=["ReopenIssue"]).ReopenIssue) and a.issue_id == "z1"]
+    assert len(labels) == 1
+    assert labels[0].label == "stuck:zombie"
+    assert len(reopens) == 1
+
+
+def test_fresh_in_progress_not_flagged():
+    recent = dt.datetime.now(dt.timezone.utc).isoformat()
+    epic = _epic()
+    fresh = _issue_with_ts("f1", "dev", role="developer", status="in_progress", updated_at=recent, assignee="demo:dev-1")
+    s = _state(epic, fresh)
+    actions = reconcile(s)
+    labels = [a for a in actions if isinstance(a, AddLabel) and a.issue_id == "f1"]
+    assert labels == []
+
+
+def test_review_loop_escalation():
+    epic = _epic()
+    dev = _issue("d1", "dev", role="developer", description="epic: e1", status="closed")
+    reviews = [
+        _issue(f"r{i}", "review", role="reviewer", target="code",
+               description=f"epic: e1\nupstream: d1", status="closed",
+               close_reason="changes-requested")
+        for i in range(1, 5)
+    ]
+    s = _state(epic, dev, *reviews)
+    actions = reconcile(s)
+    esc = [a for a in actions if isinstance(a, FileIssue) and a.title.startswith("Escalation:")]
+    assert len(esc) == 1
+    assert "4 review rounds" in esc[0].description
+
+
+def test_stuck_epic_status_request():
+    old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
+    epic = Issue(
+        id="e1", title="Stuck epic", description="", status="open",
+        labels=("kind:epic", "role:manager"),
+        updated_at=old,
+    )
+    s = _state(epic)
+    actions = reconcile(s)
+    reqs = [a for a in actions if isinstance(a, FileIssue) and a.title.startswith("Status request:")]
+    assert len(reqs) == 1
+    assert "kind:status-request" in reqs[0].labels
+
+
+def test_missing_kind_label_auto_healed():
+    epic = Issue(
+        id="e1", title="Orphan", description="", status="open",
+        labels=("role:manager",), issue_type="epic",
+    )
+    s = _state(epic)
+    actions = reconcile(s)
+    labels = [a for a in actions if isinstance(a, AddLabel)]
+    assert any(a.issue_id == "e1" and a.label == "kind:epic" for a in labels)
+
+
+def test_missing_role_label_auto_healed():
+    epic = Issue(
+        id="e1", title="Orphan", description="", status="open",
+        labels=("kind:epic",), issue_type="epic",
+    )
+    s = _state(epic)
+    actions = reconcile(s)
+    labels = [a for a in actions if isinstance(a, AddLabel)]
+    assert any(a.issue_id == "e1" and a.label == "role:manager" for a in labels)

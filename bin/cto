@@ -398,6 +398,31 @@ EOF
     info "  (existing .beads found in adopted repo — leaving it alone)"
   fi
 
+  # Install a post-commit hook to emit commit_pushed events for telemetry.
+  mkdir -p "$tdir/.git/hooks"
+  cat > "$tdir/.git/hooks/post-commit" <<HOOK
+#!/usr/bin/env bash
+branch=\$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+hash=\$(git rev-parse HEAD)
+msg=\$(git log -1 --pretty=%s)
+author=\$(git log -1 --pretty=%an)
+python3 - "\$branch" "\$hash" "\$msg" "\$author" <<'PY'
+import json, datetime, sys
+branch, hash, msg, author = sys.argv[1:5]
+event = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "event": "commit_pushed",
+    "branch": branch,
+    "commit_hash": hash,
+    "message": msg,
+    "author": author,
+}
+with open("$tdir/.cto/activity.jsonl", "a") as f:
+    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+PY
+HOOK
+  chmod +x "$tdir/.git/hooks/post-commit"
+
   render_prompts "$name"
 
   git -C "$tdir" add -A
@@ -1175,9 +1200,18 @@ AGENT="$TEAM:$SLOT"
 
 LOCKS="$TEAM_DIR/.cto/locks"
 mkdir -p "$LOCKS"
+mkdir -p "$TEAM_DIR/.cto/logs"
+
+AGENT_LOG="$TEAM_DIR/.cto/logs/$AGENT.log"
 
 ts() { date '+%H:%M:%S'; }
 log() { printf '[%s %s] %s\n' "$(ts)" "$AGENT" "$*"; }
+
+telemetry_emit() {
+  local event_type="$1"; shift
+  python3 "$TEAM_DIR/.cto/telemetry_helper.py" \
+    "$TEAM_DIR/.cto/activity.jsonl" "$event_type" "$@" 2>/dev/null || true
+}
 
 release_claim() {
   local id="$1"
@@ -1275,6 +1309,9 @@ while :; do
     *) log "unknown role: $ROLE"; exit 2 ;;
   esac
 
+  iter_start_ms=$(date +%s%3N)
+  telemetry_emit agent_iteration_start --kv "agent=$AGENT" --kv "task_id=${task_id:-}"
+
   if [[ "$AGENT_PROVIDER" == "kimi" ]]; then
     log "invoking kimi (task=${task_id:-none})"
     mcp_args=()
@@ -1288,7 +1325,7 @@ while :; do
       --prompt "$starter" \
       --work-dir "$TEAM_DIR" \
       ${mcp_args[@]+"${mcp_args[@]}"} \
-      2> >(tee "$err" >&2)
+      2> >(tee -a "$AGENT_LOG" "$err" >&2)
     rc=$?
   elif [[ "$AGENT_PROVIDER" == "codex" ]]; then
     log "invoking codex (task=${task_id:-none})"
@@ -1307,7 +1344,7 @@ $starter"
       --workdir "$TEAM_DIR" \
       "${codex_args[@]}" \
       "$full_prompt" \
-      2> >(tee "$err" >&2)
+      2> >(tee -a "$AGENT_LOG" "$err" >&2)
     rc=$?
   else
     log "invoking claude (task=${task_id:-none})"
@@ -1321,7 +1358,7 @@ $starter"
       --model "$MODEL" \
       --append-system-prompt "$(cat "$ROLE_FILE")" \
       "$starter" \
-      2> >(tee "$err" >&2) \
+      2> >(tee -a "$AGENT_LOG" "$err" >&2) \
     | jq -r --unbuffered '
         . as $e |
         if $e.type == "assistant" then
@@ -1339,6 +1376,25 @@ $starter"
         else empty end
       ' 2>/dev/null
     rc=${PIPESTATUS[0]}
+  fi
+
+  iter_end_ms=$(date +%s%3N)
+  iter_dur=$((iter_end_ms - iter_start_ms))
+  telemetry_emit agent_iteration_end \
+    --kv "agent=$AGENT" \
+    --kv "task_id=${task_id:-}" \
+    --kv "exit_code=$rc" \
+    --kv "duration_ms=$iter_dur"
+  # Capture last 20 lines of stderr for the activity stream.
+  output_preview=""
+  if [[ -s "$err" ]]; then
+    output_preview=$(tail -n 20 "$err" 2>/dev/null | tr '\n' ' ' | head -c 2000)
+  fi
+  if [[ -n "$output_preview" ]]; then
+    telemetry_emit agent_output \
+      --kv "agent=$AGENT" \
+      --kv "task_id=${task_id:-}" \
+      --kv "output=$output_preview"
   fi
 
   if (( rc != 0 )); then
@@ -1372,6 +1428,32 @@ $starter"
 done
 OUTER
   chmod +x "$launcher"
+
+  # Generate a self-contained telemetry helper so the supervisor can emit
+  # workflow events without depending on external Python modules.
+  cat > "$tdir/.cto/telemetry_helper.py" <<'PYEOF'
+#!/usr/bin/env python3
+import json, datetime, sys, argparse
+
+p = argparse.ArgumentParser()
+p.add_argument("log_path")
+p.add_argument("event_type")
+p.add_argument("--kv", action="append", default=[], metavar="KEY=VALUE")
+args = p.parse_args()
+
+event = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "event": args.event_type,
+}
+for kv in args.kv:
+    if "=" in kv:
+        k, v = kv.split("=", 1)
+        event[k] = v
+
+with open(args.log_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+PYEOF
+  chmod +x "$tdir/.cto/telemetry_helper.py"
 
   # Spawn one tmux window per agent slot.
   # For kimi teams, pass the .yaml agent spec; for claude, the .md prompt.
@@ -1571,12 +1653,23 @@ cmd_worktrees() {
 
 cmd_top() {
   require_cmd uv
-  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/top.py" "$@"
+  local legacy=0
+  while (( $# )); do
+    case "$1" in
+      --legacy) legacy=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  if (( legacy )); then
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/top.py"
+  else
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py"
+  fi
 }
 
 cmd_review() {
   require_cmd uv
-  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/cmdcenter.py" "$@"
+  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py" "$@"
 }
 
 # ---- exec ----------------------------------------------------------------

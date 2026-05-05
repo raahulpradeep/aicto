@@ -128,7 +128,9 @@ Run `bin/cto help` for a full list. Common ones:
 | `cto attach <n> [<window>]` | drop into the tmux session |
 | `cto status [<n>]` | bd snapshot + tmux state |
 | `cto update <n> [--fresh]` | latest manager status digest |
-| `cto top` | live `top`-style dashboard: every agent across every running team + the CTO inbox; refresh ~1s; quit with `q` |
+| `cto top` | unified interactive dashboard: agents, inbox, epic pipeline, activity stream, open tasks; approve/reject inline; quit with `q` |
+| `cto top --legacy` | old read-only `top`-style dashboard (fallback) |
+| `cto review` | same as `cto top` — opens the unified dashboard |
 | `cto worktrees <n>` / `cto worktrees prune <n>` | list / GC per-task worktrees |
 | `cto exec <n> -- <cmd…>` | escape hatch: run a command in the team's main worktree |
 
@@ -147,6 +149,39 @@ model: sonnet
 
 Edit via `cto config <n> --developers 3 --reviewers 2 --container-use on`.
 After config changes, `cto restart <n>` to apply.
+
+## Dashboard
+
+`cto top` launches the unified dashboard. Layout:
+
+- **Agents** (top-left) — working/idle status, elapsed time, provider, model
+- **CTO Inbox** (top-right) — open `role:cto` issues across all teams; press `a` to approve, `r` to reject
+- **Epic Pipeline** (middle-left) — swimlane per open epic showing Breakdown → Plan → Dev → Review → Merge → Ship
+- **Activity Stream** (middle-right) — live feed of workflow events (claims, merges, commits, approvals)
+- **Open Tasks** (bottom) — unclaimed work sorted by priority + age
+
+Keyboard shortcuts:
+
+| key | action |
+|---|---|
+| `q` | quit |
+| `a` | approve selected inbox item |
+| `r` | reject selected inbox item |
+| `Enter` | drill down into selected epic/agent |
+
+The dashboard fires desktop notifications on:
+- new CTO inbox arrivals
+- agent crashes
+- review-loop escalations (>3 rounds)
+
+## Health Watchdog
+
+The reconciler now runs a health check **before** each workflow tick. It silently auto-heals:
+
+- **Zombie issues** — auto-unclaims issues stuck `in_progress` for >15 minutes
+- **Missing labels** — re-applies dropped workflow labels (`kind:epic`, `role:manager`, etc.)
+- **Stuck epics** — files a `kind:status-request` if an epic has been idle for >1 hour
+- **Review loops** — escalates to CTO inbox when a dev goes through >3 review rounds
 
 ## Caveats
 

@@ -21,7 +21,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 
 # ---------- Domain types ----------
@@ -36,6 +36,8 @@ class Issue:
     close_reason: str = ""
     issue_type: str = ""
     created_at: str = ""
+    updated_at: str = ""
+    assignee: str = ""
 
     @property
     def kind(self) -> Optional[str]:
@@ -628,8 +630,114 @@ def _reconcile_leaks(state: State) -> list[Action]:
     return actions
 
 
+def _reconcile_health(state: State) -> list[Action]:
+    """Detect and auto-heal stuck/broken/orphaned state.
+
+    Runs before normal workflow transitions. Emits healing actions
+    silently; only review-loop escalations surface to the CTO inbox.
+    """
+    actions: list[Action] = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # H1: Zombie issue detection — in_progress for >15 min with no updates.
+    for issue in state.issues:
+        if issue.status != "in_progress":
+            continue
+        ts_str = issue.updated_at or issue.created_at
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (now - ts).total_seconds()
+        except ValueError:
+            continue
+        if age > 900:  # 15 minutes
+            # Auto-unclaim silently.
+            actions.append(AddLabel(issue.id, "stuck:zombie"))
+            actions.append(
+                # Reopen to clear in_progress status.
+                ReopenIssue(issue.id, "auto-heal: zombie detected, resetting claim")
+            )
+            _emit_event(
+                "stuck_detected",
+                issue_id=issue.id,
+                reason="zombie (>15m in_progress)",
+                auto_heal_action="unclaim",
+            )
+
+    # H2: Changes-requested loop detection — >3 review rounds per dev.
+    devs = [i for i in state.issues if i.kind == "dev"]
+    for dev in devs:
+        reviews = [
+            r for r in state.issues
+            if r.kind == "review" and r.target == "code"
+            and _upstream_of_review(r, state) == dev.id
+        ]
+        if len(reviews) > 3:
+            # File a CTO escalation (only once per dev).
+            esc_idem = idem("escalate-review-loop", dev.id)
+            if not state.has_idem(esc_idem):
+                actions.append(FileIssue(
+                    title=f"Escalation: {dev.title} stuck in review loop",
+                    description=(
+                        f"epic: {dev.linked_epic() or ''}\n"
+                        f"dev: {dev.id}\n"
+                        f"idem: {esc_idem}\n"
+                        f"This dev has gone through {len(reviews)} review rounds. "
+                        f"Consider manual intervention or merging with known issues."
+                    ),
+                    labels=("role:cto", "kind:escalation"),
+                    priority=1,
+                ))
+
+    # H5: Missing label detection (extends _reconcile_leaks).
+    for issue in state.issues:
+        if issue.issue_type == "epic" and issue.kind != "epic":
+            actions.append(AddLabel(issue.id, "kind:epic"))
+        if issue.kind == "epic" and issue.role != "manager":
+            actions.append(AddLabel(issue.id, "role:manager"))
+        if issue.kind in ("dev", "plan") and not issue.role:
+            actions.append(AddLabel(issue.id, "role:developer"))
+        if issue.kind == "review" and not issue.role:
+            actions.append(AddLabel(issue.id, "role:reviewer"))
+
+    # H6: Stuck epic detection — no children, no activity for >1h.
+    for epic in state.epics():
+        if not epic.is_open:
+            continue
+        children = state.children_of(epic.id)
+        if children:
+            continue
+        ts_str = epic.updated_at or epic.created_at
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (now - ts).total_seconds()
+        except ValueError:
+            continue
+        if age > 3600:  # 1 hour
+            req_idem = idem("status-request-stuck", epic.id)
+            if not state.has_idem(req_idem):
+                actions.append(FileIssue(
+                    title=f"Status request: {epic.title}",
+                    description=(
+                        f"epic: {epic.id}\n"
+                        f"idem: {req_idem}\n"
+                        f"Epic has been idle for {int(age//60)} minutes. "
+                        f"Please provide a fresh status digest."
+                    ),
+                    labels=("role:manager", "kind:status-request"),
+                    priority=2,
+                ))
+
+    return actions
+
+
 def reconcile(state: State, plan_chunks_for=None) -> list[Action]:
     out: list[Action] = []
+    # Phase 0: health check / auto-heal
+    out.extend(_reconcile_health(state))
     for epic in state.epics():
         if not epic.is_open:
             continue
@@ -702,9 +810,27 @@ def parse_plan_chunks(epic_id: str, root: Optional[Path] = None) -> list[tuple[s
     return []
 
 
+# ---------- Telemetry helpers ----------
+
+def _emit_event(event_type: str, **kwargs: Any) -> None:
+    """Best-effort event emission via the team's telemetry helper."""
+    helper = Path(".cto/telemetry_helper.py")
+    if not helper.exists():
+        return
+    kvs = []
+    for k, v in kwargs.items():
+        kvs.append(f"--kv={k}={v}")
+    subprocess.run(
+        [sys.executable, str(helper), str(Path(".cto/activity.jsonl")), event_type, *kvs],
+        capture_output=True,
+    )
+
+
 # ---------- Execute (live bd calls) ----------
 
 def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
+    import time
+    t0 = time.monotonic()
     log: list[str] = []
     for a in actions:
         if isinstance(a, FileIssue):
@@ -766,6 +892,9 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
             log.append(f"auto-merge: epic/{a.epic_id} into {a.merge_target}")
             if not dry_run:
                 _auto_merge_epic(a.epic_id, a.merge_target)
+    if not dry_run:
+        dur_ms = int((time.monotonic() - t0) * 1000)
+        _emit_event("reconciler_tick", actions=";".join(log), duration_ms=str(dur_ms))
     return log
 
 
@@ -786,11 +915,29 @@ def _bd_file(action: FileIssue) -> Optional[str]:
         if "-" in tok and tok.replace("-", "").isalnum():
             new_id = tok
             break
-    if new_id and action.blocks:
-        subprocess.run(
-            ["bd", "dep", new_id, "--blocks", action.blocks],
-            check=False, capture_output=True,
+    if new_id:
+        epic_id = ""
+        m = re.search(r"^epic:\s*(\S+)\s*$", action.description, re.MULTILINE)
+        if m:
+            epic_id = m.group(1)
+        kind = ""
+        for lbl in action.labels:
+            if lbl.startswith("kind:"):
+                kind = lbl.split(":", 1)[1]
+                break
+        _emit_event(
+            "issue_created",
+            issue_id=new_id,
+            kind=kind,
+            title=action.title,
+            labels=",".join(action.labels),
+            epic_id=epic_id,
         )
+        if action.blocks:
+            subprocess.run(
+                ["bd", "dep", new_id, "--blocks", action.blocks],
+                check=False, capture_output=True,
+            )
     return new_id
 
 
@@ -910,6 +1057,14 @@ def _auto_merge_epic(epic_id: str, merge_target: str) -> None:
         cwd=str(tdir), check=False, capture_output=True,
     )
 
+    _emit_event(
+        "merge_executed",
+        branch=epic_branch,
+        target=merge_target,
+        epic_id=epic_id,
+        commit_hash="",
+    )
+
 
 # ---------- Load state from bd ----------
 
@@ -946,6 +1101,9 @@ def load_state() -> State:
                            or raw.get("issueType", ""),
                 created_at=raw.get("created_at", "")
                            or raw.get("createdAt", ""),
+                updated_at=raw.get("updated_at", "")
+                           or raw.get("updatedAt", ""),
+                assignee=raw.get("assignee", ""),
             )
     return State(issues=tuple(seen.values()))
 
