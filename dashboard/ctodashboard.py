@@ -283,11 +283,11 @@ def gather():
 # ---- panel builders (copied from top.py) ----------------------------------
 
 
-def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Panel:
+def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime, has_focus: bool = False) -> Panel:
     if not running:
         return Panel(
             Text("no running teams — start one with `bin/cto start <team>`", style="dim", justify="center"),
-            title="Agents (0)", border_style="dim",
+            title="Agents (0)", border_style="bright_cyan" if has_focus else "dim",
         )
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
@@ -321,10 +321,10 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
                 Text(model, style=row_style), Text("idle", style="dim"),
                 Text("—", style="dim"), Text("—", style="dim"),
             )
-    return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")
+    return Panel(t, title=f"Agents ({len(agents)})", border_style="bright_cyan" if has_focus else "cyan")
 
 
-def _inbox_panel(inbox: list[dict]) -> Panel:
+def _inbox_panel(inbox: list[dict], selected_index: int = 0, has_focus: bool = False) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
     t.add_column("ID", overflow="ellipsis", no_wrap=True)
@@ -332,10 +332,11 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
     t.add_column("ARTIFACT", no_wrap=False, ratio=2)
     t.add_column("LABELS", overflow="ellipsis", no_wrap=True, ratio=1)
     if inbox:
-        for row in inbox:
+        for idx, row in enumerate(inbox):
             stale = row.get("stale", False)
             team_disp = ("~" if stale else "") + row["team"]
-            row_style = "dim" if stale else ""
+            selected = has_focus and idx == selected_index
+            row_style = "reverse" if selected else ("dim" if stale else "")
             labels = ",".join(lbl for lbl in row.get("labels", []) if not lbl.startswith("role:cto"))
             artifact = _resolve_artifact_path(row.get("description", ""), row["team"], row.get("labels", []))
             t.add_row(
@@ -350,10 +351,11 @@ def _inbox_panel(inbox: list[dict]) -> Panel:
             Text("(nothing waiting on the CTO)", style="dim"),
             Text("—", style="dim"), Text("—", style="dim"),
         )
-    return Panel(t, title=f"CTO inbox ({len(inbox)})", border_style="magenta" if inbox else "dim")
+    border = "bright_magenta" if has_focus else ("magenta" if inbox else "dim")
+    return Panel(t, title=f"CTO inbox ({len(inbox)})", border_style=border)
 
 
-def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
+def _open_panel(open_tasks: list[dict], now: dt.datetime, has_focus: bool = False) -> Panel:
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("TEAM", overflow="ellipsis", no_wrap=True)
     t.add_column("ID", overflow="ellipsis", no_wrap=True)
@@ -383,7 +385,7 @@ def _open_panel(open_tasks: list[dict], now: dt.datetime) -> Panel:
             Text("(no open tasks)", style="dim"),
             Text("—", style="dim"), Text("—", style="dim"),
         )
-    return Panel(t, title=f"Open tasks ({len(open_tasks)})", border_style="blue" if open_tasks else "dim")
+    return Panel(t, title=f"Open tasks ({len(open_tasks)})", border_style="bright_blue" if has_focus else ("blue" if open_tasks else "dim"))
 
 
 # ---- modals ---------------------------------------------------------------
@@ -561,6 +563,9 @@ class DashboardApp(App):
         ("a", "approve", "Approve"),
         ("r", "reject", "Reject"),
         ("enter", "drill_down", "Drill down"),
+        ("up", "cursor_up", "Up"),
+        ("down", "cursor_down", "Down"),
+        ("tab", "focus_next", "Next panel"),
     ]
 
     snapshot = reactive(None)
@@ -572,13 +577,13 @@ class DashboardApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
-            yield Static("", id="agents")
-            yield Static("", id="inbox")
+            yield Static("", id="agents", can_focus=True)
+            yield Static("", id="inbox", can_focus=True)
         with Horizontal(id="mid"):
             yield EpicPipeline(id="pipeline")
             yield ActivityStream(id="activity")
         with Horizontal(id="bottom"):
-            yield Static("", id="open")
+            yield Static("", id="open", can_focus=True)
         yield Static("", id="footer")
 
     def on_mount(self) -> None:
@@ -619,10 +624,15 @@ class DashboardApp(App):
         now = dt.datetime.now(dt.timezone.utc)
 
         prev = getattr(self, "_prev_snapshot", None)
-        self.query_one("#agents", Static).update(_agent_panel(agents, running, now))
-        if prev is None or prev[1] != inbox:
-            self.query_one("#inbox", Static).update(_inbox_panel(inbox))
-        self.query_one("#open", Static).update(_open_panel(open_tasks, now))
+
+        focused = self.app.focused
+        agents_focus = focused is not None and focused.id == "agents"
+        inbox_focus = focused is not None and focused.id == "inbox"
+        open_focus = focused is not None and focused.id == "open"
+
+        self.query_one("#agents", Static).update(_agent_panel(agents, running, now, has_focus=agents_focus))
+        self.query_one("#inbox", Static).update(_inbox_panel(inbox, selected_index=self.selected_inbox_index, has_focus=inbox_focus))
+        self.query_one("#open", Static).update(_open_panel(open_tasks, now, has_focus=open_focus))
 
         self._prev_snapshot = snapshot
 
@@ -635,8 +645,8 @@ class DashboardApp(App):
         if not teams_summary:
             teams_summary = "—"
         text = Text(
-            f"q quit · a approve · r reject · enter drill-down · {indicator} · "
-            f"gather {self.gather_ms}ms · teams: {teams_summary} · {ts}",
+            f"q quit · tab focus · ↑↓ navigate · enter drill-down · a approve · r reject · "
+            f"{indicator} · gather {self.gather_ms}ms · teams: {teams_summary} · {ts}",
             style="dim", justify="center",
         )
         self.query_one("#footer", Static).update(text)
@@ -699,17 +709,57 @@ class DashboardApp(App):
             self.poll_data()
 
     def action_drill_down(self) -> None:
-        # Drill down into epic pipeline or agent detail depending on focus.
-        # For now, if there are inbox items, open the selected one.
-        # Future: detect which panel has focus.
-        if self.inbox_items:
-            item = self.inbox_items[self.selected_inbox_index]
-            self.push_screen(EpicDetailScreen({
-                "team": item["team"],
-                "epic_id": item.get("id", ""),
-                "title": item.get("title", ""),
-                "stages": {},
-            }))
+        focused = self.app.focused
+        if focused is None:
+            return
+
+        fid = focused.id
+
+        # Epic Pipeline → epic detail
+        if fid == "pipeline":
+            epic = focused.selected_epic() if hasattr(focused, "selected_epic") else None
+            if epic:
+                self.push_screen(EpicDetailScreen(epic))
+            return
+
+        # Agents panel → agent detail (first agent for now)
+        if fid == "agents":
+            snapshot = self.snapshot
+            if snapshot:
+                agents = snapshot[0]
+                if agents:
+                    self.push_screen(AgentDetailScreen(agents[0]))
+            return
+
+        # Inbox panel → approve/reject for selected item
+        if fid == "inbox":
+            if self.inbox_items:
+                item = self.inbox_items[self.selected_inbox_index]
+                self.push_screen(EpicDetailScreen({
+                    "team": item["team"],
+                    "epic_id": item.get("id", ""),
+                    "title": item.get("title", ""),
+                    "stages": {},
+                }))
+            return
+
+    def action_cursor_up(self) -> None:
+        focused = self.app.focused
+        if focused and focused.id == "inbox":
+            self.selected_inbox_index = max(0, self.selected_inbox_index - 1)
+        elif focused and focused.id == "pipeline":
+            focused.selected_index = max(0, focused.selected_index - 1)
+
+    def action_cursor_down(self) -> None:
+        focused = self.app.focused
+        if focused and focused.id == "inbox":
+            self.selected_inbox_index = min(len(self.inbox_items) - 1, self.selected_inbox_index + 1)
+        elif focused and focused.id == "pipeline":
+            max_idx = len(focused.pipelines) - 1 if hasattr(focused, "pipelines") else 0
+            focused.selected_index = min(max_idx, focused.selected_index + 1)
+
+    def action_focus_next(self) -> None:
+        self.screen.focus_next()
 
 
 def main() -> int:

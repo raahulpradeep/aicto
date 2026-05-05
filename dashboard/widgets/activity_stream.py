@@ -24,53 +24,69 @@ from dashboard.telemetry import ActivityLog  # noqa: E402
 
 
 class ActivityStream(Static):
-    """Rich widget that renders the last N workflow events."""
+    """Rich widget that renders the last N workflow events.
+
+    All I/O is done in a background worker so the Textual event loop
+    never stalls — this prevents the screen from blanking.
+    """
 
     events = reactive[list[dict[str, Any]]]([])
+    can_focus = True
 
     def __init__(self, *args, limit: int = 20, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.limit = limit
 
     def on_mount(self) -> None:
-        self.refresh_events()
-        self.set_interval(2, self.refresh_events)
+        self.run_worker(self._refresh_worker, thread=True)
+        self.set_interval(2, lambda: self.run_worker(self._refresh_worker, thread=True))
 
-    def refresh_events(self) -> None:
+    def _refresh_worker(self) -> None:
         all_events: list[tuple[dt.datetime, dict[str, Any]]] = []
-        if TEAMS_DIR.is_dir():
-            for team_dir in sorted(TEAMS_DIR.iterdir()):
-                if not (team_dir / ".cto").is_dir():
-                    continue
-                log = ActivityLog(team_dir)
-                for ev in log.tail(n=self.limit):
-                    try:
-                        ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
-                    except (KeyError, ValueError):
+        try:
+            if TEAMS_DIR.is_dir():
+                for team_dir in sorted(TEAMS_DIR.iterdir()):
+                    if not (team_dir / ".cto").is_dir():
                         continue
-                    all_events.append((ts, ev))
-        all_events.sort(key=lambda x: x[0], reverse=True)
-        self.events = [ev for _, ev in all_events[: self.limit]]
+                    log = ActivityLog(team_dir)
+                    for ev in log.tail(n=self.limit):
+                        try:
+                            ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
+                        except (KeyError, ValueError):
+                            continue
+                        all_events.append((ts, ev))
+            all_events.sort(key=lambda x: x[0], reverse=True)
+            new_events = [ev for _, ev in all_events[: self.limit]]
+        except Exception:
+            new_events = []
+        self.app.call_from_thread(self._set_events, new_events)
+
+    def _set_events(self, new_events: list[dict[str, Any]]) -> None:
+        self.events = new_events
 
     def render(self) -> Panel:
-        t = Table(expand=True, show_header=False, show_lines=False, pad_edge=False)
-        t.add_column("TIME", overflow="ellipsis", no_wrap=True, width=8)
-        t.add_column("EVENT", overflow="ellipsis", no_wrap=True, ratio=1)
+        try:
+            t = Table(expand=True, show_header=False, show_lines=False, pad_edge=False)
+            t.add_column("TIME", overflow="ellipsis", no_wrap=True, width=8)
+            t.add_column("EVENT", overflow="ellipsis", no_wrap=True, ratio=1)
 
-        for ev in self.events:
-            ts_str = ""
-            try:
-                ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
-                ts_str = ts.astimezone().strftime("%H:%M:%S")
-            except (KeyError, ValueError):
-                pass
-            text = _format_event(ev)
-            t.add_row(Text(ts_str, style="dim"), text)
+            for ev in self.events:
+                ts_str = ""
+                try:
+                    ts = dt.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
+                    ts_str = ts.astimezone().strftime("%H:%M:%S")
+                except (KeyError, ValueError):
+                    pass
+                text = _format_event(ev)
+                t.add_row(Text(ts_str, style="dim"), text)
 
-        if not self.events:
-            t.add_row(Text("—", style="dim"), Text("(no activity yet)", style="dim"))
+            if not self.events:
+                t.add_row(Text("—", style="dim"), Text("(no activity yet)", style="dim"))
 
-        return Panel(t, title=f"Activity ({len(self.events)})", border_style="bright_blue")
+            border = "bright_blue" if self.has_focus else "blue"
+            return Panel(t, title=f"Activity ({len(self.events)})", border_style=border)
+        except Exception:
+            return Panel("(error rendering activity)", title="Activity", border_style="red")
 
 
 def _format_event(ev: dict[str, Any]) -> Text:

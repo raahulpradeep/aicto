@@ -61,70 +61,98 @@ def _human_age(seconds: int) -> str:
 
 
 class EpicPipeline(Static):
-    """Rich widget showing epic swimlanes."""
+    """Rich widget showing epic swimlanes.
+
+    All bd I/O is done in a background worker so the Textual event loop
+    never stalls — this prevents the screen from blanking.
+    """
 
     pipelines = reactive[list[dict[str, Any]]]([])
+    selected_index = reactive(0)
+    can_focus = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
     def on_mount(self) -> None:
-        self.refresh_pipelines()
-        self.set_interval(5, self.refresh_pipelines)
+        self.run_worker(self._refresh_worker, thread=True)
+        self.set_interval(5, lambda: self.run_worker(self._refresh_worker, thread=True))
 
-    def refresh_pipelines(self) -> None:
+    def _refresh_worker(self) -> None:
         pipes: list[dict[str, Any]] = []
-        if not TEAMS_DIR.is_dir():
-            self.pipelines = pipes
-            return
+        try:
+            if TEAMS_DIR.is_dir():
+                teams = [p for p in sorted(TEAMS_DIR.iterdir()) if (p / ".cto").is_dir()]
+                futures = {t.name: _POOL.submit(_gather_team_pipelines, t) for t in teams}
+                for team_name, fut in futures.items():
+                    try:
+                        result = fut.result(timeout=10.0)
+                        pipes.extend(result)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self.app.call_from_thread(self._set_pipelines, pipes)
 
-        teams = [p for p in sorted(TEAMS_DIR.iterdir()) if (p / ".cto").is_dir()]
-        futures = {t.name: _POOL.submit(_gather_team_pipelines, t) for t in teams}
-        for team_name, fut in futures.items():
-            try:
-                result = fut.result(timeout=10.0)
-                pipes.extend(result)
-            except Exception:
-                pass
+    def _set_pipelines(self, pipes: list[dict[str, Any]]) -> None:
         self.pipelines = pipes
+        if self.selected_index >= len(self.pipelines):
+            self.selected_index = max(0, len(self.pipelines) - 1)
 
     def render(self) -> Panel:
-        t = Table(
-            expand=True,
-            show_lines=False,
-            header_style="bold",
-            pad_edge=False,
-        )
-        t.add_column("TEAM", overflow="ellipsis", no_wrap=True, width=10)
-        t.add_column("EPIC", overflow="ellipsis", no_wrap=True, ratio=2)
-        t.add_column("BRKDN", justify="center", width=7)
-        t.add_column("PLAN", justify="center", width=7)
-        t.add_column("DEV", justify="center", width=7)
-        t.add_column("REVIEW", justify="center", width=7)
-        t.add_column("MERGE", justify="center", width=7)
-        t.add_column("SHIP", justify="center", width=7)
-        t.add_column("AGE", justify="right", width=6)
-
-        now = dt.datetime.now(dt.timezone.utc)
-        for pipe in self.pipelines:
-            row = _render_pipeline_row(pipe, now)
-            t.add_row(*row)
-
-        if not self.pipelines:
-            t.add_row(
-                Text("—", style="dim"),
-                Text("(no open epics)", style="dim"),
-                *[Text("—", style="dim")] * 7,
+        try:
+            t = Table(
+                expand=True,
+                show_lines=False,
+                header_style="bold",
+                pad_edge=False,
             )
+            t.add_column("TEAM", overflow="ellipsis", no_wrap=True, width=10)
+            t.add_column("EPIC", overflow="ellipsis", no_wrap=True, ratio=2)
+            t.add_column("BRKDN", justify="center", width=7)
+            t.add_column("PLAN", justify="center", width=7)
+            t.add_column("DEV", justify="center", width=7)
+            t.add_column("REVIEW", justify="center", width=7)
+            t.add_column("MERGE", justify="center", width=7)
+            t.add_column("SHIP", justify="center", width=7)
+            t.add_column("AGE", justify="right", width=6)
 
-        return Panel(
-            t,
-            title=f"Epic Pipeline ({len(self.pipelines)})",
-            border_style="bright_green",
-        )
+            now = dt.datetime.now(dt.timezone.utc)
+            for idx, pipe in enumerate(self.pipelines):
+                row = _render_pipeline_row(pipe, now, selected=(idx == self.selected_index))
+                t.add_row(*row)
+
+            if not self.pipelines:
+                t.add_row(
+                    Text("—", style="dim"),
+                    Text("(no open epics)", style="dim"),
+                    *[Text("—", style="dim")] * 7,
+                )
+
+            border = "bright_green" if self.has_focus else "green"
+            return Panel(
+                t,
+                title=f"Epic Pipeline ({len(self.pipelines)})",
+                border_style=border,
+            )
+        except Exception:
+            return Panel("(error rendering pipeline)", title="Epic Pipeline", border_style="red")
+
+    def on_key(self, event) -> None:
+        if not self.pipelines:
+            return
+        if event.key == "up":
+            self.selected_index = max(0, self.selected_index - 1)
+        elif event.key == "down":
+            self.selected_index = min(len(self.pipelines) - 1, self.selected_index + 1)
+
+    def selected_epic(self) -> dict[str, Any] | None:
+        if not self.pipelines or self.selected_index >= len(self.pipelines):
+            return None
+        return self.pipelines[self.selected_index]
 
 
-def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime) -> list[Text]:
+def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime, selected: bool = False) -> list[Text]:
     team = pipe["team"]
     epic_title = pipe["title"][:30]
     stages = pipe["stages"]
@@ -132,10 +160,11 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime) -> list[Text]:
     created = _parse_iso(pipe.get("created_at", ""))
     age = _human_age(int((now - created).total_seconds())) if created else "—"
 
+    row_style = "reverse" if selected else ""
+
     def cell(stage: str) -> Text:
         s = stages.get(stage, {"status": "none"})
         status = s["status"]
-        assignee = s.get("assignee", "")
         if status == "done":
             return Text("✓", style="green")
         if status == "active":
@@ -147,8 +176,8 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime) -> list[Text]:
         return Text("—", style="dim")
 
     return [
-        Text(team, style="cyan"),
-        Text(epic_title, style="white"),
+        Text(team, style="cyan" + (" reverse" if selected else "")),
+        Text(epic_title, style="white" + (" reverse" if selected else "")),
         cell("breakdown"),
         cell("plan"),
         cell("dev"),
@@ -223,7 +252,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     merges = [c for c in children if "kind:merge" in (c.get("labels") or [])]
     epic_merges = [c for c in children if "kind:merge" in (c.get("labels") or []) and "target:epic" in (c.get("labels") or [])]
 
-    # Breakdown stage
     if any(c.get("status") == "closed" for c in breakdowns):
         stages["breakdown"]["status"] = "done"
     elif any(c.get("status") in ("open", "in_progress") for c in breakdowns):
@@ -231,7 +259,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     else:
         stages["breakdown"]["status"] = "pending"
 
-    # Plan stage
     plan_merges = [c for c in merges if "target:plan" in (c.get("labels") or [])]
     if any(c.get("status") == "closed" for c in plan_merges):
         stages["plan"]["status"] = "done"
@@ -240,7 +267,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     elif stages["breakdown"]["status"] == "done":
         stages["plan"]["status"] = "pending"
 
-    # Dev stage
     code_merges = [c for c in merges if "target:code" in (c.get("labels") or [])]
     if any(c.get("status") == "closed" for c in code_merges):
         stages["dev"]["status"] = "done"
@@ -249,7 +275,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     elif stages["plan"]["status"] == "done":
         stages["dev"]["status"] = "pending"
 
-    # Review stage
     if any(c.get("status") == "closed" and "changes-requested" not in (c.get("close_reason", "") or "") for c in reviews):
         stages["review"]["status"] = "done"
     elif any(c.get("status") in ("open", "in_progress") for c in reviews):
@@ -257,7 +282,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     elif stages["dev"]["status"] == "done":
         stages["review"]["status"] = "pending"
 
-    # Merge stage (sub-merges)
     if all(stages[s]["status"] == "done" for s in ("breakdown", "plan", "dev", "review")):
         if code_merges and all(c.get("status") == "closed" for c in code_merges):
             stages["merge"]["status"] = "done"
@@ -266,7 +290,6 @@ def _compute_stages(children: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         else:
             stages["merge"]["status"] = "pending"
 
-    # Ship stage
     if epic_merges and any(c.get("status") == "closed" for c in epic_merges):
         stages["ship"]["status"] = "done"
     elif epic_merges and any(c.get("status") in ("open", "in_progress") for c in epic_merges):
