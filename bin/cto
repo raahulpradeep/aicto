@@ -310,7 +310,8 @@ Usage:
   cto status [<team>]
   cto update <team> [--fresh]
   cto reconciler-sync <team> [--force]
-  cto top                                   # live top-style dashboard
+  cto top                                   # live top-style dashboard (v2)
+  cto dashboard [--legacy]                  # launch the event-driven dashboard
 
   cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into its parent branch
   cto worktrees <team>
@@ -1740,7 +1741,27 @@ cmd_top() {
 
 cmd_review() {
   require_cmd uv
-  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py" "$@"
+  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py" "$@"
+}
+
+# ---- dashboard -------------------------------------------------------------
+#
+# Launch the new event-driven dashboard (v2). Same as `top` but explicit.
+
+cmd_dashboard() {
+  require_cmd uv
+  local legacy=0
+  while (( $# )); do
+    case "$1" in
+      --legacy) legacy=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  if (( legacy )); then
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py"
+  else
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py"
+  fi
 }
 
 # ---- exec ----------------------------------------------------------------
@@ -1788,6 +1809,7 @@ main() {
     top)       cmd_top       "$@" ;;
     review)    cmd_review    "$@" ;;
     worktrees) cmd_worktrees "$@" ;;
+    dashboard)  cmd_dashboard "$@" ;;
     reconciler-sync) cmd_reconciler_sync "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
