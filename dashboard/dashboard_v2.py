@@ -630,6 +630,49 @@ class DashboardApp(App):
                     break
         self._notified_ids = current_ids
 
+    # -- data table selection handling --------------------------------------
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle Enter/selection on DataTable widgets."""
+        table_id = event.data_table.id
+        row_key = event.row_key
+
+        if table_id == "agents":
+            # Get the selected agent and open agent detail
+            self._show_agent_detail(row_key)
+        elif table_id == "inbox":
+            # Get the selected inbox item
+            cursor_row = event.data_table.cursor_row
+            if cursor_row is not None and cursor_row < len(self.inbox_items):
+                self.selected_inbox_index = cursor_row
+                self.action_approve()
+        elif table_id == "open":
+            # Open task detail
+            self._show_open_task_detail(row_key)
+
+    def _show_agent_detail(self, row_key) -> None:
+        """Show agent detail screen for selected agent."""
+        # Get agent info from the current snapshot
+        if self.snapshot is None:
+            return
+        agents = self.snapshot[0]
+        cursor_row = self._agents_dt.cursor_row
+        if cursor_row is None or cursor_row >= len(agents):
+            return
+        agent = agents[cursor_row]
+        self.push_screen(AgentDetailScreen(agent))
+
+    def _show_open_task_detail(self, row_key) -> None:
+        """Show detail for selected open task."""
+        if self.snapshot is None:
+            return
+        open_tasks = self.snapshot[2]
+        cursor_row = self._open_dt.cursor_row
+        if cursor_row is None or cursor_row >= len(open_tasks):
+            return
+        task = open_tasks[cursor_row]
+        self.notify(f"Task: {task.get('title', '—')}", title="Open Task")
+
     # -- keyboard actions ---------------------------------------------------
 
     def action_approve(self) -> None:
