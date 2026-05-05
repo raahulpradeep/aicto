@@ -166,7 +166,7 @@ def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict]
         slot = parts[1] if len(parts) > 1 else w
         issue = role_map.get(slot)
         agents.append({"agent": f"{team_name}:{slot}", "issue": issue, "team": team_name,
-                       "provider": "claude", "model": "sonnet"})
+                       "provider": "claude", "model": "sonnet", "window": slot})
 
     # Inbox (role:cto)
     inbox = _bd_json(["list", "--status", "open", "--label", "role:cto", "--json"], team_dir)
