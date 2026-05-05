@@ -1369,7 +1369,16 @@ while :; do
     *) log "unknown role: $ROLE"; exit 2 ;;
   esac
 
-  iter_start_ms=$(date +%s%3N)
+  # Cross-platform milliseconds timestamp (GNU date supports %3N; BSD does not).
+  _ms_ts() {
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "import time; print(int(time.time()*1000))"
+    else
+      echo "$(($(date +%s) * 1000))"
+    fi
+  }
+
+  iter_start_ms=$(_ms_ts)
   telemetry_emit agent_iteration_start --kv "agent=$AGENT" --kv "task_id=${task_id:-}"
 
   if [[ "$AGENT_PROVIDER" == "kimi" ]]; then
@@ -1438,7 +1447,7 @@ $starter"
     rc=${PIPESTATUS[0]}
   fi
 
-  iter_end_ms=$(date +%s%3N)
+  iter_end_ms=$(_ms_ts)
   iter_dur=$((iter_end_ms - iter_start_ms))
   telemetry_emit agent_iteration_end \
     --kv "agent=$AGENT" \
