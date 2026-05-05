@@ -484,13 +484,14 @@ class DashboardApp(App):
         self._agents_dt = DataTable(id="agents", show_cursor=True, cursor_type="row")
         self._agents_dt.add_columns("AGENT", "STATUS", "ELAPSED", "MODEL", "TOKENS", "ISSUE")
         self._agents_dt.zebra_stripes = True
-        self._agents_dt.focus()
-        yield self._agents_dt
 
         self._inbox_dt = DataTable(id="inbox", show_cursor=True, cursor_type="row")
         self._inbox_dt.add_columns("TEAM", "ID", "TITLE", "KIND", "AGE", "ACTIONS")
         self._inbox_dt.zebra_stripes = True
-        yield self._inbox_dt
+
+        with Horizontal(id="top"):
+            yield self._agents_dt
+            yield self._inbox_dt
 
         with Horizontal(id="mid"):
             yield EpicPipeline(id="pipeline")
@@ -499,9 +500,16 @@ class DashboardApp(App):
         self._open_dt = DataTable(id="open", show_cursor=True, cursor_type="row")
         self._open_dt.add_columns("TEAM", "ID", "KIND", "TITLE", "ASSIGNEE", "AGE")
         self._open_dt.zebra_stripes = True
-        yield self._open_dt
+        with Horizontal(id="bottom"):
+            yield self._open_dt
 
         yield Static("", id="footer")
+
+    def on_ready(self) -> None:
+        try:
+            self._agents_dt.focus()
+        except Exception:
+            pass
 
     def on_mount(self) -> None:
         self._adapter = make_batched_adapter(self._on_events)
