@@ -1733,9 +1733,9 @@ cmd_top() {
     esac
   done
   if (( legacy )); then
-    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/top.py"
-  else
     exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py"
+  else
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py"
   fi
 }
 
