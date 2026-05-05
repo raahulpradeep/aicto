@@ -387,10 +387,22 @@ def gather_events(limit: int = 20):
 
 def _agent_grid_panel(agents: list[dict], running: list[str], now: dt.datetime, selected_index: int = 0, has_focus: bool = False) -> Panel:
     if not running:
-        return Panel(
-            Text("no running teams — start one with `bin/cto start <team>`", style="dim", justify="center"),
-            title="Agents (0)", border_style="bright_cyan" if has_focus else "dim",
+        # Show a table with one placeholder row instead of a text-only panel
+        # so the widget height stays stable across polls.
+        t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
+        t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
+        t.add_column("STATUS", overflow="ellipsis", no_wrap=True, width=10)
+        t.add_column("ELAPSED", justify="right", overflow="ellipsis", no_wrap=True, width=8)
+        t.add_column("MODEL", overflow="ellipsis", no_wrap=True, width=18)
+        t.add_column("TOKENS", justify="right", overflow="ellipsis", no_wrap=True, width=8)
+        t.add_column("ISSUE", overflow="ellipsis", no_wrap=True, ratio=2)
+        t.add_row(
+            Text("—", style="dim"), Text("—", style="dim"),
+            Text("—", style="dim"), Text("—", style="dim"),
+            Text("—", style="dim"),
+            Text("no running teams — start one with `cto start <team>`", style="dim"),
         )
+        return Panel(t, title="Agents (0)", border_style="bright_cyan" if has_focus else "dim")
 
     t = Table(expand=True, show_lines=False, header_style="bold", pad_edge=False)
     t.add_column("AGENT", overflow="ellipsis", no_wrap=True)
@@ -466,6 +478,7 @@ def _inbox_panel(inbox: list[dict], selected_index: int = 0, has_focus: bool = F
                 Text(actions, style="cyan" if selected else "dim"),
             )
     else:
+        # Placeholder row to keep height stable
         t.add_row(
             Text("—", style="dim"), Text("—", style="dim"),
             Text("(nothing waiting on the CTO)", style="dim"),
@@ -669,13 +682,13 @@ class DashboardV2App(App):
 
     CSS = """
     #top { height: 2fr; }
-    #agents { width: 55%; height: 100%; }
-    #inbox { width: 45%; height: 100%; }
+    #agents { width: 55%; height: 100%; min-height: 5; }
+    #inbox { width: 45%; height: 100%; min-height: 5; }
     #mid { height: 2fr; }
-    #pipeline { width: 60%; height: 100%; }
-    #activity { width: 40%; height: 100%; }
+    #pipeline { width: 60%; height: 100%; min-height: 5; }
+    #activity { width: 40%; height: 100%; min-height: 5; }
     #bottom { height: 1fr; }
-    #open { width: 100%; height: 100%; }
+    #open { width: 100%; height: 100%; min-height: 3; }
     #footer { height: 1; }
     """
 
