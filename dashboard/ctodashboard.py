@@ -830,42 +830,75 @@ class DashboardApp(App):
         if not self.inbox_items:
             self.notify("Inbox is empty", severity="warning")
             return
+        if self.selected_inbox_index >= len(self.inbox_items):
+            self.selected_inbox_index = max(0, len(self.inbox_items) - 1)
         item = self.inbox_items[self.selected_inbox_index]
+        self._pending_item = item
         self.push_screen(ApproveModal(item), self._on_approve)
 
     def _on_approve(self, comment: str | None) -> None:
         if comment is None:
             return
-        item = self.inbox_items[self.selected_inbox_index]
-        self.run_worker(lambda: self._run_cto("approve", item, comment), thread=True)
+        item = getattr(self, "_pending_item", None)
+        if item is None:
+            self.notify("Item no longer available", severity="warning")
+            return
+        self._pending_cmd = "approve"
+        self._pending_comment = comment
+        self.run_worker(self._worker_cto, thread=True, exclusive=False)
 
     def action_reject(self) -> None:
         if not self.inbox_items:
             self.notify("Inbox is empty", severity="warning")
             return
+        if self.selected_inbox_index >= len(self.inbox_items):
+            self.selected_inbox_index = max(0, len(self.inbox_items) - 1)
         item = self.inbox_items[self.selected_inbox_index]
+        self._pending_item = item
         self.push_screen(RejectModal(item), self._on_reject)
 
     def _on_reject(self, comment: str | None) -> None:
         if comment is None:
             return
-        item = self.inbox_items[self.selected_inbox_index]
-        self.run_worker(lambda: self._run_cto("reject", item, comment), thread=True)
+        item = getattr(self, "_pending_item", None)
+        if item is None:
+            self.notify("Item no longer available", severity="warning")
+            return
+        self._pending_cmd = "reject"
+        self._pending_comment = comment
+        self.run_worker(self._worker_cto, thread=True, exclusive=False)
 
-    def _run_cto(self, cmd: str, item: dict, comment: str) -> None:
-        team = item["team"]
-        issue_id = item["id"]
-        args = [str(ROOT / "bin" / "cto"), cmd, team, issue_id, "--comment", comment]
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30.0)
-        self.call_from_thread(self._handle_cto_result, cmd, result)
+    def _worker_cto(self) -> None:
+        item = getattr(self, "_pending_item", None)
+        cmd = getattr(self, "_pending_cmd", "")
+        comment = getattr(self, "_pending_comment", "")
+        if item is None or not cmd:
+            return
+        try:
+            team = item["team"]
+            issue_id = item["id"]
+            args = [str(ROOT / "bin" / "cto"), cmd, team, issue_id, "--comment", comment]
+            result = subprocess.run(args, capture_output=True, text=True, timeout=30.0)
+            self.call_from_thread(self._handle_cto_result, cmd, result)
+        except Exception as exc:
+            self.call_from_thread(self._notify_error, f"{cmd} failed: {exc}")
 
     def _handle_cto_result(self, cmd: str, result: subprocess.CompletedProcess) -> None:
+        self._pending_item = None
+        self._pending_cmd = ""
+        self._pending_comment = ""
         if result.returncode != 0:
             err = result.stderr.strip() or result.stdout.strip() or "unknown error"
             self.notify(f"{cmd} failed: {err}", severity="error", title="Error")
         else:
             self.notify(f"{cmd}d successfully", title="Done")
             self.poll_data()
+
+    def _notify_error(self, msg: str) -> None:
+        self._pending_item = None
+        self._pending_cmd = ""
+        self._pending_comment = ""
+        self.notify(msg, severity="error", title="Error")
 
     def action_drill_down(self) -> None:
         focused = self.app.focused
