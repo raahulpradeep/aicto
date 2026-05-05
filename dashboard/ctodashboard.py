@@ -83,6 +83,29 @@ def _bd_json(args: list[str], cwd: Path) -> list:
         return []
 
 
+def _bd_popen(args: list[str], cwd: Path) -> subprocess.Popen:
+    """Launch a bd query asynchronously. Caller must call communicate()."""
+    return subprocess.Popen(
+        ["bd", *args, "--json"],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def _read_bd_proc(proc: subprocess.Popen, timeout: float = 5.0) -> list:
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+        return json.loads(stdout) if proc.returncode == 0 else []
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return []
+
+
 # ---- data shapers (copied from top.py) ------------------------------------
 
 META_LABELS = {"kind:status-digest", "kind:status-request"}
@@ -195,7 +218,7 @@ def _read_team_config(tdir: Path) -> dict:
 
 
 def _gather_team(team: str, tdir: Path):
-    """Gather data for a single team. Runs synchronously (caller is already in a bg thread)."""
+    """Gather data for a single team. Runs in a bg thread; bd calls are parallelised."""
     sess = f"cto-{team}"
     if not tmux_alive(sess):
         return None
@@ -205,10 +228,15 @@ def _gather_team(team: str, tdir: Path):
     provider = cfg.get("agentProvider", "claude")
     model = cfg.get("model", "—")
 
-    # synchronous subprocess calls — fine because we're in a bg thread
-    ip = _bd_json(["list", "--status", "in_progress"], tdir)
-    op = _bd_json(["list", "--status", "open"], tdir)
-    cl = _bd_json(["list", "--status", "closed", "-n", "0"], tdir)
+    # Launch all 3 bd queries in parallel — cuts per-team time from ~6s to ~2s
+    # -n 20 for closed is enough (we only show 10 most recent)
+    ip_proc = _bd_popen(["list", "--status", "in_progress"], tdir)
+    op_proc = _bd_popen(["list", "--status", "open"], tdir)
+    cl_proc = _bd_popen(["list", "--status", "closed", "-n", "20"], tdir)
+
+    ip = _read_bd_proc(ip_proc)
+    op = _read_bd_proc(op_proc)
+    cl = _read_bd_proc(cl_proc)
 
     ip_by_assignee = {i["assignee"]: i for i in ip if i.get("assignee")}
     agent_rows = [
@@ -225,19 +253,62 @@ def _gather_team(team: str, tdir: Path):
         if "role:cto" not in (i.get("labels") or []) and not _is_meta(i.get("labels") or [])
     ]
     closed_rows = [{"team": team, **i} for i in cl]
-    return agent_rows, inbox_rows, open_rows, closed_rows
+
+    # Build pipeline data from the SAME open+in_progress issues (no extra bd calls)
+    from dashboard.widgets.epic_pipeline import _compute_stages  # noqa: E402
+    epics: list[dict] = []
+    by_epic: dict[str, list[dict]] = {}
+    for i in (op + ip):
+        labels = i.get("labels") or []
+        if "kind:epic" in labels or i.get("issue_type") == "epic":
+            epics.append(i)
+        epic_id = None
+        desc = i.get("description", "")
+        for line in desc.splitlines():
+            if line.startswith("epic:"):
+                epic_id = line.split(":", 1)[1].strip()
+                break
+        if epic_id:
+            by_epic.setdefault(epic_id, []).append(i)
+
+    # Also include recently closed children for accurate pipeline stage computation
+    for i in cl:
+        epic_id = None
+        desc = i.get("description", "")
+        for line in desc.splitlines():
+            if line.startswith("epic:"):
+                epic_id = line.split(":", 1)[1].strip()
+                break
+        if epic_id:
+            by_epic.setdefault(epic_id, []).append(i)
+
+    pipelines: list[dict] = []
+    for epic in epics:
+        epic_id = epic.get("id", "")
+        children = by_epic.get(epic_id, [])
+        stages = _compute_stages(children)
+        pipelines.append({
+            "team": team,
+            "epic_id": epic_id,
+            "title": epic.get("title", ""),
+            "created_at": epic.get("created_at", ""),
+            "stages": stages,
+        })
+
+    return agent_rows, inbox_rows, open_rows, closed_rows, pipelines
 
 
-def gather():
-    """Gather all team data. Runs in a background thread."""
+def gather_all():
+    """Gather ALL dashboard data in one pass per team. Runs in a background thread."""
     agents: list[dict] = []
     inbox: list[dict] = []
     open_tasks: list[dict] = []
     closed: list[dict] = []
     running: list[str] = []
+    pipelines: list[dict] = []
 
     if not TEAMS_DIR.is_dir():
-        return agents, inbox, open_tasks, closed, running
+        return agents, inbox, open_tasks, closed, running, pipelines
 
     teams = [p for p in sorted(TEAMS_DIR.iterdir()) if p.is_dir() and (p / ".cto").is_dir()]
     live_team_names = {t.name for t in teams}
@@ -256,13 +327,14 @@ def gather():
             cached = _prev_data.get(team.name)
             if cached is None:
                 continue
-            a_rows, i_rows, o_rows, c_rows = cached
+            a_rows, i_rows, o_rows, c_rows, p_rows = cached
             a_rows = [{**r, "stale": True} for r in a_rows]
             i_rows = [{**r, "stale": True} for r in i_rows]
             o_rows = [{**r, "stale": True} for r in o_rows]
             c_rows = [{**r, "stale": True} for r in c_rows]
+            p_rows = [{**r, "stale": True} for r in p_rows]
         else:
-            a_rows, i_rows, o_rows, c_rows = result
+            a_rows, i_rows, o_rows, c_rows, p_rows = result
             _prev_data[team.name] = result
 
         running.append(team.name)
@@ -270,30 +342,11 @@ def gather():
         inbox.extend(i_rows)
         open_tasks.extend(o_rows)
         closed.extend(c_rows)
+        pipelines.extend(p_rows)
 
     closed.sort(key=lambda r: r.get("closed_at") or "", reverse=True)
     closed_recent = closed[:10]
-    return agents, inbox, open_tasks, closed_recent, running
-
-
-# ---- pipeline gather (imported from widget, gathered centrally) -----------
-
-from dashboard.widgets.epic_pipeline import _gather_team_pipelines  # noqa: E402
-
-
-def gather_pipelines():
-    """Gather epic pipeline data for all teams."""
-    pipes: list[dict] = []
-    if not TEAMS_DIR.is_dir():
-        return pipes
-    for team_dir in sorted(TEAMS_DIR.iterdir()):
-        if not (team_dir / ".cto").is_dir():
-            continue
-        try:
-            pipes.extend(_gather_team_pipelines(team_dir))
-        except Exception:
-            pass
-    return pipes
+    return agents, inbox, open_tasks, closed_recent, running, pipelines
 
 
 # ---- activity gather (imported from widget, gathered centrally) -----------
@@ -674,8 +727,7 @@ class DashboardApp(App):
         try:
             t0 = time.monotonic()
 
-            agents, inbox, open_tasks, closed, running = gather()
-            pipelines = gather_pipelines()
+            agents, inbox, open_tasks, closed, running, pipelines = gather_all()
             events = gather_events(limit=20)
 
             gather_ms = int((time.monotonic() - t0) * 1000)

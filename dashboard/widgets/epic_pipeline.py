@@ -166,13 +166,38 @@ def _render_pipeline_row(pipe: dict[str, Any], now: dt.datetime, selected: bool 
     ]
 
 
-def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
-    """Gather epic pipeline data for a single team."""
+def _bd_popen(args: list[str], cwd: Path) -> subprocess.Popen:
+    """Launch a bd query asynchronously."""
+    return subprocess.Popen(
+        ["bd", *args, "--json"],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def _read_bd_proc(proc: subprocess.Popen, timeout: float = 5.0) -> list:
     try:
-        issues = _bd_json(["list", "--status", "open"], team_dir)
-        issues += _bd_json(["list", "--status", "in_progress"], team_dir)
+        stdout, _ = proc.communicate(timeout=timeout)
+        return json.loads(stdout) if proc.returncode == 0 else []
     except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
         return []
+
+
+def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
+    """Gather epic pipeline data for a single team. bd calls are parallelised."""
+    open_proc = _bd_popen(["list", "--status", "open"], team_dir)
+    ip_proc = _bd_popen(["list", "--status", "in_progress"], team_dir)
+    closed_proc = _bd_popen(["list", "--status", "closed", "--limit", "50"], team_dir)
+
+    issues = _read_bd_proc(open_proc)
+    issues += _read_bd_proc(ip_proc)
+    closed_issues = _read_bd_proc(closed_proc)
 
     epics: list[dict[str, Any]] = []
     by_epic: dict[str, list[dict[str, Any]]] = {}
@@ -189,11 +214,6 @@ def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
                 break
         if epic_id:
             by_epic.setdefault(epic_id, []).append(i)
-
-    try:
-        closed_issues = _bd_json(["list", "--status", "closed", "--limit", "50"], team_dir)
-    except Exception:
-        closed_issues = []
 
     for i in closed_issues:
         epic_id = None

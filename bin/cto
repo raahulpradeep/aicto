@@ -1191,6 +1191,34 @@ set -uo pipefail
 TEAM_DIR="$1"; ROLE="$2"; SLOT="$3"; ROLE_FILE="$4"; PERM="$5"; MODEL="$6"; AGENT_PROVIDER="${7:-claude}"
 cd "$TEAM_DIR"
 
+# Ensure telemetry helper exists (back-compat for teams started before
+# the helper was added to cmd_start).
+if [[ ! -f "$TEAM_DIR/.cto/telemetry_helper.py" ]]; then
+  cat > "$TEAM_DIR/.cto/telemetry_helper.py" <<'PYEOF'
+#!/usr/bin/env python3
+import json, datetime, sys, argparse
+
+p = argparse.ArgumentParser()
+p.add_argument("log_path")
+p.add_argument("event_type")
+p.add_argument("--kv", action="append", default=[], metavar="KEY=VALUE")
+args = p.parse_args()
+
+event = {
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "event": args.event_type,
+}
+for kv in args.kv:
+    if "=" in kv:
+        k, v = kv.split("=", 1)
+        event[k] = v
+
+with open(args.log_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+PYEOF
+  chmod +x "$TEAM_DIR/.cto/telemetry_helper.py"
+fi
+
 # Globally unique agent identity. Used as the bd assignee, the
 # filesystem-lock owner stamp, and the agent's self-identifier in
 # agent prompts. Team names are unique within the CTO workspace, so
