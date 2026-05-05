@@ -524,14 +524,16 @@ class DashboardApp(App):
     # DataTable update methods (in-place, no collapse)
     # ------------------------------------------------------------------
 
+    def _clear_poll_flag(self) -> None:
+        self._poll_in_flight = False
+
     def _update_agents_table(self, agents: list[dict], running: list[str]) -> None:
-        dt = self._agents_dt
-        dt.clear()
+        table = self._agents_dt
+        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
         if not running:
-            dt.add_row("—", "—", "—", "—", "—", "no running teams — start with `cto start <team>`")
-            dt.update_cell_at((0, 5), Text("no running teams — start with `cto start <team>`", style="dim"))
+            table.add_row("—", "—", "—", "—", "—", "no running teams — start with `cto start <team>`")
             return
 
         for idx, row in enumerate(agents):
@@ -552,15 +554,15 @@ class DashboardApp(App):
                 issue_text = "—"
 
             model = f"{row.get('provider', '—')}:{row.get('model', '—')}"
-            dt.add_row(agent, status, elapsed, model, "—", issue_text)
+            table.add_row(agent, status, elapsed, model, "—", issue_text)
 
     def _update_inbox_table(self, inbox: list[dict]) -> None:
-        dt = self._inbox_dt
-        dt.clear()
+        table = self._inbox_dt
+        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
         if not inbox:
-            dt.add_row("—", "—", "(nothing waiting on the CTO)", "—", "—", "—")
+            table.add_row("—", "—", "(nothing waiting on the CTO)", "—", "—", "—")
             return
 
         for row in inbox:
@@ -569,15 +571,15 @@ class DashboardApp(App):
             kind = _kind(row.get("labels", []))
             age_str = _age(row, now)
             actions = "[A][R][F]" if not stale else ""
-            dt.add_row(team_disp, row["id"], _truncate(row.get("title", ""), 45), kind, age_str, actions)
+            table.add_row(team_disp, row["id"], _truncate(row.get("title", ""), 45), kind, age_str, actions)
 
     def _update_open_table(self, open_tasks: list[dict]) -> None:
-        dt = self._open_dt
-        dt.clear()
+        table = self._open_dt
+        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
         if not open_tasks:
-            dt.add_row("—", "—", "—", "(no open tasks)", "—", "—")
+            table.add_row("—", "—", "—", "(no open tasks)", "—", "—")
             return
 
         rows = sorted(open_tasks, key=lambda r: (r.get("priority") or 99, r.get("created_at") or ""))
@@ -585,7 +587,7 @@ class DashboardApp(App):
             stale = row.get("stale", False)
             team_disp = ("~" if stale else "") + row.get("team", "")
             assignee = row.get("assignee") or ""
-            dt.add_row(team_disp, row.get("id", ""), _kind(row.get("labels") or []),
+            table.add_row(team_disp, row.get("id", ""), _kind(row.get("labels") or []),
                        _truncate(row.get("title", ""), 50), assignee or "—", _age(row, now))
 
     # ------------------------------------------------------------------
