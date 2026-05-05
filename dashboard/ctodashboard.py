@@ -541,6 +541,11 @@ class AgentDetailScreen(ModalScreen[None]):
 # ---- textual app ----------------------------------------------------------
 
 
+class FocusableStatic(Static):
+    """A Static widget that can receive keyboard focus."""
+    can_focus = True
+
+
 class DashboardApp(App):
     """Unified CTO dashboard."""
 
@@ -577,13 +582,13 @@ class DashboardApp(App):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
-            yield Static("", id="agents", can_focus=True)
-            yield Static("", id="inbox", can_focus=True)
+            yield FocusableStatic("", id="agents")
+            yield FocusableStatic("", id="inbox")
         with Horizontal(id="mid"):
             yield EpicPipeline(id="pipeline")
             yield ActivityStream(id="activity")
         with Horizontal(id="bottom"):
-            yield Static("", id="open", can_focus=True)
+            yield FocusableStatic("", id="open")
         yield Static("", id="footer")
 
     def on_mount(self) -> None:
