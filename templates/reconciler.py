@@ -10,6 +10,10 @@ Replaces the bash hooks that previously lived inline in `supervisor.sh`
 (hooks 1 through 5 plus the epic-ship gate). The reconciler is the only
 thing in the system that may file or relabel workflow-control issues
 (approvals, plan filings, dev/review pairs, epic merges, re-reviews).
+
+Phase 2: The reconciler also publishes events to the event bus so that
+persistent agents wake immediately instead of waiting for the next `bd ready`
+poll cycle.
 """
 from __future__ import annotations
 
@@ -22,6 +26,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
+
+from event_bus import EventBus
+from state_store import StateStore
 
 
 # ---------- Domain types ----------
@@ -828,15 +835,45 @@ def _emit_event(event_type: str, **kwargs: Any) -> None:
 
 # ---------- Execute (live bd calls) ----------
 
-def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
+def execute(actions: list[Action], dry_run: bool = False, team_dir: Optional[Path] = None) -> list[str]:
     import time
     t0 = time.monotonic()
     log: list[str] = []
+
+    # Phase 2: initialise event bus for publishing workflow events.
+    bus: Optional[EventBus] = None
+    if team_dir is not None:
+        state_dir = team_dir / ".cto" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        db_path = state_dir / "agent_state.db"
+        store = StateStore(str(db_path))
+        bus = EventBus(store, watch_dir=state_dir)
+
+    def _publish(kind: str, **kwargs: Any) -> None:
+        if bus is not None:
+            try:
+                bus.publish("task.lifecycle", {"kind": kind, **kwargs})
+            except Exception:
+                pass  # best-effort; never let event bus break bd filing
+
     for a in actions:
         if isinstance(a, FileIssue):
             log.append(f"file: {a.title!r} labels={list(a.labels)}")
             if not dry_run:
-                _bd_file(a)
+                new_id = _bd_file(a)
+                if new_id:
+                    kind = ""
+                    for lbl in a.labels:
+                        if lbl.startswith("kind:"):
+                            kind = lbl.split(":", 1)[1]
+                            break
+                    _publish("task.created", task_id=new_id, kind=kind, title=a.title)
+                    if kind == "dev":
+                        _publish("dev.assigned", task_id=new_id)
+                    elif kind == "review":
+                        _publish("review.required", task_id=new_id)
+                    elif kind == "merge":
+                        _publish("merge.ready", task_id=new_id)
         elif isinstance(a, FilePair):
             log.append(
                 f"pair: {a.upstream.title!r} → {a.downstream.title!r} "
@@ -845,6 +882,7 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
             if not dry_run:
                 up_id = _bd_file(a.upstream)
                 if up_id:
+                    _publish("task.created", task_id=up_id, kind=a.upstream.labels[0].split(":", 1)[1] if a.upstream.labels else "", title=a.upstream.title)
                     down_action = FileIssue(
                         title=a.downstream.title,
                         description=a.downstream.description,
@@ -854,12 +892,13 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
                     )
                     down_id = _bd_file(down_action)
                     if down_id:
-                        # Upstream blocks downstream: downstream stays out of
-                        # `bd ready` until upstream closes.
                         subprocess.run(
                             ["bd", "dep", up_id, "--blocks", down_id],
                             check=False, capture_output=True,
                         )
+                        _publish("task.created", task_id=down_id, kind=a.downstream.labels[0].split(":", 1)[1] if a.downstream.labels else "", title=a.downstream.title)
+                        if "review" in [l for l in a.downstream.labels if l.startswith("kind:")]:
+                            _publish("review.required", task_id=down_id)
         elif isinstance(a, AddLabel):
             log.append(f"label+: {a.issue_id} +{a.label}")
             if not dry_run:
@@ -867,6 +906,8 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
                     ["bd", "update", a.issue_id, "--add-label", a.label],
                     check=False, capture_output=True,
                 )
+                if "verdict:approved" in a.label:
+                    _publish("approval.granted", issue_id=a.issue_id)
         elif isinstance(a, RemoveLabel):
             log.append(f"label-: {a.issue_id} -{a.label}")
             if not dry_run:
@@ -888,10 +929,12 @@ def execute(actions: list[Action], dry_run: bool = False) -> list[str]:
                     ["bd", "close", a.issue_id, "-r", a.reason],
                     check=False, capture_output=True,
                 )
+                _publish("task.closed", issue_id=a.issue_id, reason=a.reason)
         elif isinstance(a, AutoMergeEpic):
             log.append(f"auto-merge: epic/{a.epic_id} into {a.merge_target}")
             if not dry_run:
                 _auto_merge_epic(a.epic_id, a.merge_target)
+                _publish("epic.merged", epic_id=a.epic_id, target=a.merge_target)
     if not dry_run:
         dur_ms = int((time.monotonic() - t0) * 1000)
         _emit_event("reconciler_tick", actions=";".join(log), duration_ms=str(dur_ms))
@@ -1115,6 +1158,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--role", default="manager",
                    help="Only role=manager performs reconciliation.")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--team-dir", type=Path, default=Path("."),
+                   help="Path to team directory (for event bus init).")
     args = p.parse_args(argv)
 
     if args.role != "manager":
@@ -1122,7 +1167,7 @@ def main(argv: list[str]) -> int:
 
     state = load_state()
     actions = reconcile(state, plan_chunks_for=parse_plan_chunks)
-    for line in execute(actions, dry_run=args.dry_run):
+    for line in execute(actions, dry_run=args.dry_run, team_dir=args.team_dir):
         print(line)
     return 0
 

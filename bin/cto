@@ -302,9 +302,9 @@ Usage:
   cto reject <team> <id> --comment "…"
   cto review                                # interactive TUI inbox
 
-  cto start <team> [--attach] [--dangerous]
+  cto start <team> [--attach] [--dangerous] [--persistent]
   cto stop <team>
-  cto restart <team>
+  cto restart <team> [--persistent]
   cto attach <team> [<window>]
 
   cto status [<team>]
@@ -1134,12 +1134,13 @@ cmd_reject() {
 cmd_start() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local attach=0 dangerous=0 force=0
+  local attach=0 dangerous=0 force=0 persistent=0
   while (( $# )); do
     case "$1" in
       --attach)     attach=1;    shift ;;
       --dangerous)  dangerous=1; shift ;;
       --force)      force=1;     shift ;;
+      --persistent) persistent=1; shift ;;
       *) die "unknown start flag: $1" ;;
     esac
   done
@@ -1178,7 +1179,37 @@ cmd_start() {
   # reconciler is the kind of thing that has burned us before.
   reconciler_sync "$name" "$tdir" || die "reconciler drift detected; run: cto reconciler-sync $name --force"
 
-  # Generate a supervisor script. Each tmux window runs this; the bash
+  if (( persistent )); then
+    # Phase 2: use Python persistent supervisors instead of bash heredocs.
+    # Ensure src/ exists in the team dir (symlink from the CTO root).
+    local src_dir="$tdir/.cto/src"
+    if [[ ! -d "$src_dir" ]]; then
+      ln -s "$CTO_ROOT/src" "$src_dir" 2>/dev/null || die "failed to symlink src/ into team .cto/"
+    fi
+
+    # Spawn persistent supervisors for each agent slot.
+    local manager_file="$pdir/manager.md"
+    [[ "$provider" == "kimi" ]] && manager_file="$pdir/manager.yaml"
+    tmux new-session -d -s "$sess" -n manager -c "$tdir"       "$src_dir/persistent_supervisor.py" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
+
+    tmux new-window -t "$sess" -n reconciler -c "$tdir"       bash -c '''while :; do python3 "$1/.cto/reconciler.py" --role manager --team-dir "$1" 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; sleep 3; done''' bash "$tdir"
+
+    for i in $(seq 1 "$n_devs"); do
+      local dev_file="$pdir/dev-$i.md"
+      [[ "$provider" == "kimi" ]] && dev_file="$pdir/dev-$i.yaml"
+      tmux new-window -t "$sess" -n "dev-$i" -c "$tdir"         "$src_dir/persistent_supervisor.py" "$tdir" developer "dev-$i" "$dev_file" "$mode" "$model" "$provider"
+    done
+
+    for i in $(seq 1 "$n_revs"); do
+      local rev_file="$pdir/review-$i.md"
+      [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
+      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
+    done
+
+    info "started team $name in tmux session: $sess (persistent mode)"
+  else
+    # Legacy bash supervisor mode (default, backward compatible).
+    # Generate a supervisor script.. Each tmux window runs this; the bash
   # loop is what's eternal — the agent CLI is one-shot per iteration.
   # On non-zero exit, the supervisor releases any bd claim it took and,
   # if the failure mentions a permission gap, files a CTO inbox item.
@@ -1507,9 +1538,10 @@ PYEOF
       "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
   done
 
-  info "started team $name in tmux session: $sess"
+  fi  # close persistent/else
   info "  windows: manager, reconciler, dev-1..$n_devs, review-1..$n_revs"
   info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
+  info "  mode: $([[ $persistent -eq 1 ]] && echo persistent || echo legacy bash)"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then
     tmux attach -t "$sess"
@@ -1531,10 +1563,21 @@ cmd_stop() {
 }
 
 cmd_restart() {
-  local name="${1:-}"
+  local name="${1:-}"; shift || true
   require_team "$name"
+  local persistent=0
+  while (( $# )); do
+    case "$1" in
+      --persistent) persistent=1; shift ;;
+      *) die "unknown restart flag: $1" ;;
+    esac
+  done
   cmd_stop "$name" || true
-  cmd_start "$name"
+  if (( persistent )); then
+    cmd_start "$name" --persistent
+  else
+    cmd_start "$name"
+  fi
 }
 
 cmd_attach() {
