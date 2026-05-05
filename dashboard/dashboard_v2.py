@@ -838,6 +838,10 @@ class DashboardApp(App):
             focused.action_cursor_down()
 
 
+# Compat alias — tests and external callers import DashboardV2App.
+DashboardV2App = DashboardApp
+
+
 if __name__ == "__main__":
     app = DashboardApp()
     app.run()
