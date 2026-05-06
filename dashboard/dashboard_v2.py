@@ -519,7 +519,9 @@ class DashboardApp(App):
         self.set_interval(1.0, self._tick_footer)
 
     def on_unmount(self) -> None:
-        self._adapter.stop()
+        adapter = getattr(self, "_adapter", None)
+        if adapter is not None:
+            adapter.stop()
 
     # ------------------------------------------------------------------
     # Event bus callbacks (real-time)
