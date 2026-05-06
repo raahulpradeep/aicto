@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -21,7 +21,7 @@ from textual.widgets import Button, Static
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 8.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 8.0) -> str:
     try:
         r = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
@@ -50,7 +50,7 @@ def _get_diff(team: str, epic_id: str) -> str:
     return diff
 
 
-class DiffViewerScreen(ModalScreen[str | None]):
+class DiffViewerScreen(ModalScreen[Optional[str]]):
     """Scrollable diff viewer with approve/reject actions.
 
     Dismisses with 'approve', 'reject', or None.

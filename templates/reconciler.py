@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # RECONCILER_TEMPLATE_SHA: managed by `bin/cto`. Do not edit per-team copies.
-"""Workflow reconciler for the AI CTO orchestrator.
+"""Health reconciler for the AI CTO orchestrator.
 
-Pure-function core: reconcile(state) -> [Action]. The execute layer turns
-actions into bd CLI calls. Idempotency keys embedded in issue descriptions
-prevent duplicate filings if a tick is replayed.
+Stripped down from the full workflow reconciler. Agents now own all
+workflow transitions (filing approvals, reviews, merges, etc.). This
+module only detects and auto-heals stuck/broken/orphaned state:
 
-Replaces the bash hooks that previously lived inline in `supervisor.sh`
-(hooks 1 through 5 plus the epic-ship gate). The reconciler is the only
-thing in the system that may file or relabel workflow-control issues
-(approvals, plan filings, dev/review pairs, epic merges, re-reviews).
+- Zombie issues (in_progress >15 min with no updates) → auto-unclaim
+- Review loops (>3 rounds per dev) → CTO escalation
+- Missing workflow labels → auto-heal
+- Stuck epics (no children, idle >1h) → status request
+- Leaked epics (no children >15 min) → leak detection
 
-Phase 2: The reconciler also publishes events to the event bus so that
-persistent agents wake immediately instead of waiting for the next `bd ready`
-poll cycle.
+The execute layer turns actions into bd CLI calls. Idempotency keys
+embedded in issue descriptions prevent duplicate filings if a tick is
+replayed.
 """
 from __future__ import annotations
 
@@ -31,8 +32,6 @@ from event_bus import EventBus
 from state_store import StateStore
 
 # Re-export Phase 3/4 components for callers that import them off `reconciler`.
-# These live in src/ alongside this template; the migration plan has them
-# eventually replacing this file's body.
 from health_auditor import HealthAuditor, HealKind, HealAction  # noqa: F401
 from action_queue import ActionQueue  # noqa: F401
 
@@ -93,22 +92,6 @@ class Issue:
             or "verdict:changes-requested" in self.labels
         )
 
-    @property
-    def is_ops(self) -> bool:
-        """Lightweight epic that bypasses breakdown/plan/review/merge.
-        Use for one-shot ops tasks (git pull, run a sync script, etc.)
-        where there is no diff to review."""
-        return "class:ops" in self.labels
-
-    @property
-    def is_bypass_cto(self) -> bool:
-        return "class:bypass-cto" in self.labels
-
-    @property
-    def parent_branch(self) -> str:
-        m = re.search(r"^parent_branch:\s*(\S+)\s*$", self.description, re.MULTILINE)
-        return m.group(1) if m else "main"
-
 
 @dataclass(frozen=True)
 class State:
@@ -136,29 +119,6 @@ class State:
         return any(i.has_idem(key) for i in self.issues)
 
 
-# ---------- Ops heuristics ----------
-
-_OPS_RE = re.compile(
-    r"\b(sync|pull|fetch|merge\s+(origin|remote))\b.*\b(main|origin|remote)\b|"
-    r"\b(restart|cleanup|refresh)\b.*\b(service|env|cache|remote|main)\b",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_ops(epic: Issue, state: State) -> bool:
-    """Detect regular epics that are actually ops tasks (git sync, restart,
-    cleanup) filed without --ops. Only converts if the epic hasn't progressed
-    to dev yet, to avoid misfiring on legitimate feature work."""
-    if epic.is_ops:
-        return False
-    text = f"{epic.title} {epic.description}"
-    if not _OPS_RE.search(text):
-        return False
-    children = state.children_of(epic.id)
-    devs = [c for c in children if c.kind == "dev"]
-    return not devs
-
-
 # ---------- Action types ----------
 
 @dataclass(frozen=True)
@@ -168,20 +128,6 @@ class FileIssue:
     labels: tuple[str, ...]
     priority: int = 2
     blocks: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class FilePair:
-    """File two issues atomically and link them with a `blocks` dependency.
-
-    `upstream` is filed first; its bd-assigned id is then used as the
-    `blocks` target for `downstream`, so `downstream` does not appear in
-    `bd ready` until `upstream` closes. Used for plan↔review-plan,
-    dev↔review-code, and dev↔re-review pairs — without this, reviewers
-    claim review issues before the upstream artifact exists.
-    """
-    upstream: FileIssue
-    downstream: FileIssue
 
 
 @dataclass(frozen=True)
@@ -208,13 +154,7 @@ class CloseIssue:
     reason: str
 
 
-@dataclass(frozen=True)
-class AutoMergeEpic:
-    epic_id: str
-    merge_target: str
-
-
-Action = Union[FileIssue, FilePair, AddLabel, RemoveLabel, ReopenIssue, CloseIssue, AutoMergeEpic]
+Action = Union[FileIssue, AddLabel, RemoveLabel, ReopenIssue, CloseIssue]
 
 
 # ---------- Idempotency keys ----------
@@ -223,369 +163,107 @@ def idem(*parts: str) -> str:
     return ":".join(parts)
 
 
-# ---------- Per-epic reconcile ----------
+# ---------- Health checks ----------
 
-def _reconcile_ops_epic(epic: Issue, state: State) -> list[Action]:
-    """Lightweight FSM for `class:ops` epics: file a single dev, close the
-    epic when it closes. No breakdown, plan, review, merge, or worktree.
-    Intended for one-shot tasks that don't produce a diff (git pull, run a
-    sync script, restart something)."""
-    actions: list[Action] = []
-    children = state.children_of(epic.id)
-    devs = [c for c in children if c.kind == "dev"]
+def _reconcile_health(state: State) -> list[Action]:
+    """Detect and auto-heal stuck/broken/orphaned state.
 
-    if not devs:
-        dev_idem = idem("file-ops-dev", epic.id)
-        if not state.has_idem(dev_idem):
-            actions.append(FileIssue(
-                title=f"Ops: {epic.title}",
-                description=(
-                    f"epic: {epic.id}\n"
-                    f"idem: {dev_idem}\n"
-                    f"Ops task — work directly in the team's main worktree. "
-                    f"No branch, no diff expected. Close when done."
-                ),
-                labels=("role:developer", "kind:dev", "class:ops"),
-                priority=2,
-            ))
-        return actions
-
-    # Single dev exists. Close the epic when it closes.
-    if all(not d.is_open for d in devs):
-        actions.append(CloseIssue(
-            issue_id=epic.id,
-            reason=f"ops complete via {devs[0].id}",
-        ))
-    return actions
-
-
-def reconcile_epic(
-    epic: Issue,
-    state: State,
-    plan_chunks_for: "Optional[callable]" = None,
-) -> list[Action]:
-    """Compute actions for a single epic.
-
-    `plan_chunks_for(epic_id) -> list[(letter, desc)]` reads the merged plan
-    from disk to determine dev-task chunks. Tests inject a stub.
+    Emits healing actions silently; only review-loop escalations surface
+    to the CTO inbox.
     """
-    # ---- Auto-detect ops-shaped regular epics ----
-    if not epic.is_ops and _looks_like_ops(epic, state):
-        return [AddLabel(epic.id, "class:ops")]
-
-    if epic.is_ops:
-        return _reconcile_ops_epic(epic, state)
-
-    children = state.children_of(epic.id)
     actions: list[Action] = []
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-    breakdowns = [c for c in children if c.kind == "breakdown"]
-    breakdown_merges = [c for c in children if c.kind == "merge" and c.target == "breakdown"]
-    breakdown_merges_closed = [c for c in breakdown_merges if not c.is_open]
+    # H1: Zombie issue detection — in_progress for >15 min with no updates.
+    for issue in state.issues:
+        if issue.status != "in_progress":
+            continue
+        ts_str = issue.updated_at or issue.created_at
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (now - ts).total_seconds()
+        except ValueError:
+            continue
+        if age > 900:  # 15 minutes
+            # Auto-unclaim silently.
+            actions.append(AddLabel(issue.id, "stuck:zombie"))
+            actions.append(
+                # Reopen to clear in_progress status.
+                ReopenIssue(issue.id, "auto-heal: zombie detected, resetting claim")
+            )
+            _emit_event(
+                "stuck_detected",
+                issue_id=issue.id,
+                reason="zombie (>15m in_progress)",
+                auto_heal_action="unclaim",
+            )
 
-    plans = [c for c in children if c.kind == "plan"]
-    plan_merges = [c for c in children if c.kind == "merge" and c.target == "plan"]
-    plan_merges_closed = [c for c in plan_merges if not c.is_open]
-
-    devs = [c for c in children if c.kind == "dev"]
-    code_reviews = [c for c in children if c.kind == "review" and c.target == "code"]
-    code_merges = [c for c in children if c.kind == "merge" and c.target == "code"]
-    epic_merges = [c for c in children if c.kind == "merge" and c.target == "epic"]
-
-    plan_reviews = [c for c in children if c.kind == "review" and c.target == "plan"]
-    approvals_breakdown = [c for c in children if c.kind == "approval" and c.target == "breakdown"]
-    approvals_plan = [c for c in children if c.kind == "approval" and c.target == "plan"]
-
-    # ---- Phase 1: no breakdown yet → manager fills this in. Reconciler waits.
-    if not breakdowns:
-        return actions
-
-    # ---- Phase 1.5: breakdown closed → file approval or merge.
-    closed_breakdowns = [b for b in breakdowns if not b.is_open]
-    if closed_breakdowns and not breakdown_merges_closed:
-        if epic.is_bypass_cto:
-            bd_merge_idem = idem("file-breakdown-merge", epic.id, closed_breakdowns[-1].id)
-            if not state.has_idem(bd_merge_idem):
+    # H2: Changes-requested loop detection — >3 review rounds per dev.
+    devs = [i for i in state.issues if i.kind == "dev"]
+    for dev in devs:
+        reviews = [
+            r for r in state.issues
+            if r.kind == "review" and r.target == "code"
+            and _upstream_of_review(r, state) == dev.id
+        ]
+        if len(reviews) > 3:
+            # File a CTO escalation (only once per dev).
+            esc_idem = idem("escalate-review-loop", dev.id)
+            if not state.has_idem(esc_idem):
                 actions.append(FileIssue(
-                    title=f"Merge breakdown: {epic.title}",
+                    title=f"Escalation: {dev.title} stuck in review loop",
                     description=(
-                        f"epic: {epic.id}\n"
-                        f"branch: manager/{closed_breakdowns[-1].id}\n"
-                        f"idem: {bd_merge_idem}\n"
-                        f"Merge manager/{closed_breakdowns[-1].id} into epic/{epic.id}, prune sub-worktree."
+                        f"epic: {dev.linked_epic() or ''}\n"
+                        f"dev: {dev.id}\n"
+                        f"idem: {esc_idem}\n"
+                        f"This dev has gone through {len(reviews)} review rounds. "
+                        f"Consider manual intervention or merging with known issues."
                     ),
-                    labels=("role:manager", "kind:merge", "target:breakdown"),
-                    priority=1,
-                ))
-        else:
-            if not approvals_breakdown:
-                bd_appr_idem = idem("file-approval-breakdown", epic.id)
-                if not state.has_idem(bd_appr_idem):
-                    bd_issue = closed_breakdowns[-1]
-                    actions.append(FileIssue(
-                        title=f"Approve breakdown: {epic.title}",
-                        description=(
-                            f"epic: {epic.id}\n"
-                            f"branch: manager/{bd_issue.id}\n"
-                            f"artifact: breakdowns/{epic.id}.md @ branch manager/{bd_issue.id}\n"
-                            f"idem: {bd_appr_idem}\n"
-                            f"Read breakdowns/{epic.id}.md. Approve via `cto approve` or reject with --comment."
-                        ),
-                        labels=("role:cto", "kind:approval", "target:breakdown"),
-                        priority=1,
-                    ))
-
-    # ---- Phase 2: after breakdown merge, ensure plan + plan-review filed.
-    if breakdown_merges_closed and not plans:
-        plan_idem = idem("file-plan", epic.id)
-        review_idem = idem("file-review-plan", epic.id)
-        if not state.has_idem(plan_idem) and not state.has_idem(review_idem):
-            actions.append(FilePair(
-                upstream=FileIssue(
-                    title=f"Plan: {epic.title}",
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"idem: {plan_idem}\n"
-                        f"Author plans/{epic.id}.md on a task branch off epic/{epic.id}."
-                    ),
-                    labels=("role:developer", "kind:plan"),
-                    priority=2,
-                ),
-                downstream=FileIssue(
-                    title=f"Review plan: {epic.title}",
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"idem: {review_idem}\n"
-                        f"Review plans/{epic.id}.md on the plan branch."
-                    ),
-                    labels=("role:reviewer", "kind:review", "target:plan"),
-                    priority=2,
-                ),
-            ))
-
-    # ---- Phase 2.5: approved plan review → file plan approval or plan merge.
-    closed_approved_plan_reviews = [
-        r for r in plan_reviews
-        if not r.is_open and not r.changes_requested()
-    ]
-    if closed_approved_plan_reviews and not approvals_plan and plans:
-        if epic.is_bypass_cto:
-            plan = plans[-1]
-            pl_merge_idem = idem("file-plan-merge", epic.id, plan.id)
-            if not state.has_idem(pl_merge_idem):
-                actions.append(FileIssue(
-                    title=f"Merge plan: {epic.title}",
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"branch: task/{plan.id}\n"
-                        f"idem: {pl_merge_idem}\n"
-                        f"Merge task/{plan.id} into epic/{epic.id}, prune sub-worktree."
-                    ),
-                    labels=("role:manager", "kind:merge", "target:plan"),
-                    priority=1,
-                ))
-        else:
-            plan = plans[-1]
-            pl_appr_idem = idem("file-approval-plan", epic.id)
-            if not state.has_idem(pl_appr_idem):
-                actions.append(FileIssue(
-                    title=f"Approve plan: {epic.title}",
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"branch: task/{plan.id}\n"
-                        f"artifact: plans/{epic.id}.md @ task/{plan.id}\n"
-                        f"idem: {pl_appr_idem}\n"
-                        f"Read plans/{epic.id}.md. Approve via `cto approve` or reject with --comment."
-                    ),
-                    labels=("role:cto", "kind:approval", "target:plan"),
+                    labels=("role:cto", "kind:escalation"),
                     priority=1,
                 ))
 
-    # ---- Phase 3: after plan merge, ensure dev + review:code per chunk.
-    if plan_merges_closed and not devs:
-        chunks: list[tuple[str, str]] = []
-        if plan_chunks_for is not None:
-            chunks = list(plan_chunks_for(epic.id) or [])
-        if not chunks:
-            chunks = [("", epic.title)]
-        for letter, desc in chunks:
-            slot = letter or "full"
-            dev_key = idem("file-dev", epic.id, slot)
-            rev_key = idem("file-review-code", epic.id, slot, "round-1")
-            if state.has_idem(dev_key) or state.has_idem(rev_key):
-                continue
-            if letter:
-                dev_title = f"Implement {desc}"
-                dev_body = (
-                    f"epic: {epic.id}\n"
-                    f"idem: {dev_key}\n"
-                    f"Per plans/{epic.id}.md §{letter} — {desc}.\n"
-                    f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
-                )
-                rev_title = f"Review: {desc}"
-            else:
-                dev_title = f"Implement {epic.title}"
-                dev_body = (
-                    f"epic: {epic.id}\n"
-                    f"idem: {dev_key}\n"
-                    f"Implement deliverables from the merged plan for epic {epic.id}.\n"
-                    f"Worktree: .cto/worktrees/<dev-id> off epic/{epic.id}."
-                )
-                rev_title = f"Review: {epic.title}"
-            actions.append(FilePair(
-                upstream=FileIssue(
-                    title=dev_title,
-                    description=dev_body,
-                    labels=("role:developer", "kind:dev"),
-                    priority=2,
-                ),
-                downstream=FileIssue(
-                    title=rev_title,
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"idem: {rev_key}\n"
-                        f"Review diff on the dev branch against epic/{epic.id}."
-                    ),
-                    labels=("role:reviewer", "kind:review", "target:code"),
-                    priority=2,
-                ),
-            ))
+    # H5: Missing label detection.
+    for issue in state.issues:
+        if issue.issue_type == "epic" and issue.kind != "epic":
+            actions.append(AddLabel(issue.id, "kind:epic"))
+        if issue.kind == "epic" and issue.role != "manager":
+            actions.append(AddLabel(issue.id, "role:manager"))
+        if issue.kind in ("dev", "plan") and not issue.role:
+            actions.append(AddLabel(issue.id, "role:developer"))
+        if issue.kind == "review" and not issue.role:
+            actions.append(AddLabel(issue.id, "role:reviewer"))
 
-    # ---- Phase 4: changes-requested handling (was supervisor Hook 1).
-    # Only react to the LATEST closed review per upstream. A round-1 that
-    # closed changes-requested is historical once round-2+ exists — we'd
-    # otherwise infinitely re-tag the dev with needs-re-review on every
-    # tick, even after the approved round and the code-merge landed.
-    by_upstream: dict[str, list[Issue]] = {}
-    for rev in code_reviews:
-        if rev.is_open:
+    # H6: Stuck epic detection — no children, no activity for >1h.
+    for epic in state.epics():
+        if not epic.is_open:
             continue
-        u = _upstream_of_review(rev, state)
-        if not u:
+        children = state.children_of(epic.id)
+        if children:
             continue
-        by_upstream.setdefault(u, []).append(rev)
-    for upstream_id, revs in by_upstream.items():
-        revs.sort(key=lambda r: _review_round_number(r))
-        latest = revs[-1]
-        if not latest.changes_requested():
+        ts_str = epic.updated_at or epic.created_at
+        if not ts_str:
             continue
-        upstream = state.by_id(upstream_id)
-        if upstream is None or upstream.has_label("needs-re-review"):
+        try:
+            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (now - ts).total_seconds()
+        except ValueError:
             continue
-        actions.append(AddLabel(issue_id=upstream_id, label="needs-re-review"))
-
-    # ---- Phase 5: re-review filing (was supervisor Hook 2).
-    for d in devs:
-        if d.is_open or not d.has_label("needs-re-review"):
-            continue
-        # If an open review already covers this dev, the re-review is already
-        # in flight — emit nothing and just strip the stale label.
-        open_review_covers_dev = any(
-            r.is_open and _upstream_of_review(r, state) == d.id
-            for r in code_reviews
-        )
-        if open_review_covers_dev:
-            actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
-            continue
-        # If the latest closed review for this dev is approved, the
-        # `needs-re-review` label is stale — strip it instead of filing a
-        # new round. This prevents an infinite re-review loop after a
-        # post-approval ghost or a manual label add.
-        d_reviews = sorted(
-            (r for r in code_reviews
-             if not r.is_open and _upstream_of_review(r, state) == d.id),
-            key=_review_round_number,
-        )
-        if d_reviews and not d_reviews[-1].changes_requested():
-            actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
-            continue
-        round_n = _next_review_round(d, state)
-        rev_key = idem("file-review-code", epic.id, d.id, f"round-{round_n}")
-        if state.has_idem(rev_key):
-            continue
-        actions.append(FileIssue(
-            title=f"Re-review (round {round_n}): {d.title}",
-            description=(
-                f"epic: {epic.id}\n"
-                f"upstream: {d.id}\n"
-                f"idem: {rev_key}\n"
-                f"Re-review after dev addressed prior changes-requested."
-            ),
-            labels=("role:reviewer", "kind:review", "target:code"),
-            priority=2,
-        ))
-        actions.append(RemoveLabel(issue_id=d.id, label="needs-re-review"))
-
-    # ---- Phase 5.5: approved code review → file code merge.
-    for upstream_id, revs in by_upstream.items():
-        revs.sort(key=lambda r: _review_round_number(r))
-        latest = revs[-1]
-        if latest.changes_requested():
-            continue
-        merge_key = idem("file-code-merge", epic.id, upstream_id)
-        if state.has_idem(merge_key):
-            continue
-        if any(
-            f"upstream: {upstream_id}" in m.description
-            or f"branch: task/{upstream_id}" in m.description
-            for m in code_merges
-        ):
-            continue
-        dev = state.by_id(upstream_id)
-        if dev is None:
-            continue
-        actions.append(FileIssue(
-            title=f"Merge: {dev.title}",
-            description=(
-                f"epic: {epic.id}\n"
-                f"upstream: {upstream_id}\n"
-                f"branch: task/{upstream_id}\n"
-                f"idem: {merge_key}\n"
-                f"Merge task/{upstream_id} into epic/{epic.id}, prune sub-worktree."
-            ),
-            labels=("role:manager", "kind:merge", "target:code"),
-            priority=1,
-        ))
-
-    # ---- Phase 6: ship gate (was supervisor Hook 3, with all guards).
-    # We don't gate on "no review ever closed changes-requested" — that's
-    # historical state and can be cleared by an approved round-2. The
-    # active gate is: every dev closed, no dev still carries
-    # `needs-re-review`, no review or code-merge open, AND there are at
-    # least as many code-merges as devs (so every dev's branch was merged
-    # — without this, an epic with a changes-requested review and no
-    # follow-up merge ships prematurely).
-    ship_ready = (
-        bool(breakdowns)
-        and bool(breakdown_merges_closed)
-        and bool(plans)
-        and bool(plan_merges_closed)
-        and bool(devs)
-        and all(not d.is_open for d in devs)
-        and not any(d.has_label("needs-re-review") for d in devs)
-        and all(not r.is_open for r in code_reviews)
-        and all(not m.is_open for m in code_merges)
-        and len(code_merges) >= len(devs)
-        and not any(em.is_open for em in epic_merges)
-    )
-    if ship_ready:
-        if epic.is_bypass_cto and epic.parent_branch != "main":
-            actions.append(AutoMergeEpic(
-                epic_id=epic.id,
-                merge_target=epic.parent_branch,
-            ))
-        else:
-            ship_key = idem("file-epic-merge", epic.id)
-            if not state.has_idem(ship_key):
+        if age > 3600:  # 1 hour
+            req_idem = idem("status-request-stuck", epic.id)
+            if not state.has_idem(req_idem):
                 actions.append(FileIssue(
-                    title=f"Merge epic: {epic.title}",
+                    title=f"Status request: {epic.title}",
                     description=(
                         f"epic: {epic.id}\n"
-                        f"epic-branch: epic/{epic.id}\n"
-                        f"idem: {ship_key}"
+                        f"idem: {req_idem}\n"
+                        f"Epic has been idle for {int(age//60)} minutes. "
+                        f"Please provide a fresh status digest."
                     ),
-                    labels=("role:cto", "kind:merge", "target:epic"),
-                    priority=1,
+                    labels=("role:manager", "kind:status-request"),
+                    priority=2,
                 ))
 
     return actions
@@ -643,118 +321,9 @@ def _reconcile_leaks(state: State) -> list[Action]:
     return actions
 
 
-def _reconcile_health(state: State) -> list[Action]:
-    """Detect and auto-heal stuck/broken/orphaned state.
-
-    Runs before normal workflow transitions. Emits healing actions
-    silently; only review-loop escalations surface to the CTO inbox.
-    """
-    actions: list[Action] = []
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    # H1: Zombie issue detection — in_progress for >15 min with no updates.
-    for issue in state.issues:
-        if issue.status != "in_progress":
-            continue
-        ts_str = issue.updated_at or issue.created_at
-        if not ts_str:
-            continue
-        try:
-            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            age = (now - ts).total_seconds()
-        except ValueError:
-            continue
-        if age > 900:  # 15 minutes
-            # Auto-unclaim silently.
-            actions.append(AddLabel(issue.id, "stuck:zombie"))
-            actions.append(
-                # Reopen to clear in_progress status.
-                ReopenIssue(issue.id, "auto-heal: zombie detected, resetting claim")
-            )
-            _emit_event(
-                "stuck_detected",
-                issue_id=issue.id,
-                reason="zombie (>15m in_progress)",
-                auto_heal_action="unclaim",
-            )
-
-    # H2: Changes-requested loop detection — >3 review rounds per dev.
-    devs = [i for i in state.issues if i.kind == "dev"]
-    for dev in devs:
-        reviews = [
-            r for r in state.issues
-            if r.kind == "review" and r.target == "code"
-            and _upstream_of_review(r, state) == dev.id
-        ]
-        if len(reviews) > 3:
-            # File a CTO escalation (only once per dev).
-            esc_idem = idem("escalate-review-loop", dev.id)
-            if not state.has_idem(esc_idem):
-                actions.append(FileIssue(
-                    title=f"Escalation: {dev.title} stuck in review loop",
-                    description=(
-                        f"epic: {dev.linked_epic() or ''}\n"
-                        f"dev: {dev.id}\n"
-                        f"idem: {esc_idem}\n"
-                        f"This dev has gone through {len(reviews)} review rounds. "
-                        f"Consider manual intervention or merging with known issues."
-                    ),
-                    labels=("role:cto", "kind:escalation"),
-                    priority=1,
-                ))
-
-    # H5: Missing label detection (extends _reconcile_leaks).
-    for issue in state.issues:
-        if issue.issue_type == "epic" and issue.kind != "epic":
-            actions.append(AddLabel(issue.id, "kind:epic"))
-        if issue.kind == "epic" and issue.role != "manager":
-            actions.append(AddLabel(issue.id, "role:manager"))
-        if issue.kind in ("dev", "plan") and not issue.role:
-            actions.append(AddLabel(issue.id, "role:developer"))
-        if issue.kind == "review" and not issue.role:
-            actions.append(AddLabel(issue.id, "role:reviewer"))
-
-    # H6: Stuck epic detection — no children, no activity for >1h.
-    for epic in state.epics():
-        if not epic.is_open:
-            continue
-        children = state.children_of(epic.id)
-        if children:
-            continue
-        ts_str = epic.updated_at or epic.created_at
-        if not ts_str:
-            continue
-        try:
-            ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            age = (now - ts).total_seconds()
-        except ValueError:
-            continue
-        if age > 3600:  # 1 hour
-            req_idem = idem("status-request-stuck", epic.id)
-            if not state.has_idem(req_idem):
-                actions.append(FileIssue(
-                    title=f"Status request: {epic.title}",
-                    description=(
-                        f"epic: {epic.id}\n"
-                        f"idem: {req_idem}\n"
-                        f"Epic has been idle for {int(age//60)} minutes. "
-                        f"Please provide a fresh status digest."
-                    ),
-                    labels=("role:manager", "kind:status-request"),
-                    priority=2,
-                ))
-
-    return actions
-
-
-def reconcile(state: State, plan_chunks_for=None) -> list[Action]:
+def reconcile(state: State) -> list[Action]:
     out: list[Action] = []
-    # Phase 0: health check / auto-heal
     out.extend(_reconcile_health(state))
-    for epic in state.epics():
-        if not epic.is_open:
-            continue
-        out.extend(reconcile_epic(epic, state, plan_chunks_for=plan_chunks_for))
     out.extend(_reconcile_leaks(state))
     return out
 
@@ -762,6 +331,7 @@ def reconcile(state: State, plan_chunks_for=None) -> list[Action]:
 # ---------- Helpers ----------
 
 def _upstream_of_review(review: Issue, state: State) -> Optional[str]:
+    """Derive the upstream dev issue id from a review's description."""
     m = re.search(r"^upstream:\s*(\S+)\s*$", review.description, re.MULTILINE)
     if m:
         return m.group(1)
@@ -770,10 +340,7 @@ def _upstream_of_review(review: Issue, state: State) -> Optional[str]:
         cand = m.group(1)
         if state.by_id(cand):
             return cand
-    # Fallback: derive upstream via idem-key shape. Reviews filed by the
-    # reconciler carry idem `file-review-code:<epic>:<slot>:round-N`; their
-    # paired dev carries `file-dev:<epic>:<slot>`. Used for code reviews
-    # that predate FilePair (no description-level link to the dev).
+    # Fallback: derive upstream via idem-key shape.
     m = re.search(r"^idem:\s*file-review-code:([^:]+):([^:]+):", review.description, re.MULTILINE)
     if m:
         epic_id, slot = m.group(1), m.group(2)
@@ -782,45 +349,6 @@ def _upstream_of_review(review: Issue, state: State) -> Optional[str]:
             if i.kind == "dev" and dev_idem in i.description:
                 return i.id
     return None
-
-
-def _review_round_number(review: Issue) -> int:
-    """Extract the round-N number from a review's idem key. Defaults to 1
-    for legacy reviews without a parseable round."""
-    m = re.search(r"round-(\d+)", review.description)
-    return int(m.group(1)) if m else 1
-
-
-def _next_review_round(dev: Issue, state: State) -> int:
-    n = 1
-    for i in state.issues:
-        if i.kind != "review" or i.target != "code":
-            continue
-        if _upstream_of_review(i, state) == dev.id:
-            n += 1
-    return n
-
-
-def parse_plan_chunks(epic_id: str, root: Optional[Path] = None) -> list[tuple[str, str]]:
-    """Find chunk markers in a merged plan. Looks for headings of the form
-    `## Dev A: <desc>` or `### Chunk B — <desc>`."""
-    root = root or Path(".")
-    candidates = [
-        root / ".cto" / "worktrees" / epic_id / "plans" / f"{epic_id}.md",
-        root / "plans" / f"{epic_id}.md",
-    ]
-    for p in candidates:
-        if p.exists():
-            text = p.read_text(encoding="utf-8", errors="replace")
-            return [
-                (m.group(1), m.group(2).strip())
-                for m in re.finditer(
-                    r"^#{2,3}\s+(?:Dev|Chunk)\s+([A-Z])\s*[:—\-]\s*(.+)$",
-                    text,
-                    re.MULTILINE,
-                )
-            ]
-    return []
 
 
 # ---------- Telemetry helpers ----------
@@ -874,37 +402,6 @@ def execute(actions: list[Action], dry_run: bool = False, team_dir: Optional[Pat
                             kind = lbl.split(":", 1)[1]
                             break
                     _publish("task.created", task_id=new_id, kind=kind, title=a.title)
-                    if kind == "dev":
-                        _publish("dev.assigned", task_id=new_id)
-                    elif kind == "review":
-                        _publish("review.required", task_id=new_id)
-                    elif kind == "merge":
-                        _publish("merge.ready", task_id=new_id)
-        elif isinstance(a, FilePair):
-            log.append(
-                f"pair: {a.upstream.title!r} → {a.downstream.title!r} "
-                f"(downstream blocked by upstream)"
-            )
-            if not dry_run:
-                up_id = _bd_file(a.upstream)
-                if up_id:
-                    _publish("task.created", task_id=up_id, kind=a.upstream.labels[0].split(":", 1)[1] if a.upstream.labels else "", title=a.upstream.title)
-                    down_action = FileIssue(
-                        title=a.downstream.title,
-                        description=a.downstream.description,
-                        labels=a.downstream.labels,
-                        priority=a.downstream.priority,
-                        blocks=None,
-                    )
-                    down_id = _bd_file(down_action)
-                    if down_id:
-                        subprocess.run(
-                            ["bd", "dep", up_id, "--blocks", down_id],
-                            check=False, capture_output=True,
-                        )
-                        _publish("task.created", task_id=down_id, kind=a.downstream.labels[0].split(":", 1)[1] if a.downstream.labels else "", title=a.downstream.title)
-                        if "review" in [l for l in a.downstream.labels if l.startswith("kind:")]:
-                            _publish("review.required", task_id=down_id)
         elif isinstance(a, AddLabel):
             log.append(f"label+: {a.issue_id} +{a.label}")
             if not dry_run:
@@ -936,11 +433,6 @@ def execute(actions: list[Action], dry_run: bool = False, team_dir: Optional[Pat
                     check=False, capture_output=True,
                 )
                 _publish("task.closed", issue_id=a.issue_id, reason=a.reason)
-        elif isinstance(a, AutoMergeEpic):
-            log.append(f"auto-merge: epic/{a.epic_id} into {a.merge_target}")
-            if not dry_run:
-                _auto_merge_epic(a.epic_id, a.merge_target)
-                _publish("epic.merged", epic_id=a.epic_id, target=a.merge_target)
     if not dry_run:
         dur_ms = int((time.monotonic() - t0) * 1000)
         _emit_event("reconciler_tick", actions=";".join(log), duration_ms=str(dur_ms))
@@ -990,131 +482,6 @@ def _bd_file(action: FileIssue) -> Optional[str]:
     return new_id
 
 
-def _auto_merge_epic(epic_id: str, merge_target: str) -> None:
-    """Auto-execute epic merge for bypass-cto epics targeting non-main branches."""
-    tdir = Path(".")
-    epic_branch = f"epic/{epic_id}"
-
-    # Verify epic branch exists.
-    r = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{epic_branch}"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-    if r.returncode != 0:
-        return
-
-    # Verify target branch exists locally or on origin.
-    r = subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{merge_target}"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-    if r.returncode != 0:
-        r = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{merge_target}"],
-            cwd=str(tdir), check=False, capture_output=True,
-        )
-        if r.returncode != 0:
-            return
-
-    # Refuse unless main worktree is already on the target branch.
-    head = subprocess.run(
-        ["git", "symbolic-ref", "--short", "HEAD"],
-        cwd=str(tdir), check=False, capture_output=True, text=True,
-    ).stdout.strip()
-    if head != merge_target:
-        return
-
-    # Stash .beads if needed.
-    stashed = False
-    r1 = subprocess.run(
-        ["git", "diff", "--quiet", "--", ".beads"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-    r2 = subprocess.run(
-        ["git", "diff", "--cached", "--quiet", "--", ".beads"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-    if r1.returncode != 0 or r2.returncode != 0:
-        r = subprocess.run(
-            ["git", "stash", "push", "-u", "-m", f"cto-auto-merge-{epic_id}", "--", ".beads"],
-            cwd=str(tdir), check=False, capture_output=True,
-        )
-        if r.returncode == 0:
-            stashed = True
-
-    r = subprocess.run(
-        ["git", "-c", "commit.gpgsign=false", "merge", "--no-ff", epic_branch,
-         "-m", f"merge {epic_branch} into {merge_target}"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-    if r.returncode != 0:
-        if stashed:
-            subprocess.run(
-                ["git", "stash", "pop"], cwd=str(tdir), check=False, capture_output=True,
-            )
-        return
-
-    if stashed:
-        subprocess.run(
-            ["git", "stash", "pop"], cwd=str(tdir), check=False, capture_output=True,
-        )
-
-    # Close any stale open kind:merge target:epic issue.
-    r = subprocess.run(
-        ["bd", "list", "--status", "open", "--label", "kind:merge",
-         "--label", "target:epic", "--json"],
-        cwd=str(tdir), check=False, capture_output=True, text=True,
-    )
-    if r.returncode == 0:
-        try:
-            data = json.loads(r.stdout)
-            for item in data:
-                desc = item.get("description", "")
-                if epic_branch in desc or epic_id in desc:
-                    mid = item.get("id")
-                    if mid:
-                        subprocess.run(
-                            ["bd", "comment", mid, "merged by reconciler"],
-                            cwd=str(tdir), check=False, capture_output=True,
-                        )
-                        subprocess.run(
-                            ["bd", "update", mid, "--add-label", "verdict:approved"],
-                            cwd=str(tdir), check=False, capture_output=True,
-                        )
-                        subprocess.run(
-                            ["bd", "close", mid, "-r", "merged by reconciler"],
-                            cwd=str(tdir), check=False, capture_output=True,
-                        )
-        except json.JSONDecodeError:
-            pass
-
-    # Close the epic itself.
-    subprocess.run(
-        ["bd", "close", epic_id, "-r", f"epic merged into {merge_target} by reconciler"],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-
-    # Prune epic worktree + branch.
-    wt = tdir / ".cto" / "worktrees" / epic_id
-    if wt.is_dir():
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(wt)],
-            cwd=str(tdir), check=False, capture_output=True,
-        )
-    subprocess.run(
-        ["git", "branch", "-D", epic_branch],
-        cwd=str(tdir), check=False, capture_output=True,
-    )
-
-    _emit_event(
-        "merge_executed",
-        branch=epic_branch,
-        target=merge_target,
-        epic_id=epic_id,
-        commit_hash="",
-    )
-
-
 # ---------- Load state from bd ----------
 
 def load_state() -> State:
@@ -1162,7 +529,7 @@ def load_state() -> State:
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--role", default="manager",
-                   help="Only role=manager performs reconciliation.")
+                   help="Only role=manager runs health checks.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--preview", action="store_true",
                    help="Shadow mode: run health auditor and print proposed "
@@ -1196,7 +563,7 @@ def main(argv: list[str]) -> int:
                   f"epic={heal.epic_id} reason={heal.reason!r}")
         return 0
 
-    actions = reconcile(state, plan_chunks_for=parse_plan_chunks)
+    actions = reconcile(state)
     for line in execute(actions, dry_run=args.dry_run, team_dir=args.team_dir):
         print(line)
     return 0

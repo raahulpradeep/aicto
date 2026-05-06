@@ -9,14 +9,14 @@ import datetime as dt
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
@@ -24,7 +24,7 @@ from textual.widgets import Button, Static
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
@@ -79,6 +79,14 @@ def _restart_agent(team: str, window: str) -> bool:
 class AgentDetailScreen(ModalScreen[None]):
     """Live agent detail with log tail and control buttons."""
 
+    CSS = """
+    #agent-detail { width: 90%; height: 90%; padding: 1 2; }
+    #agent-header { height: auto; }
+    #agent-stats { height: auto; margin: 1 0; }
+    #agent-log-scroll { height: 1fr; border: solid cyan; }
+    .dialog-buttons { height: auto; margin-top: 1; }
+    """
+
     log_lines = reactive[str]("")
     agent_data = reactive[dict[str, Any]]({})
     _refresh_interval: float = 1.0
@@ -95,7 +103,8 @@ class AgentDetailScreen(ModalScreen[None]):
         with Vertical(id="agent-detail"):
             yield Static("", id="agent-header")
             yield Static("", id="agent-stats")
-            yield Static("", id="agent-log")
+            with VerticalScroll(id="agent-log-scroll"):
+                yield Static("", id="agent-log")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Kill (SIGTERM)", variant="error", id="kill")
                 yield Button("Kill -9", variant="error", id="kill9")
@@ -129,12 +138,19 @@ class AgentDetailScreen(ModalScreen[None]):
         provider = a.get("provider", "—")
         model = a.get("model", "—")
         stale = a.get("stale", False)
+        activity_status = a.get("activity_status")
+        activity_task_id = a.get("activity_task_id")
+        activity_last_ts = a.get("activity_last_ts")
 
         status = "idle"
         if stale:
             status = "stale"
         elif issue:
             status = "working"
+        elif activity_status == "working":
+            status = "working"
+        elif activity_status == "stuck":
+            status = "stuck"
 
         now = dt.datetime.now(dt.timezone.utc)
         started = None
@@ -144,12 +160,16 @@ class AgentDetailScreen(ModalScreen[None]):
                 started = dt.datetime.fromisoformat(started_str.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 pass
+        elif activity_last_ts and isinstance(activity_last_ts, dt.datetime):
+            started = activity_last_ts
         elapsed_secs = int((now - started).total_seconds()) if started else 0
 
         if status == "working":
             status_text = f"🟢 WORKING  {_fmt_elapsed(max(0, elapsed_secs))}"
+        elif status == "stuck":
+            status_text = f"🟡 STUCK  {_fmt_elapsed(max(0, elapsed_secs))}"
         elif status == "stale":
-            status_text = f"🟡 STALE"
+            status_text = f"💤 STALE"
         else:
             status_text = f"⚪ IDLE"
 
@@ -162,6 +182,8 @@ class AgentDetailScreen(ModalScreen[None]):
         issue_text = "—"
         if issue:
             issue_text = f"{issue['id']} — {issue.get('title', '')[:50]}"
+        elif activity_task_id:
+            issue_text = f"{activity_task_id} — (activity log)"
 
         stats = (
             f"Model: {provider}:{model}  |  "

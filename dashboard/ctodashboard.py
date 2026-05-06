@@ -9,6 +9,7 @@ Screens:
 Quit with q, Q, Esc, or Ctrl-C.
 """
 from __future__ import annotations
+from typing import Optional
 
 import datetime as dt
 import json
@@ -51,7 +52,7 @@ _prev_data: dict[str, tuple] = {}
 # ---- shell helpers (copied from top.py) -----------------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
@@ -168,7 +169,7 @@ def _human_duration(seconds: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:
@@ -509,7 +510,7 @@ def _activity_panel(events: list[dict], has_focus: bool = False) -> Panel:
 # ---- modals ---------------------------------------------------------------
 
 
-class ApproveModal(ModalScreen[str | None]):
+class ApproveModal(ModalScreen[Optional[str]]):
     def __init__(self, item: dict) -> None:
         super().__init__()
         self.item = item
@@ -536,7 +537,7 @@ class ApproveModal(ModalScreen[str | None]):
             self.dismiss(None)
 
 
-class RejectModal(ModalScreen[str | None]):
+class RejectModal(ModalScreen[Optional[str]]):
     def __init__(self, item: dict) -> None:
         super().__init__()
         self.item = item
@@ -723,7 +724,7 @@ class DashboardApp(App):
 
     def _poll_worker(self) -> None:
         """Runs in a background thread. Gathers ALL data and pushes to main thread."""
-        error_msg: str | None = None
+        error_msg: Optional[str] = None
         try:
             t0 = time.monotonic()
 
@@ -836,7 +837,7 @@ class DashboardApp(App):
         self._pending_item = item
         self.push_screen(ApproveModal(item), self._on_approve)
 
-    def _on_approve(self, comment: str | None) -> None:
+    def _on_approve(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = getattr(self, "_pending_item", None)
@@ -857,7 +858,7 @@ class DashboardApp(App):
         self._pending_item = item
         self.push_screen(RejectModal(item), self._on_reject)
 
-    def _on_reject(self, comment: str | None) -> None:
+    def _on_reject(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = getattr(self, "_pending_item", None)

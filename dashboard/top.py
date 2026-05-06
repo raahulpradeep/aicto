@@ -17,6 +17,7 @@ Known limitation: `bd list --status closed --json` doesn't include the
     claim-to-close.
 """
 from __future__ import annotations
+from typing import Optional
 
 import datetime as dt
 import json
@@ -55,7 +56,7 @@ _prev_data: dict[str, tuple] = {}
 # ---- shell helpers --------------------------------------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd,
@@ -186,7 +187,7 @@ def _human_duration(seconds: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:

@@ -14,7 +14,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 
 class ActivityLog:
@@ -63,8 +63,8 @@ class ActivityLog:
     def tail(
         self,
         n: int = 50,
-        since: dt.datetime | None = None,
-        event_types: set[str] | None = None,
+        since: Optional[dt.datetime] = None,
+        event_types: Optional[set[str]] = None,
     ) -> list[dict[str, Any]]:
         """Return the most recent *n* events, optionally filtered."""
         out: list[dict[str, Any]] = []
@@ -129,7 +129,7 @@ class ActivityLog:
 # Convenience helpers used by supervisor / reconciler ------------------------
 
 
-def emit_agent_iteration_start(team_dir: Path | str, agent: str, task_id: str | None) -> None:
+def emit_agent_iteration_start(team_dir: Path | str, agent: str, task_id: Optional[str]) -> None:
     ActivityLog(team_dir).emit(
         "agent_iteration_start",
         agent=agent,
@@ -140,7 +140,7 @@ def emit_agent_iteration_start(team_dir: Path | str, agent: str, task_id: str | 
 def emit_agent_iteration_end(
     team_dir: Path | str,
     agent: str,
-    task_id: str | None,
+    task_id: Optional[str],
     exit_code: int,
     duration_ms: int,
 ) -> None:
@@ -156,7 +156,7 @@ def emit_agent_iteration_end(
 def emit_agent_output(
     team_dir: Path | str,
     agent: str,
-    task_id: str | None,
+    task_id: Optional[str],
     lines: list[str],
 ) -> None:
     ActivityLog(team_dir).emit(
@@ -173,7 +173,7 @@ def emit_issue_created(
     kind: str,
     title: str,
     labels: list[str],
-    epic_id: str | None = None,
+    epic_id: Optional[str] = None,
 ) -> None:
     ActivityLog(team_dir).emit(
         "issue_created",
@@ -189,8 +189,8 @@ def emit_merge_executed(
     team_dir: Path | str,
     branch: str,
     target: str,
-    epic_id: str | None = None,
-    commit_hash: str | None = None,
+    epic_id: Optional[str] = None,
+    commit_hash: Optional[str] = None,
 ) -> None:
     ActivityLog(team_dir).emit(
         "merge_executed",

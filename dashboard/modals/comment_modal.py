@@ -1,5 +1,6 @@
 """Comment modal for adding comments to issues/epics from the dashboard."""
 from __future__ import annotations
+from typing import Optional
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -7,7 +8,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Static, TextArea
 
 
-class CommentModal(ModalScreen[str | None]):
+class CommentModal(ModalScreen[Optional[str]]):
     """TextArea input for adding comments to issues.
 
     Returns the comment text if submitted, None if cancelled.

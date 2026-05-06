@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 from rich.panel import Panel
 from rich.table import Table
@@ -19,7 +19,7 @@ from textual.widgets import Static
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:

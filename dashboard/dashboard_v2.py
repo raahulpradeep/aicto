@@ -150,7 +150,7 @@ def _read_bd_proc(proc: subprocess.Popen, timeout: float = 5.0) -> list:
 # ---- data gatherers (same as before) -------------------------------------
 
 
-def _parse_iso(s: str) -> dt.Optional[datetime]:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:

@@ -42,7 +42,7 @@ def _bd_json(args: list[str], cwd: Path) -> list[dict[str, Any]]:
         return []
 
 
-def _parse_iso(s: str) -> dt.Optional[datetime]:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:

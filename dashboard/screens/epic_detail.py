@@ -9,7 +9,7 @@ import datetime as dt
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
 from rich.panel import Panel
 from rich.table import Table
@@ -25,7 +25,7 @@ from dashboard.widgets.epic_pipeline import _compute_stages, _human_age, _parse_
 TEAMS_DIR = Path(__file__).resolve().parent.parent.parent / "teams"
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
