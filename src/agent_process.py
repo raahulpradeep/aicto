@@ -254,13 +254,14 @@ class AgentProcess:
 
     def _do_manager_pass(self) -> None:
         """Manager agents don't claim single tasks; they do a digest pass."""
+        self._telemetry("manager.pass_started", agent=self.agent_id, role=self.cfg.role)
         starter = (
             "Do one pass per your role manual: "
             "(1) close any open kind:status-request issues with a fresh digest; "
-            "(2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; "
+            "(2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown (or merge:breakdown for bypass-cto) — YOU must file the approval/merge yourself after closing the breakdown; "
             "(3) claim and complete any ready kind:merge role:manager issue; "
-            "(4) update the team's open kind:status-digest issue (or create one if none). "
-            "All plan/dev filing and epic-ship detection is automated by the reconciler — do not do it manually. "
+            "(4) check if any epic is ship-ready and file the kind:merge target:epic yourself if so; "
+            "(5) update the team's open kind:status-digest issue (or create one if none). "
             "Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — "
             "I (the supervisor) will run you again."
         )
@@ -269,7 +270,10 @@ class AgentProcess:
         self.state.iteration_count += 1
         self.state.last_run_at = self._now()
         self.store.save(self.state)
-        time.sleep(10)
+        # Interruptible cooldown: wake immediately if anything happens on the
+        # bus during the next 10s, so the manager doesn't sleep through new
+        # work it could action right away.
+        self._wake_or_sleep(10.0)
 
     def _do_task(self, task_id: str) -> None:
         """Claim, execute, and release a single bd issue."""
@@ -277,6 +281,23 @@ class AgentProcess:
         self.state.iteration_count += 1
         self.state.last_run_at = self._now()
         self.store.save(self.state)
+        # Gather task metadata for the activity log.
+        task_title = ""
+        task_kind = ""
+        issue_json = self._bd(["show", task_id, "--json"], check=False)
+        if issue_json:
+            try:
+                issue_arr = json.loads(issue_json)
+                issue_obj = issue_arr[0] if isinstance(issue_arr, list) else issue_arr
+                task_title = issue_obj.get("title", "")
+                for lbl in issue_obj.get("labels", []):
+                    if lbl.startswith("kind:"):
+                        task_kind = lbl
+                        break
+            except Exception:
+                pass
+        self._telemetry("agent.claimed", agent=self.agent_id, task_id=task_id,
+                        task_title=task_title, task_kind=task_kind, role=self.cfg.role)
 
         # Read the issue to build context
         issue_json = self._bd(["show", task_id, "--json"])
@@ -300,7 +321,8 @@ class AgentProcess:
                 f"You have been assigned bd issue {task_id} (already in_progress). "
                 f"Run 'bd show {task_id}' to read it, identify whether it's kind:plan or kind:dev, "
                 f"set up your worktree, do the work, run any project tests/lints, commit on the task branch, "
-                f"and close the bd issue with a short gist. Do exactly one bd issue this iteration and exit."
+                f"and close the bd issue with a short gist. AFTER closing, you MUST file the next review issue yourself "
+                f"(plan review or code review with role:reviewer). Do exactly one bd issue this iteration and exit."
             )
         elif self.cfg.role == "reviewer":
             starter = (
@@ -308,42 +330,49 @@ class AgentProcess:
                 f"You are agent '{self.agent_id}'. "
                 f"You have been assigned bd review issue {task_id} (already in_progress). "
                 f"Run 'bd show {task_id}' to identify the upstream and what artifact to read. "
-                f"Apply your principal-engineer review; if approved on a plan, file the kind:approval; "
-                f"if approved on code, file the kind:merge for the manager; if changes requested, "
-                f"reopen upstream with concrete asks. Do exactly one review this iteration and exit."
+                f"Apply your principal-engineer review; if approved on a plan, file the kind:approval target:plan "
+                f"(or kind:merge target:plan for bypass-cto) yourself; if approved on code, file the kind:merge target:code "
+                f"for the manager yourself; if changes requested, reopen the upstream AND reset THIS review issue to "
+                f"open (assignee='') with `bd dep add <review-id> <upstream-id>` so it blocks until the dev re-closes "
+                f"the upstream — do NOT close the review or file a new round-N re-review. Do exactly one review this "
+                f"iteration and exit."
             )
         else:
             starter = context_header + "\nDo your work and exit cleanly."
 
         iter_start = time.time()
-        rc = self._invoke_cli(starter, task_id=task_id)
-        iter_dur = int((time.time() - iter_start) * 1000)
+        rc = -1
+        try:
+            rc = self._invoke_cli(starter, task_id=task_id)
+        except Exception as exc:
+            self._log("CLI invocation raised exception: %s", exc)
+            self._append_scratchpad(f"Iteration {self.state.iteration_count} exception: {exc}")
+        finally:
+            iter_dur = int((time.time() - iter_start) * 1000)
+            self._telemetry("agent_iteration_end",
+                            agent=self.agent_id,
+                            task_id=task_id,
+                            exit_code=str(rc),
+                            duration_ms=str(iter_dur))
 
-        self._telemetry("agent_iteration_end",
-                        agent=self.agent_id,
-                        task_id=task_id,
-                        exit_code=str(rc),
-                        duration_ms=str(iter_dur))
-
-        if rc != 0:
-            self._log("CLI exited %d", rc)
-            self._release_claim(task_id)
-            self.state.crash_count += 1
-            self._append_scratchpad(f"Iteration {self.state.iteration_count} failed with rc={rc}")
-        else:
-            # Verify the agent closed the issue; if not, reset it.
-            st = self._bd_show_status(task_id)
-            if st == "in_progress":
-                self._log("agent did not close %s; resetting to open", task_id)
-                self._bd(["update", task_id, "--status", "open", "--assignee", ""])
+            if rc != 0:
+                self._log("CLI exited %d", rc)
+                self.state.crash_count += 1
+                self._append_scratchpad(f"Iteration {self.state.iteration_count} failed with rc={rc}")
             else:
-                self.state.crash_count = 0  # success resets crash streak
-                self._append_scratchpad(f"Iteration {self.state.iteration_count} ok (task={task_id})")
-            self._release_claim(task_id)
+                # Verify the agent closed the issue; if not, reset it.
+                st = self._bd_show_status(task_id)
+                if st == "in_progress":
+                    self._log("agent did not close %s; resetting to open", task_id)
+                    self._bd(["update", task_id, "--status", "open", "--assignee", ""])
+                else:
+                    self.state.crash_count = 0  # success resets crash streak
+                    self._append_scratchpad(f"Iteration {self.state.iteration_count} ok (task={task_id})")
 
-        self.state.current_task_id = None
-        self.state.last_run_at = self._now()
-        self.store.save(self.state)
+            self._release_claim(task_id)
+            self.state.current_task_id = None
+            self.state.last_run_at = self._now()
+            self.store.save(self.state)
 
     # ------------------------------------------------------------------
     # CLI invocation
@@ -477,6 +506,7 @@ class AgentProcess:
             import shutil
             shutil.rmtree(lock_dir, ignore_errors=True)
         self._log("released claim on %s", task_id)
+        self._telemetry("agent.released", agent=self.agent_id, task_id=task_id, role=self.cfg.role)
 
     def _recover_from_crash(self) -> None:
         """On startup after a crash, release any stale claims."""
@@ -491,6 +521,11 @@ class AgentProcess:
                         tid = issue["id"]
                         self._log("boot recovery: resetting zombie %s", tid)
                         self._release_claim(tid)
+                        self._telemetry("agent_iteration_end",
+                                        agent=self.agent_id,
+                                        task_id=tid,
+                                        exit_code="-1",
+                                        duration_ms="0")
             except Exception:
                 pass
         # Clean stale lock dirs
@@ -503,6 +538,11 @@ class AgentProcess:
                     import shutil
                     shutil.rmtree(ld, ignore_errors=True)
                     self._log("boot recovery: removed stale lock %s", ld.name)
+                    self._telemetry("agent_iteration_end",
+                                    agent=self.agent_id,
+                                    task_id=ld.name,
+                                    exit_code="-1",
+                                    duration_ms="0")
         self.state.status = "running"
         self.store.save(self.state)
 
@@ -542,6 +582,45 @@ class AgentProcess:
         # Keep scratchpad bounded
         if len(self.state.scratchpad) > 8000:
             self.state.scratchpad = self.state.scratchpad[-8000:]
+
+    def _wake_or_sleep(self, max_seconds: float) -> None:
+        """Sleep up to max_seconds, returning early on bd state change.
+
+        Watches the bd journal + agent_state.db mtimes; exits within ~150ms
+        of any change. Prevents the manager from sleeping through new work.
+        """
+        if max_seconds <= 0:
+            return
+        watch = []
+        for rel in (".beads/issues.jsonl", ".beads/issues.db",
+                    ".beads/issues.db-wal", ".cto/agent_state.db",
+                    ".cto/agent_state.db-wal", ".cto/activity.jsonl"):
+            p = self.cfg.team_dir / rel
+            if p.exists():
+                watch.append(p)
+        if not watch:
+            time.sleep(max_seconds)
+            return
+
+        def snap() -> tuple:
+            out = []
+            for p in watch:
+                try:
+                    st = p.stat()
+                    out.append((str(p), st.st_mtime_ns, st.st_size))
+                except OSError:
+                    out.append((str(p), 0, 0))
+            return tuple(out)
+
+        baseline = snap()
+        deadline = time.monotonic() + max_seconds
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.15, remaining))
+            if snap() != baseline:
+                return
 
     def _bd(self, args: list[str], check: bool = True) -> str:
         """Run bd CLI and return stdout."""

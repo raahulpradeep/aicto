@@ -13,7 +13,6 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -39,10 +38,11 @@ class ActivityStream(Static):
     def set_events(self, events: list[dict[str, Any]]) -> None:
         """Called by the parent app after gathering data."""
         self.events = events
+        self.border_title = f"Activity ({len(self.events)})"
 
-    def render(self) -> Panel:
+    def render(self) -> Table:
         try:
-            t = Table(expand=True, show_header=False, show_lines=False, pad_edge=False)
+            t = Table(expand=True, show_header=False, show_lines=False, pad_edge=False, box=None)
             t.add_column("TIME", overflow="ellipsis", no_wrap=True, width=8)
             t.add_column("EVENT", overflow="ellipsis", no_wrap=True, ratio=1)
 
@@ -59,10 +59,9 @@ class ActivityStream(Static):
             if not self.events:
                 t.add_row(Text("—", style="dim"), Text("(no activity yet)", style="dim"))
 
-            border = "bright_blue" if self.has_focus else "blue"
-            return Panel(t, title=f"Activity ({len(self.events)})", border_style=border)
+            return t
         except Exception:
-            return Panel("(error rendering activity)", title="Activity", border_style="red")
+            return Table(title="(error rendering activity)")
 
 
 def _format_event(ev: dict[str, Any]) -> Text:

@@ -13,9 +13,8 @@ import datetime as dt
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
 
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -43,7 +42,7 @@ def _bd_json(args: list[str], cwd: Path) -> list[dict[str, Any]]:
         return []
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> dt.Optional[datetime]:
     if not s:
         return None
     try:
@@ -77,14 +76,16 @@ class EpicPipeline(Static):
         self.pipelines = pipelines
         if self.selected_index >= len(self.pipelines):
             self.selected_index = max(0, len(self.pipelines) - 1)
+        self.border_title = f"Epic Pipeline ({len(self.pipelines)})"
 
-    def render(self) -> Panel:
+    def render(self) -> Table:
         try:
             t = Table(
                 expand=True,
                 show_lines=False,
                 header_style="bold",
                 pad_edge=False,
+                box=None,
             )
             t.add_column("TEAM", overflow="ellipsis", no_wrap=True, width=10)
             t.add_column("EPIC", overflow="ellipsis", no_wrap=True, ratio=2)
@@ -108,14 +109,9 @@ class EpicPipeline(Static):
                     *[Text("—", style="dim")] * 7,
                 )
 
-            border = "bright_green" if self.has_focus else "green"
-            return Panel(
-                t,
-                title=f"Epic Pipeline ({len(self.pipelines)})",
-                border_style=border,
-            )
+            return t
         except Exception:
-            return Panel("(error rendering pipeline)", title="Epic Pipeline", border_style="red")
+            return Table(title="(error rendering pipeline)")
 
     def on_key(self, event) -> None:
         if not self.pipelines:
@@ -125,7 +121,7 @@ class EpicPipeline(Static):
         elif event.key == "down":
             self.selected_index = min(len(self.pipelines) - 1, self.selected_index + 1)
 
-    def selected_epic(self) -> dict[str, Any] | None:
+    def selected_epic(self) -> Optional[dict[str, Any]]:
         if not self.pipelines or self.selected_index >= len(self.pipelines):
             return None
         return self.pipelines[self.selected_index]
@@ -189,15 +185,39 @@ def _read_bd_proc(proc: subprocess.Popen, timeout: float = 5.0) -> list:
         return []
 
 
-def _gather_team_pipelines(team_dir: Path) -> list[dict[str, Any]]:
-    """Gather epic pipeline data for a single team. bd calls are parallelised."""
-    open_proc = _bd_popen(["list", "--status", "open"], team_dir)
-    ip_proc = _bd_popen(["list", "--status", "in_progress"], team_dir)
-    closed_proc = _bd_popen(["list", "--status", "closed", "--limit", "50"], team_dir)
+def _gather_team_pipelines(
+    team_dir: Path,
+    open_issues: Optional[list[dict[str, Any]]] = None,
+    in_progress_issues: Optional[list[dict[str, Any]]] = None,
+    closed_issues: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Gather epic pipeline data for a single team.
 
-    issues = _read_bd_proc(open_proc)
-    issues += _read_bd_proc(ip_proc)
-    closed_issues = _read_bd_proc(closed_proc)
+    If callers pass pre-fetched issue lists, we skip the subprocess fan-out
+    entirely (used by the dashboard to dedup `bd list` calls). Otherwise we
+    parallelise the three bd queries as a fallback for standalone use.
+    """
+    if open_issues is None or in_progress_issues is None or closed_issues is None:
+        open_proc = _bd_popen(["list", "--status", "open"], team_dir)
+        ip_proc = _bd_popen(["list", "--status", "in_progress"], team_dir)
+        closed_proc = _bd_popen(["list", "--status", "closed", "--limit", "50"], team_dir)
+        if open_issues is None:
+            open_issues = _read_bd_proc(open_proc)
+        else:
+            try: open_proc.kill()
+            except Exception: pass
+        if in_progress_issues is None:
+            in_progress_issues = _read_bd_proc(ip_proc)
+        else:
+            try: ip_proc.kill()
+            except Exception: pass
+        if closed_issues is None:
+            closed_issues = _read_bd_proc(closed_proc)
+        else:
+            try: closed_proc.kill()
+            except Exception: pass
+
+    issues = list(open_issues) + list(in_progress_issues)
 
     epics: list[dict[str, Any]] = []
     by_epic: dict[str, list[dict[str, Any]]] = {}

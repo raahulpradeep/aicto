@@ -5,6 +5,7 @@ Uses Textual DataTable widgets for smooth in-place row updates.
 No more panel collapse during polling.
 """
 from __future__ import annotations
+from typing import Optional
 
 import datetime as dt
 import json
@@ -51,7 +52,7 @@ _prev_data: dict[str, tuple] = {}
 # ---- shell helpers (copied from ctodashboard.py) --------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
@@ -83,6 +84,51 @@ def _bd_json(args: list[str], cwd: Path) -> list:
         return []
 
 
+# Cache: team_dir → (mtime_ns, parsed_issues) so we re-read only when changed.
+_issues_cache: dict[str, tuple[int, list[dict]]] = {}
+
+
+def _read_issues_local(team_dir: Path) -> Optional[list[dict]]:
+    """Read team's bd issues directly from .beads/issues.jsonl.
+
+    Avoids the per-poll `bd list` subprocess fork. Returns None if the file
+    isn't present (caller should fall back to subprocess).
+    """
+    p = team_dir / ".beads" / "issues.jsonl"
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    key = str(p)
+    cached = _issues_cache.get(key)
+    if cached and cached[0] == st.st_mtime_ns:
+        return cached[1]
+    issues: list[dict] = []
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("_type") == "issue":
+                    issues.append(ev)
+    except OSError:
+        return None
+    _issues_cache[key] = (st.st_mtime_ns, issues)
+    return issues
+
+
+def _filter_local(issues: list[dict], status: str, limit: Optional[int] = None) -> list[dict]:
+    out = [i for i in issues if i.get("status") == status]
+    if limit:
+        out = out[:limit]
+    return out
+
+
 def _bd_popen(args: list[str], cwd: Path) -> subprocess.Popen:
     return subprocess.Popen(
         ["bd", *args, "--json"],
@@ -104,7 +150,7 @@ def _read_bd_proc(proc: subprocess.Popen, timeout: float = 5.0) -> list:
 # ---- data gatherers (same as before) -------------------------------------
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> dt.Optional[datetime]:
     if not s:
         return None
     try:
@@ -145,8 +191,8 @@ def _kind(labels: list[str]) -> str:
 def _agent_status_from_activity(team_name: str, team_dir: Path) -> dict[str, dict]:
     """Derive per-slot agent status by scanning the tail of activity.jsonl.
 
-    Returns {slot: {"status": str, "last_ts": datetime|None,
-                    "task_id": str|None}}.
+    Returns {slot: {"status": str, "last_ts": Optional[datetime],
+                    "task_id": Optional[str]}}.
 
     Status values:
         working      -- iteration_start without a matching iteration_end
@@ -181,7 +227,7 @@ def _agent_status_from_activity(team_name: str, team_dir: Path) -> dict[str, dic
         except json.JSONDecodeError:
             continue
         evt = ev.get("event") or ev.get("topic") or ""
-        if evt not in ("agent_iteration_start", "agent_iteration_end"):
+        if evt not in ("agent_iteration_start", "agent_iteration_end", "manager.pass_started"):
             continue
         agent = ev.get("agent") or ""
         if not agent.startswith(prefix):
@@ -212,66 +258,73 @@ def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict]
     sess = f"cto-{team_name}"
     windows = tmux_windows(sess) if tmux_alive(sess) else []
     activity_status = _agent_status_from_activity(team_name, team_dir)
-    proc = _bd_popen(["ready", "--label", f"role:developer", "--json"], team_dir)
-    dev_rows = _read_bd_proc(proc)
-    dev_map = {r["id"]: r for r in dev_rows}
 
-    proc = _bd_popen(["ready", "--label", f"role:reviewer", "--json"], team_dir)
-    rev_rows = _read_bd_proc(proc)
-    rev_map = {r["id"]: r for r in rev_rows}
+    # Fast path: read issues.jsonl directly to skip three bd subprocess forks.
+    # Falls back to parallel `bd list` queries if the file isn't there.
+    local = _read_issues_local(team_dir)
+    if local is not None:
+        open_issues = _filter_local(local, "open")
+        in_progress_issues = _filter_local(local, "in_progress")
+        closed_local = sorted(
+            _filter_local(local, "closed"),
+            key=lambda r: r.get("closed_at") or "",
+            reverse=True,
+        )
+        closed_issues = closed_local[:50]
+    else:
+        open_proc = _bd_popen(["list", "--status", "open"], team_dir)
+        ip_proc = _bd_popen(["list", "--status", "in_progress"], team_dir)
+        closed_proc = _bd_popen(["list", "--status", "closed", "--limit", "50"], team_dir)
+        open_issues = _read_bd_proc(open_proc)
+        in_progress_issues = _read_bd_proc(ip_proc)
+        closed_issues = _read_bd_proc(closed_proc)
 
-    proc = _bd_popen(["ready", "--label", f"role:manager", "--json"], team_dir)
-    mgr_rows = _read_bd_proc(proc)
-    mgr_map = {r["id"]: r for r in mgr_rows}
-
-    role_map = {**dev_map, **rev_map, **mgr_map}
+    ip_by_assignee = {r["assignee"]: r for r in in_progress_issues if r.get("assignee")}
 
     for w in windows:
         parts = w.split(":", 1)
         slot = parts[1] if len(parts) > 1 else w
-        issue = role_map.get(slot)
+        issue = ip_by_assignee.get(f"{team_name}:{slot}")
         act = activity_status.get(slot, {})
         agents.append({
             "agent": f"{team_name}:{slot}", "issue": issue, "team": team_name,
             "provider": "claude", "model": "sonnet", "window": slot,
-            "activity_status": act.get("status"),  # working|idle|stuck|None
+            "activity_status": act.get("status"),  # working|idle|Optional[stuck]
             "activity_last_ts": act.get("last_ts"),
             "activity_task_id": act.get("task_id"),
         })
 
-    # Inbox (role:cto)
-    inbox = _bd_json(["list", "--status", "open", "--label", "role:cto", "--json"], team_dir)
+    # Inbox (role:cto) — derive from already-fetched open list
     inbox_rows = []
-    for r in inbox:
+    for r in open_issues:
         labels = r.get("labels", [])
-        if any(l.startswith("kind:approval") or l.startswith("kind:merge") for l in labels):
+        if "role:cto" in labels and any(
+            l.startswith("kind:approval") or l.startswith("kind:merge") for l in labels
+        ):
             inbox_rows.append({**r, "team": team_name})
 
-    # Open tasks (dev/review not claimed or in-progress)
-    open_tasks = _bd_json(["list", "--status", "open", "--json"], team_dir)
+    # Open tasks — everything open except inbox (role:cto) and meta
+    meta_labels = {"kind:status-digest", "kind:status-request"}
     open_rows = []
-    for r in open_tasks:
+    for r in open_issues:
         labels = r.get("labels", [])
-        if any(l.startswith("kind:dev") or l.startswith("kind:review") or l.startswith("kind:breakdown") or l.startswith("kind:plan") for l in labels):
+        if "role:cto" not in labels and not any(l in meta_labels for l in labels):
             open_rows.append({**r, "team": team_name})
 
     # Closed recently
-    closed = _bd_json(["list", "--status", "closed", "--limit", "20", "--json"], team_dir)
-    closed_rows = [{**r, "team": team_name} for r in closed]
+    closed_rows = [{**r, "team": team_name} for r in closed_issues]
 
-    # Pipelines (epics)
-    epics = _bd_json(["list", "--status", "open", "--label", "kind:epic", "--json"], team_dir)
-    pipelines = []
-    for epic in epics:
-        epic_id = epic.get("id", "")
-        title = epic.get("title", "")
-        labels = epic.get("labels", [])
-        stages = []
-        if "class:bypass-cto" in labels:
-            stages = ["breakdown", "plan", "dev", "review", "merge", "ship"]
-        else:
-            stages = ["breakdown", "plan", "dev", "review", "merge", "ship"]
-        pipelines.append({"epic_id": epic_id, "title": title, "stages": stages, "team": team_name})
+    # Pipelines — pass already-fetched lists; no extra subprocesses.
+    from dashboard.widgets.epic_pipeline import _gather_team_pipelines
+    pipelines = [
+        {**p, "team": team_name}
+        for p in _gather_team_pipelines(
+            team_dir,
+            open_issues=open_issues,
+            in_progress_issues=in_progress_issues,
+            closed_issues=closed_issues,
+        )
+    ]
 
     return agents, inbox_rows, open_rows, closed_rows, pipelines
 
@@ -350,14 +403,42 @@ def gather_events(limit: int = 20):
     return [ev for _, ev in all_events[:limit]]
 
 
+def _event_key(ev: dict) -> tuple:
+    return (
+        ev.get("ts", ""),
+        ev.get("event", ev.get("topic", "")),
+        ev.get("agent", ""),
+        ev.get("issue_id", "") or ev.get("task_id", ""),
+        ev.get("team", ""),
+    )
+
+
+def _merge_events(existing: list[dict], polled: list[dict], cap: int = 100) -> list[dict]:
+    """Merge polled events into the existing live-pushed list.
+
+    Live events are authoritative — only add polled events that aren't
+    already present, then sort by ts desc and cap. Prevents the 5s poll
+    from clobbering real-time events that arrived in between polls.
+    """
+    seen = {_event_key(ev) for ev in existing}
+    out = list(existing)
+    for ev in polled:
+        k = _event_key(ev)
+        if k not in seen:
+            out.append(ev)
+            seen.add(k)
+    out.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return out[:cap]
+
+
 # ---- panel builders (replaced by DataTable in compose) --------------------
 
 
 # ---- modals ---------------------------------------------------------------
 
 
-class ApproveModal(ModalScreen[str | None]):
-    """Modal to confirm approval with an optional comment."""
+class ApproveModal(ModalScreen[Optional[tuple[str, str]]]):
+    """Modal to approve or reject an inbox item with a comment."""
 
     def __init__(self, item: dict) -> None:
         self.item = item
@@ -365,21 +446,28 @@ class ApproveModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approve-modal"):
-            yield Markdown(f"### Approve: {self.item['title']}\n\n{item_desc(self.item)}")
+            yield Markdown(f"### Review: {self.item['title']}\n\n{item_desc(self.item)}")
             yield TextArea(id="comment", classes="comment-input")
             with Horizontal():
                 yield Button("Approve", variant="success", id="approve")
+                yield Button("Reject", variant="error", id="reject")
                 yield Button("Cancel", variant="default", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "approve":
             comment = self.query_one("#comment", TextArea).text
-            self.dismiss(comment)
+            self.dismiss(("approve", comment))
+        elif event.button.id == "reject":
+            comment = self.query_one("#comment", TextArea).text
+            if not comment.strip():
+                self.notify("A comment is required to reject", severity="error")
+                return
+            self.dismiss(("reject", comment))
         else:
             self.dismiss(None)
 
 
-class RejectModal(ModalScreen[str | None]):
+class RejectModal(ModalScreen[Optional[str]]):
     """Modal to reject with a required comment."""
 
     def __init__(self, item: dict) -> None:
@@ -405,7 +493,7 @@ class RejectModal(ModalScreen[str | None]):
             self.dismiss(None)
 
 
-class FreezeModal(ModalScreen[str | None]):
+class FreezeModal(ModalScreen[Optional[str]]):
     """Modal to freeze an epic or inbox item with a comment."""
 
     def __init__(self, item: dict) -> None:
@@ -465,6 +553,25 @@ class DashboardApp(App):
     #bottom { height: 1fr; }
     #open { width: 100%; height: 100%; min-height: 3; }
     #footer { height: 1; }
+
+    Screen { background: black; }
+
+    #agents, #inbox, #pipeline, #activity, #open {
+        background: black;
+        border: round green;
+        padding: 0 1;
+    }
+    #agents:focus-within, #inbox:focus-within,
+    #pipeline:focus-within, #activity:focus-within,
+    #open:focus-within {
+        border: round bright_green;
+    }
+
+    DataTable { background: black; }
+    DataTable > .datatable--header { background: black; }
+    DataTable > .datatable--odd-row { background: black; }
+    DataTable > .datatable--even-row { background: black; }
+    DataTable > .datatable--cursor { background: $accent 30%; }
     """
 
     snapshot = reactive(None)
@@ -478,28 +585,40 @@ class DashboardApp(App):
     _poll_in_flight: bool = False
     _event_count = reactive(0)
     _last_event_ts = reactive(0.0)
+    # Cached row signatures so we can skip table rebuilds when nothing changed
+    # (preserves cursor + scroll position on every no-change poll).
+    _agent_sig: tuple = ()
+    _inbox_sig: tuple = ()
+    _open_sig: tuple = ()
 
     def compose(self) -> ComposeResult:
         # Use DataTable widgets instead of Static for smooth row-level updates
         self._agents_dt = DataTable(id="agents", show_cursor=True, cursor_type="row")
         self._agents_dt.add_columns("AGENT", "STATUS", "ELAPSED", "MODEL", "TOKENS", "ISSUE")
         self._agents_dt.zebra_stripes = True
+        self._agents_dt.border_title = "Agents"
 
         self._inbox_dt = DataTable(id="inbox", show_cursor=True, cursor_type="row")
         self._inbox_dt.add_columns("TEAM", "ID", "TITLE", "KIND", "AGE", "ACTIONS")
         self._inbox_dt.zebra_stripes = True
+        self._inbox_dt.border_title = "CTO Inbox"
 
         with Horizontal(id="top"):
             yield self._agents_dt
             yield self._inbox_dt
 
+        pipeline = EpicPipeline(id="pipeline")
+        pipeline.border_title = "Epic Pipeline"
+        activity = ActivityStream(id="activity")
+        activity.border_title = "Activity"
         with Horizontal(id="mid"):
-            yield EpicPipeline(id="pipeline")
-            yield ActivityStream(id="activity")
+            yield pipeline
+            yield activity
 
         self._open_dt = DataTable(id="open", show_cursor=True, cursor_type="row")
         self._open_dt.add_columns("TEAM", "ID", "KIND", "TITLE", "ASSIGNEE", "AGE")
         self._open_dt.zebra_stripes = True
+        self._open_dt.border_title = "Open Issues"
         with Horizontal(id="bottom"):
             yield self._open_dt
 
@@ -515,7 +634,7 @@ class DashboardApp(App):
         self._adapter = make_batched_adapter(self._on_events)
         self._adapter.start()
         self.poll_data()
-        self.set_interval(5.0, self.poll_data)
+        self.set_interval(15.0, self.poll_data)
         self.set_interval(1.0, self._tick_footer)
 
     def on_unmount(self) -> None:
@@ -597,8 +716,11 @@ class DashboardApp(App):
         except Exception:
             pass
 
+        merged = _merge_events(list(self.events), events, cap=100)
+        if merged != list(self.events):
+            self.events = merged
         try:
-            self.query_one("#activity", ActivityStream).set_events(events)
+            self.query_one("#activity", ActivityStream).set_events(merged[:20])
         except Exception:
             pass
 
@@ -610,85 +732,109 @@ class DashboardApp(App):
 
     def _update_agents_table(self, agents: list[dict], running: list[str]) -> None:
         table = self._agents_dt
-        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
+        new_rows: list[tuple] = []
         if not running:
-            table.add_row("—", "—", "—", "—", "—", "no running teams — start with `cto start <team>`")
-            return
+            new_rows.append(("—", "—", "—", "—", "—", "no running teams — start with `cto start <team>`"))
+        else:
+            for row in agents:
+                stale = row.get("stale", False)
+                agent = ("~" if stale else "") + row["agent"]
+                issue = row.get("issue")
+                act_status = row.get("activity_status")
+                act_ts = row.get("activity_last_ts")
 
-        for idx, row in enumerate(agents):
-            stale = row.get("stale", False)
-            agent = ("~" if stale else "") + row["agent"]
-            issue = row.get("issue")
-            act_status = row.get("activity_status")
-            act_ts = row.get("activity_last_ts")
+                if issue:
+                    started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
+                else:
+                    started = act_ts
+                secs = int((now - started).total_seconds()) if started else 0
+                elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
 
-            if issue:
-                started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
-            else:
-                started = act_ts
-            secs = int((now - started).total_seconds()) if started else 0
-            elapsed = _fmt_elapsed(max(0, secs)) if started else "—"
+                if act_status == "working":
+                    status = "🟢 working"
+                elif act_status == "stuck":
+                    status = "🟡 stuck"
+                elif act_status == "idle":
+                    status = "⚪ idle"
+                elif issue:
+                    status = "🟢 working"
+                else:
+                    status = "⚪ idle"
+                if stale:
+                    status = f"💤 {status}"
 
-            # Prefer activity-derived status (real signal); fall back to bd lookup.
-            if act_status == "working":
-                status = "🟢 working"
-            elif act_status == "stuck":
-                status = "🟡 stuck"
-            elif act_status == "idle":
-                status = "⚪ idle"
-            elif issue:
-                status = "🟢 working"
-            else:
-                status = "⚪ idle"
-            if stale:
-                status = f"💤 {status}"
+                if issue:
+                    title = _truncate(issue.get("title", ""), 40)
+                    issue_text = f"{issue['id']}  {title}"
+                elif row.get("activity_task_id") and act_status in ("working", "stuck"):
+                    issue_text = row["activity_task_id"]
+                else:
+                    issue_text = "—"
 
-            if issue:
-                title = _truncate(issue.get("title", ""), 40)
-                issue_text = f"{issue['id']}  {title}"
-            elif row.get("activity_task_id"):
-                issue_text = row["activity_task_id"]
-            else:
-                issue_text = "—"
+                model = f"{row.get('provider', '—')}:{row.get('model', '—')}"
+                new_rows.append((agent, status, elapsed, model, "—", issue_text))
 
-            model = f"{row.get('provider', '—')}:{row.get('model', '—')}"
-            table.add_row(agent, status, elapsed, model, "—", issue_text)
+        sig = tuple(new_rows)
+        if sig == self._agent_sig:
+            return  # No change — preserve cursor + scroll.
+        self._agent_sig = sig
+        table.clear()
+        for r in new_rows:
+            table.add_row(*r)
 
     def _update_inbox_table(self, inbox: list[dict]) -> None:
         table = self._inbox_dt
-        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
+        new_rows: list[tuple] = []
         if not inbox:
-            table.add_row("—", "—", "(nothing waiting on the CTO)", "—", "—", "—")
-            return
+            new_rows.append(("—", "—", "(nothing waiting on the CTO)", "—", "—", "—"))
+        else:
+            for row in inbox:
+                stale = row.get("stale", False)
+                team_disp = ("~" if stale else "") + row.get("team", "")
+                kind = _kind(row.get("labels", []))
+                age_str = _age(row, now)
+                actions = "[A][R][F]" if not stale else ""
+                new_rows.append(
+                    (team_disp, row["id"], _truncate(row.get("title", ""), 45), kind, age_str, actions)
+                )
 
-        for row in inbox:
-            stale = row.get("stale", False)
-            team_disp = ("~" if stale else "") + row.get("team", "")
-            kind = _kind(row.get("labels", []))
-            age_str = _age(row, now)
-            actions = "[A][R][F]" if not stale else ""
-            table.add_row(team_disp, row["id"], _truncate(row.get("title", ""), 45), kind, age_str, actions)
+        sig = tuple(new_rows)
+        if sig == self._inbox_sig:
+            return
+        self._inbox_sig = sig
+        table.clear()
+        for r in new_rows:
+            table.add_row(*r)
 
     def _update_open_table(self, open_tasks: list[dict]) -> None:
         table = self._open_dt
-        table.clear()
         now = dt.datetime.now(dt.timezone.utc)
 
+        new_rows: list[tuple] = []
         if not open_tasks:
-            table.add_row("—", "—", "—", "(no open tasks)", "—", "—")
-            return
+            new_rows.append(("—", "—", "—", "(no open tasks)", "—", "—"))
+        else:
+            rows = sorted(open_tasks, key=lambda r: (r.get("priority") or 99, r.get("created_at") or ""))
+            for row in rows:
+                stale = row.get("stale", False)
+                team_disp = ("~" if stale else "") + row.get("team", "")
+                assignee = row.get("assignee") or ""
+                new_rows.append(
+                    (team_disp, row.get("id", ""), _kind(row.get("labels") or []),
+                     _truncate(row.get("title", ""), 50), assignee or "—", _age(row, now))
+                )
 
-        rows = sorted(open_tasks, key=lambda r: (r.get("priority") or 99, r.get("created_at") or ""))
-        for row in rows:
-            stale = row.get("stale", False)
-            team_disp = ("~" if stale else "") + row.get("team", "")
-            assignee = row.get("assignee") or ""
-            table.add_row(team_disp, row.get("id", ""), _kind(row.get("labels") or []),
-                       _truncate(row.get("title", ""), 50), assignee or "—", _age(row, now))
+        sig = tuple(new_rows)
+        if sig == self._open_sig:
+            return
+        self._open_sig = sig
+        table.clear()
+        for r in new_rows:
+            table.add_row(*r)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -803,18 +949,19 @@ class DashboardApp(App):
         else:
             self.notify("Focus the inbox panel first (Tab)", severity="warning")
 
-    def _on_approve(self, comment: str | None) -> None:
-        if comment is None:
+    def _on_approve(self, result: Optional[tuple[str, str]]) -> None:
+        if result is None:
             return
+        decision, comment = result
         item = getattr(self, "_pending_item", None)
         if item is None:
             self.notify("Item no longer available", severity="warning")
             return
-        self._pending_cmd = "approve"
+        self._pending_cmd = decision
         self._pending_comment = comment
         self.run_worker(self._worker_cto, thread=True, exclusive=False)
 
-    def _on_reject(self, comment: str | None) -> None:
+    def _on_reject(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = getattr(self, "_pending_item", None)
@@ -853,6 +1000,8 @@ class DashboardApp(App):
         self._pending_cmd = ""
         self._pending_comment = ""
         if success:
+            self.inbox_items = [i for i in self.inbox_items if i["id"] != issue_id]
+            self._update_inbox_table(self.inbox_items)
             self.notify(f"{cmd.capitalize()}d {issue_id}", title="CTO Action")
         else:
             self.notify(f"Failed to {cmd} {issue_id}", severity="error")
@@ -875,7 +1024,7 @@ class DashboardApp(App):
         else:
             self.notify("Select an inbox item or epic first", severity="warning")
 
-    def _on_freeze(self, comment: str | None) -> None:
+    def _on_freeze(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = getattr(self, "_pending_item", None)

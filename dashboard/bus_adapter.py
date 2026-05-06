@@ -10,7 +10,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Optional, Any, Callable
 
 # The event_bus and state_store live in src/ which is on sys.path when
 # ctodashboard.py runs.
@@ -33,7 +33,7 @@ class DashboardEventAdapter:
 
     def __init__(self, callback: Callable[[dict[str, Any]], None]):
         self.callback = callback
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._running = False
         self._bus_subs: list[Any] = []
         self._file_offsets: dict[Path, int] = {}
@@ -182,7 +182,7 @@ class _BatchingCallback:
         self.callback = callback
         self._pending: list[dict[str, Any]] = []
         self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
+        self._timer: Optional[threading.Timer] = None
 
     def __call__(self, event: dict[str, Any]) -> None:
         with self._lock:
