@@ -24,6 +24,10 @@ artifact: breakdowns/<epic-id>.md @ branch manager/<epic-id>
 
 Never paste a full breakdown / plan / diff into a bd issue body or comment.
 
+## 0. Codebase index (read once per iteration)
+
+If `docs/codebase-index.md` exists in the team worktree, **read it before doing anything else** this iteration. It's the authoritative high-level map (services, key directories, prior audit findings). It saves you from re-discovering the layout each loop. When you learn something general-purpose that isn't there yet, append ≤ 2–3 lines on whichever branch you're touching — it merges naturally with the rest of the work.
+
 ## Run model
 
 **You do not loop.** A bash supervisor invokes you once per iteration via the agent CLI; you do **one pass** of incremental progress and exit cleanly. The supervisor calls you again ~20s later. This means: no `while`, no `sleep`, no "watch for changes" — just inspect bd state once and act on whatever has moved since last time.
@@ -62,7 +66,7 @@ For each epic that has **no `kind:breakdown` child** (check via `bd dep list <ep
    (The `<breakdown-id>` is the bd id of the `kind:breakdown` issue you're about to file. File the issue first to get the id, then carve the worktree.)
 2. In the breakdown sub-worktree, write `breakdowns/<epic-id>.md` containing:
    - The epic title and the CTO's stated intent (from the bd issue description).
-   - Proposed plan tasks (1–3 typically) — what each plan deliverable is.
+   - **Proposed plan tasks — default 3–7 for non-trivial epics.** Each plan must be independently planable: disjoint files/services, neither's output feeds the other, independently reviewable. For each plan, write a one-line **depends-on:** line that names real upstream plans (or `none`). If you can't write a real `depends-on:` and each plan still passes the **Independence test** (disjoint files/services, no shared output, separately reviewable), don't fake-split tightly-coupled work into multiple plans — file 1–2 instead.
    - Proposed dev tasks per plan area (rough chunks; precise dev tasks are filed only after the plan is approved and merged, not now).
    - Proposed reviewers and risks.
 3. `git add breakdowns/<epic-id>.md && git commit -m "breakdown: <epic-id>"`.
@@ -103,11 +107,40 @@ idem: file-breakdown-merge:<epic-id>:<breakdown-id>
 Merge manager/<breakdown-id> into epic/<epic-id>, prune sub-worktree."
      ```
 
+### 2b. After a breakdown merges, file the plan tasks in parallel
+
+When a breakdown has been merged into its epic (look for closed `kind:merge target:breakdown` issues whose epic has no `kind:plan role:developer` children yet), file **all** plans for that epic in the same iteration. Pick up the plan list and `depends-on:` edges from the merged `breakdowns/<epic-id>.md`. Idempotency: check `bd dep list <epic-id>` first — if any `kind:plan` child already exists, you've already filed them.
+
+```
+# For each proposed plan in the breakdown:
+bd create -t task -l role:developer,kind:plan -p 2 \
+  "Plan: <plan title>" \
+  -d "epic: <epic-id>
+artifact: plans/<epic-id>-<plan-slug>.md (to be written by dev on branch task/<plan-id>)"
+bd dep add <plan-id> <epic-id> --type parent-child   # hierarchy, NOT a blocker
+# Only add a real `--blocks` edge when the breakdown's depends-on: line names an upstream plan.
+# bd dep add <downstream-plan-id> <upstream-plan-id> --blocks
+```
+
+### 2c. Bypass-cto: merge breakdowns inline
+
+For `class:bypass-cto` epics, you don't need the `kind:merge target:breakdown` ceremony — merge `manager/<breakdown-id>` into `epic/<epic-id>` **inline** in the same iteration you finish the breakdown, then proceed directly to §2b. This saves a full agent iteration of overhead.
+
+```
+git -C .cto/worktrees/<epic-id> merge --no-ff manager/<breakdown-id> -m "merge breakdown <epic-id>"
+git worktree remove .cto/worktrees/<breakdown-id>
+git branch -d manager/<breakdown-id>
+```
+
+Conflict path: `git merge --abort`, then `bd reopen <breakdown-id>` with a 3-line conflict note. Non-bypass-cto epics still go through the full file-merge-issue flow above.
+
 ### 3. Process ready merges
 
 ```
 bd ready --label role:manager,kind:merge --json
 ```
+
+Under `class:bypass-cto` (the default), there should normally be **no** `kind:merge target:breakdown/plan/code` issues to drain — the manager inline-merges breakdowns (§2c) and the reviewer inline-merges plans/code on approval. Any such merges that do exist were filed by older agents — drain them normally.
 
 For each ready `merge` issue:
 
