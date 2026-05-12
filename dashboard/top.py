@@ -17,6 +17,7 @@ Known limitation: `bd list --status closed --json` doesn't include the
     claim-to-close.
 """
 from __future__ import annotations
+from typing import Optional
 
 import datetime as dt
 import json
@@ -55,7 +56,7 @@ _prev_data: dict[str, tuple] = {}
 # ---- shell helpers --------------------------------------------------------
 
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 4.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 4.0) -> str:
     try:
         r = subprocess.run(
             cmd,
@@ -186,7 +187,7 @@ def _human_duration(seconds: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 
-def _parse_iso(s: str) -> dt.datetime | None:
+def _parse_iso(s: str) -> Optional[dt.datetime]:
     if not s:
         return None
     try:
@@ -244,6 +245,57 @@ def _read_team_config(tdir: Path) -> dict:
     return cfg
 
 
+def _doing_for_team(team: str, tdir: Path, now: dt.datetime, stale_secs: int = 120) -> dict:
+    """Read the tail of `<tdir>/.cto/activity.jsonl` and return the latest
+    activity per slot. Returns `{slot: {"summary": str, "kind": str, "stale": bool}}`.
+    """
+    log = tdir / ".cto" / "activity.jsonl"
+    if not log.exists():
+        return {}
+    try:
+        size = log.stat().st_size
+        with open(log, "rb") as f:
+            if size > 1_000_000:
+                f.seek(size - 1_000_000)
+                f.readline()  # discard partial first line
+            raw = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        slot = row.get("slot") or ""
+        if not slot and isinstance(row.get("agent"), str) and ":" in row["agent"]:
+            slot = row["agent"].split(":", 1)[1]
+        if not slot:
+            continue
+        out[slot] = {
+            "summary": row.get("summary") or row.get("event") or row.get("kind") or "",
+            "kind": row.get("kind") or row.get("event") or "",
+            "ts": row.get("ts", ""),
+        }
+    for slot, info in out.items():
+        ts = _parse_iso(info.get("ts", ""))
+        info["stale"] = bool(ts and (now - ts).total_seconds() > stale_secs)
+    return out
+
+
+def _model_for_slot(slot: str, manager_model: str, reviewer_model: str, dev_model: str) -> str:
+    """Mirror bin/cto's per-role model assignment for dashboard display."""
+    if slot == "manager":
+        return manager_model
+    if slot.startswith("review"):
+        return reviewer_model
+    if slot.startswith("dev"):
+        return dev_model
+    return "—"
+
+
 def _gather_team(team: str, tdir: Path):
     """Return (agent_rows, inbox_rows, open_rows, closed_rows) or None.
 
@@ -257,7 +309,11 @@ def _gather_team(team: str, tdir: Path):
     windows = tmux_windows(sess)
     cfg = _read_team_config(tdir)
     provider = cfg.get("agentProvider", "claude")
-    model = cfg.get("model", "—")
+    dev_model = cfg.get("model", "—")
+    manager_model = cfg.get("managerModel", dev_model)
+    reviewer_model = cfg.get("reviewerModel", dev_model)
+
+    doing = _doing_for_team(team, tdir, dt.datetime.now(dt.timezone.utc))
 
     f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
     f_open = _POOL.submit(_bd_json, ["list", "--status", "open"], tdir)
@@ -278,7 +334,10 @@ def _gather_team(team: str, tdir: Path):
             "window": w,
             "issue": ip_by_assignee.get(f"{team}:{w}"),
             "provider": provider,
-            "model": model,
+            "model": _model_for_slot(w, manager_model, reviewer_model, dev_model),
+            "doing": (doing.get(w) or {}).get("summary", ""),
+            "doing_kind": (doing.get(w) or {}).get("kind", ""),
+            "doing_stale": bool((doing.get(w) or {}).get("stale")),
         }
         for w in windows
     ]
@@ -375,6 +434,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
     t.add_column("MODEL", overflow="ellipsis", no_wrap=True)
     t.add_column("STATUS", overflow="ellipsis", no_wrap=True)
     t.add_column("ISSUE", overflow="ellipsis", no_wrap=True, ratio=2)
+    t.add_column("DOING", overflow="ellipsis", no_wrap=True, ratio=2)
     t.add_column("ELAPSED", justify="right", overflow="ellipsis", no_wrap=True)
 
     for row in agents:
@@ -384,6 +444,9 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
         model = row.get("model", "—")
         issue = row["issue"]
         row_style = "dim" if stale else ""
+        doing_text = _truncate(row.get("doing", "") or "", 60)
+        doing_style = "dim" if (row.get("doing_stale") or stale or not doing_text) else ""
+        doing_display = doing_text or "—"
         if issue:
             started = _parse_iso(issue.get("started_at") or issue.get("updated_at") or "")
             secs = int((now - started).total_seconds()) if started else 0
@@ -395,6 +458,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
                 Text(model, style=row_style),
                 Text("working", style="green" if not stale else "dim"),
                 Text(f"{issue['id']}  {title}", style=row_style),
+                Text(doing_display, style=doing_style or row_style),
                 Text(elapsed, style="green" if not stale else "dim"),
             )
         else:
@@ -404,6 +468,7 @@ def _agent_panel(agents: list[dict], running: list[str], now: dt.datetime) -> Pa
                 Text(model, style=row_style),
                 Text("idle", style="dim"),
                 Text("—", style="dim"),
+                Text(doing_display, style=doing_style or "dim"),
                 Text("—", style="dim"),
             )
     return Panel(t, title=f"Agents ({len(agents)})", border_style="cyan")

@@ -294,23 +294,28 @@ Usage:
   cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi]
   cto team list
   cto team remove <name>
-  cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
+  cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--reviewer-model M] [--agent-provider claude|kimi]
 
-  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--ops] [--bypass-cto] [--parent-branch <branch>]
+  cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--ops] [--require-cto|--bypass-cto] [--parent-branch <branch>]
   cto inbox [<team>] [--json]
+  cto inbox <team> --mailbox [--unread] [--ack <id>] [--reply <id> --payload <json>] [--json]
   cto approve <team> <id> [--comment "…"]
   cto reject <team> <id> --comment "…"
   cto review                                # interactive TUI inbox
 
-  cto start <team> [--attach] [--dangerous]
+  cto start <team> [--attach] [--dangerous] [--persistent]
   cto stop <team>
-  cto restart <team>
+  cto restart <team> [--persistent]
   cto attach <team> [<window>]
 
   cto status [<team>]
   cto update <team> [--fresh]
   cto reconciler-sync <team> [--force]
-  cto top                                   # live top-style dashboard
+  cto top                                   # live top-style dashboard (v2)
+  cto dashboard [--legacy]                  # launch the event-driven dashboard
+  cto activity <team> [-f] [--agent <slot>] [--kind <k>] [--since <iso>] [--limit N]
+  cto decisions <team> [--epic <id>]        # browse committed decision log
+  cto nudge <team> <slot> "<message>"       # inject a steering nudge into a running agent
 
   cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into its parent branch
   cto worktrees <team>
@@ -365,6 +370,7 @@ containerUse: $cuse
 agentProvider: $provider
 model: $default_model
 managerModel: $default_manager_model
+reviewerModel: $default_model
 extraArgs: []
 EOF
 
@@ -600,9 +606,10 @@ _scale_team() {
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
   local sess; sess="$(tmux_session "$name")"
-  local mode model provider
+  local mode model reviewer_model provider
   mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
+  reviewer_model="$(cfg_get "$name" reviewerModel "$model")"
   provider="$(cfg_get "$name" agentProvider claude)"
   local launcher="$tdir/.cto/supervisor.sh"
 
@@ -633,7 +640,7 @@ _scale_team() {
       local rev_file="$pdir/review-$i.md"
       [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
       tmux new-window -t "$sess" -n "$win" -c "$tdir" \
-        "$launcher" "$tdir" reviewer "$win" "$rev_file" "$mode" "$model" "$provider"
+        "$launcher" "$tdir" reviewer "$win" "$rev_file" "$mode" "$reviewer_model" "$provider"
       info "scaled up: $win"
     fi
   done
@@ -684,6 +691,7 @@ cmd_config() {
       --permission-mode) cfg_set "$name" permissionMode "$2";    shift 2 ;;
       --model)           cfg_set "$name" model "$2";             shift 2 ;;
       --manager-model)   cfg_set "$name" managerModel "$2";      shift 2 ;;
+      --reviewer-model)  cfg_set "$name" reviewerModel "$2";     shift 2 ;;
       --agent-provider)
         [[ "$2" == "claude" || "$2" == "kimi" || "$2" == "codex" ]] || die "--agent-provider must be claude, kimi, or codex"
         cfg_set "$name" agentProvider "$2"; shift 2 ;;
@@ -706,7 +714,7 @@ cmd_config() {
 cmd_task() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local title="" desc="" prio=2 kind=epic ops=0 bypass_cto=0 parent_branch=""
+  local title="" desc="" prio=2 kind=epic ops=0 bypass_cto=1 parent_branch=""
   while (( $# )); do
     case "$1" in
       -d|--description) desc="$2"; shift 2 ;;
@@ -716,21 +724,22 @@ cmd_task() {
       --plan) kind=plan; shift ;;
       --ops)  ops=1;     shift ;;
       --bypass-cto)     bypass_cto=1; shift ;;
+      --require-cto)    bypass_cto=0; shift ;;
       --parent-branch)  parent_branch="$2"; shift 2 ;;
       --) shift ;;
       -*) die "unknown task flag: $1" ;;
       *) [[ -z "$title" ]] && title="$1" || die "extra arg: $1"; shift ;;
     esac
   done
+  if [[ "$kind" != "epic" ]]; then
+    bypass_cto=0
+  fi
   [[ -n "$title" ]] || die "task title required"
   if (( ops )) && [[ "$kind" != "epic" ]]; then
     die "--ops only applies to epics"
   fi
-  if (( bypass_cto )) && [[ "$kind" != "epic" ]]; then
-    die "--bypass-cto only applies to epics"
-  fi
   if (( bypass_cto && ops )); then
-    die "--bypass-cto is incompatible with --ops"
+    bypass_cto=0
   fi
   if [[ "$kind" == "epic" && -z "$parent_branch" ]]; then
     die "--parent-branch is required when creating an epic"
@@ -969,14 +978,35 @@ cmd_promote() {
 # ---- inbox ---------------------------------------------------------------
 
 cmd_inbox() {
-  local target="" json_mode=0
+  local target="" json_mode=0 mailbox=0 unread=0 ack="" reply="" payload=""
   while (( $# )); do
     case "$1" in
-      --json) json_mode=1; shift ;;
+      --json)    json_mode=1; shift ;;
+      --mailbox) mailbox=1;   shift ;;
+      --unread)  unread=1;    shift ;;
+      --ack)     ack="$2";    shift 2 ;;
+      --reply)   reply="$2";  shift 2 ;;
+      --payload) payload="$2"; shift 2 ;;
       -*) die "unknown flag: $1" ;;
       *) target="$1"; shift ;;
     esac
   done
+
+  # §17 mailbox inbox: route to cto_inbox_cli (per-team SQLite). Targets a
+  # single team — looping across all teams would multiplex DBs.
+  if (( mailbox )) || [[ -n "$ack" || -n "$reply" ]]; then
+    [[ -n "$target" ]] || die "inbox --mailbox requires <team>"
+    require_team "$target"
+    local tdir; tdir="$(team_dir "$target")"
+    local -a extra=()
+    (( unread )) && extra+=(--unread)
+    [[ -n "$ack" ]]     && extra+=(--ack "$ack")
+    [[ -n "$reply" ]]   && extra+=(--reply "$reply")
+    [[ -n "$payload" ]] && extra+=(--payload "$payload")
+    (( json_mode )) && extra+=(--json)
+    python3 "$CTO_ROOT/src/cto_inbox_cli.py" "$tdir" "${extra[@]}"
+    return $?
+  fi
   shopt -s nullglob
   local any=0
   local accum="[]"
@@ -1134,12 +1164,17 @@ cmd_reject() {
 cmd_start() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local attach=0 dangerous=0 force=0
+  # Persistent supervisors are the default (event-driven, scratchpad-backed,
+  # dramatically faster than the legacy stateless bash loop). Pass
+  # --no-persistent to fall back to the legacy bash supervisor.
+  local attach=0 dangerous=0 force=0 persistent=1
   while (( $# )); do
     case "$1" in
-      --attach)     attach=1;    shift ;;
-      --dangerous)  dangerous=1; shift ;;
-      --force)      force=1;     shift ;;
+      --attach)        attach=1;    shift ;;
+      --dangerous)     dangerous=1; shift ;;
+      --force)         force=1;     shift ;;
+      --persistent)    persistent=1; shift ;;
+      --no-persistent) persistent=0; shift ;;
       *) die "unknown start flag: $1" ;;
     esac
   done
@@ -1156,10 +1191,11 @@ cmd_start() {
 
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
-  local mode model manager_model provider
+  local mode model manager_model reviewer_model provider
   mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
   manager_model="$(cfg_get "$name" managerModel "$model")"
+  reviewer_model="$(cfg_get "$name" reviewerModel "$model")"
   provider="$(cfg_get "$name" agentProvider claude)"
   (( dangerous )) && mode="bypassPermissions"
   local n_devs n_revs
@@ -1178,7 +1214,53 @@ cmd_start() {
   # reconciler is the kind of thing that has burned us before.
   reconciler_sync "$name" "$tdir" || die "reconciler drift detected; run: cto reconciler-sync $name --force"
 
-  # Generate a supervisor script. Each tmux window runs this; the bash
+  if (( persistent )); then
+    # Phase 2: use Python persistent supervisors instead of bash heredocs.
+    # Ensure src/ exists in the team dir (symlink from the CTO root).
+    local src_dir="$tdir/.cto/src"
+    if [[ ! -d "$src_dir" ]]; then
+      ln -s "$CTO_ROOT/src" "$src_dir" 2>/dev/null || die "failed to symlink src/ into team .cto/"
+    fi
+    if [[ -f "$CTO_ROOT/src/wake.py" ]]; then
+      cp -f "$CTO_ROOT/src/wake.py" "$tdir/.cto/wake.py"
+      chmod +x "$tdir/.cto/wake.py"
+    fi
+    if [[ -f "$CTO_ROOT/src/merger.py" ]]; then
+      cp -f "$CTO_ROOT/src/merger.py" "$tdir/.cto/merger.py"
+      chmod +x "$tdir/.cto/merger.py"
+    fi
+    if [[ -f "$CTO_ROOT/src/mailbox_cli.py" ]]; then
+      cp -f "$CTO_ROOT/src/mailbox_cli.py" "$tdir/.cto/mailbox.py"
+      chmod +x "$tdir/.cto/mailbox.py"
+    fi
+
+    # Spawn persistent supervisors for each agent slot.
+    local manager_file="$pdir/manager.md"
+    [[ "$provider" == "kimi" ]] && manager_file="$pdir/manager.yaml"
+    tmux new-session -d -s "$sess" -n manager -c "$tdir"       python3 "$src_dir/persistent_supervisor.py" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
+
+    tmux new-window -t "$sess" -n reconciler -c "$tdir"       bash -c '''while :; do python3 "$1/.cto/reconciler.py" --role manager --team-dir "$1" 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; if [[ -x "$1/.cto/wake.py" ]]; then python3 "$1/.cto/wake.py" "$1" 3 2>/dev/null || sleep 3; else sleep 3; fi; done''' bash "$tdir"
+
+    if [[ -x "$tdir/.cto/merger.py" ]]; then
+      tmux new-window -t "$sess" -n merger -c "$tdir" python3 "$tdir/.cto/merger.py" "$tdir"
+    fi
+
+    for i in $(seq 1 "$n_devs"); do
+      local dev_file="$pdir/dev-$i.md"
+      [[ "$provider" == "kimi" ]] && dev_file="$pdir/dev-$i.yaml"
+      tmux new-window -t "$sess" -n "dev-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" developer "dev-$i" "$dev_file" "$mode" "$model" "$provider"
+    done
+
+    for i in $(seq 1 "$n_revs"); do
+      local rev_file="$pdir/review-$i.md"
+      [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
+      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$reviewer_model" "$provider"
+    done
+
+    info "started team $name in tmux session: $sess (persistent mode)"
+  else
+    # Legacy bash supervisor mode (default, backward compatible).
+    # Generate a supervisor script.. Each tmux window runs this; the bash
   # loop is what's eternal — the agent CLI is one-shot per iteration.
   # On non-zero exit, the supervisor releases any bd claim it took and,
   # if the failure mentions a permission gap, files a CTO inbox item.
@@ -1247,6 +1329,7 @@ release_claim() {
   bd update "$id" --status open --assignee "" >/dev/null 2>&1 || true
   rm -rf "$LOCKS/$id" 2>/dev/null || true
   log "released claim on $id"
+  telemetry_emit agent.released --kv "agent=$AGENT" --kv "task_id=$id" --kv "role=$ROLE"
 }
 
 escalate_permission() {
@@ -1279,6 +1362,7 @@ if [[ -n "$zombies" ]]; then
     log "boot recovery: resetting zombie claim $zid"
     bd update "$zid" --status open --assignee "" >/dev/null 2>&1 || true
     rm -rf "$LOCKS/$zid" 2>/dev/null || true
+    telemetry_emit agent_iteration_end --kv "agent=$AGENT" --kv "task_id=$zid" --kv "exit_code=-1" --kv "duration_ms=0"
   done
 fi
 # Also: any lock dir whose owner stamp matches this agent but has no
@@ -1288,8 +1372,10 @@ for ld in "$LOCKS"/*/; do
   [[ -d "$ld" ]] || continue
   owner=$(cat "$ld/owner" 2>/dev/null || true)
   if [[ "$owner" == "$AGENT" ]]; then
+    zid=$(basename "$ld")
     rm -rf "$ld"
-    log "boot recovery: removed stale lock $(basename "$ld")"
+    log "boot recovery: removed stale lock $zid"
+    telemetry_emit agent_iteration_end --kv "agent=$AGENT" --kv "task_id=$zid" --kv "exit_code=-1" --kv "duration_ms=0"
   fi
 done
 shopt -u nullglob
@@ -1299,7 +1385,8 @@ while :; do
 
   case "$ROLE" in
     manager)
-      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) update the team's open kind:status-digest issue (or create one if none). All plan/dev filing and epic-ship detection is automated by the supervisor — do not do it manually. Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
+      telemetry_emit manager.pass_started --kv "agent=$AGENT" --kv "role=$ROLE"
+      starter="Do one pass per your role manual: (1) close any open kind:status-request issues with a fresh digest; (2) decompose new kind:epic role:manager issues into a breakdown + approval:breakdown (or merge:breakdown for bypass-cto) — YOU must file the approval/merge yourself after closing the breakdown; (3) claim and complete any ready kind:merge role:manager issue; (4) check if any epic is ship-ready and file the kind:merge target:epic yourself if so; (5) update the team's open kind:status-digest issue (or create one if none). Make ONE iteration of incremental progress and exit cleanly. Do not loop yourself — I (the supervisor) will run you again."
       ;;
     developer|reviewer)
       label="role:$ROLE"
@@ -1317,7 +1404,15 @@ while :; do
           break
         fi
       done
-      if [[ -z "$task_id" ]]; then rm -f "$err"; sleep 5; continue; fi
+      if [[ -z "$task_id" ]]; then
+        rm -f "$err"
+        if [[ -x "$TEAM_DIR/.cto/wake.py" ]]; then
+          python3 "$TEAM_DIR/.cto/wake.py" "$TEAM_DIR" 5 2>/dev/null || sleep 5
+        else
+          sleep 5
+        fi
+        continue
+      fi
 
       # Stamp the bd issue with our globally-unique agent identity and
       # flip it to in_progress so it falls out of `bd ready` for everyone.
@@ -1327,17 +1422,30 @@ while :; do
         rm -f "$err"; sleep 5; continue
       fi
       log "claimed $task_id (assignee=$AGENT)"
+      # Gather task metadata for the activity log.
+      task_title=$(bd show "$task_id" --json 2>/dev/null | jq -r '.[0].title // "unknown"')
+      task_kind=$(bd show "$task_id" --json 2>/dev/null | jq -r '.[0].labels // [] | map(select(startswith("kind:"))) | .[0] // "unknown"')
+      telemetry_emit agent.claimed --kv "agent=$AGENT" --kv "task_id=$task_id" --kv "task_title=$task_title" --kv "task_kind=$task_kind" --kv "role=$ROLE"
 
       if [[ "$ROLE" == developer ]]; then
-        starter="You are agent '$AGENT'. You have been assigned bd issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to read it, identify whether it's kind:plan or kind:dev, set up your worktree, do the work, run any project tests/lints, commit on the task branch, and close the bd issue with a short gist (artifact path, branch, files-touched count, one-line test result). Do exactly one bd issue this iteration and exit."
+        starter="You are agent '$AGENT'. You have been assigned bd issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to read it, identify whether it's kind:plan or kind:dev, set up your worktree, do the work, run any project tests/lints, commit on the task branch, and close the bd issue with a short gist (artifact path, branch, files-touched count, one-line test result). AFTER closing, you MUST file the next review issue yourself (plan review or code review with role:reviewer). Do exactly one bd issue this iteration and exit."
       else
-        starter="You are agent '$AGENT'. You have been assigned bd review issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to identify the upstream (target:plan or target:code) and what artifact to read. Apply your principal-engineer review; if approved on a plan, file the kind:approval target:plan for the CTO; if approved on code, file the kind:merge for the manager; if changes requested, reopen upstream with concrete asks. Do exactly one review this iteration and exit."
+        starter="You are agent '$AGENT'. You have been assigned bd review issue $task_id (already in_progress with assignee=$AGENT). Run 'bd show $task_id' to identify the upstream (target:plan or target:code) and what artifact to read. Apply your principal-engineer review; if approved on a plan, file the kind:approval target:plan (or kind:merge target:plan for bypass-cto) yourself; if approved on code, file the kind:merge target:code for the manager yourself; if changes requested, reopen the upstream AND reset THIS review issue to open (assignee='') with 'bd dep add $task_id <upstream-id>' so it blocks until the dev re-closes the upstream — do NOT close the review or file a new round-N re-review. Do exactly one review this iteration and exit."
       fi
       ;;
     *) log "unknown role: $ROLE"; exit 2 ;;
   esac
 
-  iter_start_ms=$(date +%s%3N)
+  # Cross-platform milliseconds timestamp (GNU date supports %3N; BSD does not).
+  _ms_ts() {
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "import time; print(int(time.time()*1000))"
+    else
+      echo "$(($(date +%s) * 1000))"
+    fi
+  }
+
+  iter_start_ms=$(_ms_ts)
   telemetry_emit agent_iteration_start --kv "agent=$AGENT" --kv "task_id=${task_id:-}"
 
   if [[ "$AGENT_PROVIDER" == "kimi" ]]; then
@@ -1406,7 +1514,7 @@ $starter"
     rc=${PIPESTATUS[0]}
   fi
 
-  iter_end_ms=$(date +%s%3N)
+  iter_end_ms=$(_ms_ts)
   iter_dur=$((iter_end_ms - iter_start_ms))
   telemetry_emit agent_iteration_end \
     --kv "agent=$AGENT" \
@@ -1450,7 +1558,12 @@ $starter"
     fi
     log "iteration ok (task=${task_id:-none})"
 
-    [[ "$ROLE" == "manager" ]] && sleep 10 || sleep 5
+    if [[ -x "$TEAM_DIR/.cto/wake.py" ]]; then
+      [[ "$ROLE" == "manager" ]] && wake_for=10 || wake_for=5
+      python3 "$TEAM_DIR/.cto/wake.py" "$TEAM_DIR" "$wake_for" 2>/dev/null || sleep "$wake_for"
+    else
+      [[ "$ROLE" == "manager" ]] && sleep 10 || sleep 5
+    fi
   fi
   rm -f "$err"
 done
@@ -1483,6 +1596,24 @@ with open(args.log_path, "a", encoding="utf-8") as f:
 PYEOF
   chmod +x "$tdir/.cto/telemetry_helper.py"
 
+  # Install the wake helper used by the supervisor + reconciler loops to
+  # interrupt their sleep when bd state changes (event-driven step
+  # progression).
+  if [[ -f "$CTO_ROOT/src/wake.py" ]]; then
+    cp -f "$CTO_ROOT/src/wake.py" "$tdir/.cto/wake.py"
+    chmod +x "$tdir/.cto/wake.py"
+  fi
+  # Install the auto-merger daemon (drains ready manager merges in parallel).
+  if [[ -f "$CTO_ROOT/src/merger.py" ]]; then
+    cp -f "$CTO_ROOT/src/merger.py" "$tdir/.cto/merger.py"
+    chmod +x "$tdir/.cto/merger.py"
+  fi
+  # Install the §12 mailbox CLI so prompts can call `python3 .cto/mailbox.py …`.
+  if [[ -f "$CTO_ROOT/src/mailbox_cli.py" ]]; then
+    cp -f "$CTO_ROOT/src/mailbox_cli.py" "$tdir/.cto/mailbox.py"
+    chmod +x "$tdir/.cto/mailbox.py"
+  fi
+
   # Spawn one tmux window per agent slot.
   # For kimi teams, pass the .yaml agent spec; for claude, the .md prompt.
   local manager_file="$pdir/manager.md"
@@ -1491,7 +1622,11 @@ PYEOF
     "$launcher" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
 
   tmux new-window -t "$sess" -n reconciler -c "$tdir" \
-    bash -c 'while :; do python3 "$1/.cto/reconciler.py" --role manager 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; sleep 3; done' bash "$tdir"
+    bash -c 'while :; do python3 "$1/.cto/reconciler.py" --role manager 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; if [[ -x "$1/.cto/wake.py" ]]; then python3 "$1/.cto/wake.py" "$1" 3 2>/dev/null || sleep 3; else sleep 3; fi; done' bash "$tdir"
+
+  if [[ -x "$tdir/.cto/merger.py" ]]; then
+    tmux new-window -t "$sess" -n merger -c "$tdir" python3 "$tdir/.cto/merger.py" "$tdir"
+  fi
 
   for i in $(seq 1 "$n_devs"); do
     local dev_file="$pdir/dev-$i.md"
@@ -1504,12 +1639,13 @@ PYEOF
     local rev_file="$pdir/review-$i.md"
     [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
     tmux new-window -t "$sess" -n "review-$i" -c "$tdir" \
-      "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
+      "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$reviewer_model" "$provider"
   done
 
-  info "started team $name in tmux session: $sess"
+  fi  # close persistent/else
   info "  windows: manager, reconciler, dev-1..$n_devs, review-1..$n_revs"
-  info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
+  info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev-model: $model, reviewer-model: $reviewer_model"
+  info "  mode: $([[ $persistent -eq 1 ]] && echo persistent || echo legacy bash)"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then
     tmux attach -t "$sess"
@@ -1531,10 +1667,23 @@ cmd_stop() {
 }
 
 cmd_restart() {
-  local name="${1:-}"
+  local name="${1:-}"; shift || true
   require_team "$name"
+  # Persistent supervisors are the default; pass --no-persistent for legacy.
+  local persistent=1
+  while (( $# )); do
+    case "$1" in
+      --persistent)    persistent=1; shift ;;
+      --no-persistent) persistent=0; shift ;;
+      *) die "unknown restart flag: $1" ;;
+    esac
+  done
   cmd_stop "$name" || true
-  cmd_start "$name"
+  if (( persistent )); then
+    cmd_start "$name"
+  else
+    cmd_start "$name" --no-persistent
+  fi
 }
 
 cmd_attach() {
@@ -1689,15 +1838,35 @@ cmd_top() {
     esac
   done
   if (( legacy )); then
-    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/top.py"
-  else
     exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py"
+  else
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py"
   fi
 }
 
 cmd_review() {
   require_cmd uv
-  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py" "$@"
+  exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py" "$@"
+}
+
+# ---- dashboard -------------------------------------------------------------
+#
+# Launch the new event-driven dashboard (v2). Same as `top` but explicit.
+
+cmd_dashboard() {
+  require_cmd uv
+  local legacy=0
+  while (( $# )); do
+    case "$1" in
+      --legacy) legacy=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  if (( legacy )); then
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/ctodashboard.py"
+  else
+    exec uv run --quiet --with textual,rich python3 "$CTO_ROOT/dashboard/dashboard_v2.py"
+  fi
 }
 
 # ---- exec ----------------------------------------------------------------
@@ -1745,10 +1914,38 @@ main() {
     top)       cmd_top       "$@" ;;
     review)    cmd_review    "$@" ;;
     worktrees) cmd_worktrees "$@" ;;
+    dashboard)  cmd_dashboard "$@" ;;
     reconciler-sync) cmd_reconciler_sync "$@" ;;
+    activity)  cmd_activity  "$@" ;;
+    decisions) cmd_decisions "$@" ;;
+    nudge)     cmd_nudge     "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
   esac
+}
+
+cmd_activity() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  python3 "$CTO_ROOT/src/activity_cli.py" "$tdir" "$@"
+}
+
+cmd_decisions() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  python3 "$CTO_ROOT/src/decisions_cli.py" "$tdir" "$@"
+}
+
+cmd_nudge() {
+  local name="${1:-}"; shift || true
+  local slot="${1:-}"; shift || true
+  local msg="${1:-}"; shift || true
+  [[ -n "$name" && -n "$slot" && -n "$msg" ]] || die "usage: cto nudge <team> <slot> \"<message>\""
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  python3 "$CTO_ROOT/src/nudge_cli.py" "$tdir" "$name" "$slot" "$msg"
 }
 
 main "$@"

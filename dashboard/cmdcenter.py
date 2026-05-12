@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --with textual,rich python
 """CTO Command Center — interactive TUI for approving / rejecting inbox items."""
 from __future__ import annotations
+from typing import Optional
 
 import json
 import os
@@ -50,7 +51,7 @@ class InboxItem:
 # helpers
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], cwd: Path | None = None, timeout: float = 10.0) -> str:
+def _run(cmd: list[str], cwd: Optional[Path] = None, timeout: float = 10.0) -> str:
     try:
         r = subprocess.run(
             cmd,
@@ -97,7 +98,7 @@ def _kind_and_target(labels: list[str]) -> tuple[str, str]:
     return kind, target
 
 
-def _epic_merge_summary(item: InboxItem) -> tuple[str, Path | None]:
+def _epic_merge_summary(item: InboxItem) -> tuple[str, Optional[Path]]:
     desc = item.description or ""
     epic_id = ""
     m = _EPIC_RE.search(desc)
@@ -126,7 +127,7 @@ def _epic_merge_summary(item: InboxItem) -> tuple[str, Path | None]:
     return meta, None
 
 
-def resolve_artifact(item: InboxItem) -> tuple[str, Path | None]:
+def resolve_artifact(item: InboxItem) -> tuple[str, Optional[Path]]:
     """Return (meta_text, path_or_none)."""
     desc = item.description or ""
     kind, target = _kind_and_target(item.labels)
@@ -186,7 +187,7 @@ def read_artifact_safe(path: Path) -> str:
 # modals
 # ---------------------------------------------------------------------------
 
-class ApproveModal(ModalScreen[str | None]):
+class ApproveModal(ModalScreen[Optional[str]]):
     def __init__(self, item: InboxItem) -> None:
         super().__init__()
         self.item = item
@@ -213,7 +214,7 @@ class ApproveModal(ModalScreen[str | None]):
             self.dismiss(None)
 
 
-class RejectModal(ModalScreen[str | None]):
+class RejectModal(ModalScreen[Optional[str]]):
     def __init__(self, item: InboxItem) -> None:
         super().__init__()
         self.item = item
@@ -414,7 +415,7 @@ class CommandCenter(App):
         item = self.items[self.selected_index]
         self.push_screen(ApproveModal(item), self._on_approve)
 
-    def _on_approve(self, comment: str | None) -> None:
+    def _on_approve(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = self.items[self.selected_index]
@@ -426,7 +427,7 @@ class CommandCenter(App):
         item = self.items[self.selected_index]
         self.push_screen(RejectModal(item), self._on_reject)
 
-    def _on_reject(self, comment: str | None) -> None:
+    def _on_reject(self, comment: Optional[str]) -> None:
         if comment is None:
             return
         item = self.items[self.selected_index]

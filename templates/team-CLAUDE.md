@@ -23,7 +23,7 @@ This repository is a **team workspace** owned by an AI CTO. Multiple AI agents (
 | `kind:approval` + `target:breakdown|plan` | CTO's final sign-off. |
 | `kind:merge` + `target:breakdown|plan|code` | Manager merges a sub-branch into `epic/<epic-id>` (never the trunk branch). |
 | `kind:merge` + `target:epic` + `role:cto` | **CTO-only.** Manager files this when the epic is complete; CTO runs `cto merge-epic` to merge `epic/<id>` into its parent branch. |
-| `class:bypass-cto` | Epic label. Skips manual CTO `target:breakdown` and `target:plan` approvals. Reviewer checks remain mandatory. Final epic merge is auto-executed by the reconciler when `parent_branch != main`. |
+| `class:bypass-cto` | Epic label (DEFAULT for `cto task`). Skips manual CTO `target:breakdown` and `target:plan` approvals. Reviewer checks remain mandatory. Final epic merge is auto-executed by the reconciler when `parent_branch != main`. Pass `--require-cto` to opt back into the gated flow. |
 | `kind:status-digest` / `kind:status-request` | Manager↔CTO status protocol. |
 
 | label | meaning |
@@ -32,9 +32,9 @@ This repository is a **team workspace** owned by an AI CTO. Multiple AI agents (
 
 ## Gates the workflow enforces
 
-1. The CTO must close `kind:approval target:breakdown` before any plan is filed. (Skipped for `class:bypass-cto` epics — reconciler files `kind:merge target:breakdown` directly.)
-2. The reviewer must close `kind:review target:plan` (approved). The reconciler then files `kind:approval target:plan` (normal) or `kind:merge target:plan` (`class:bypass-cto`).
-3. The CTO must close `kind:approval target:plan` before any `kind:dev` is filed. (Skipped for `class:bypass-cto` epics.)
+1. The CTO must close `kind:approval target:breakdown` before any plan is filed. **Skipped by default** (`class:bypass-cto` is the default label) — reviewer/manager files `kind:merge target:breakdown` directly. Only applies for epics created with `--require-cto`.
+2. The reviewer must close `kind:review target:plan` (approved). The reviewer then files `kind:merge target:plan` directly (default) or `kind:approval target:plan` (under `--require-cto`).
+3. The CTO must close `kind:approval target:plan` before any `kind:dev` is filed. **Skipped by default**; only applies under `--require-cto`.
 4. The reviewer must close `kind:review target:code` (approved) before a `kind:merge` is filed for that dev branch.
 5. The manager merges sub-branches into `epic/<epic-id>`, only via a `kind:merge target:breakdown|plan|code` issue.
 6. **Only the CTO merges `epic/<id>` into its parent branch**, via `cto merge-epic` (or `cto approve` on the manager-filed `kind:merge target:epic role:cto` issue). The manager never touches the trunk branch. Exception: `class:bypass-cto` epics with `parent_branch != main` are auto-merged by the reconciler.

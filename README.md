@@ -174,6 +174,151 @@ The dashboard fires desktop notifications on:
 - agent crashes
 - review-loop escalations (>3 rounds)
 
+## Persistent Agent Shell (Phase 1)
+
+The default supervisor is a bash loop (`bin/cto start`) that spawns a fresh
+`claude`/`kimi`/`codex` CLI process every 5-10 seconds.  That works, but it
+is **stateless** — the agent re-reads its 10K token role prompt every
+iteration and loses all accumulated context.
+
+`src/persistent_supervisor.py` is a drop-in Python replacement that:
+
+- **Maintains state across iterations** in SQLite (`.cto/state/agent_state.db`)
+- **Preserves accumulated context** — scratchpad, iteration count, last task
+- **Subscribes to events** on a file-based pub/sub bus (no Redis/NATS needed)
+- **Recovers from crashes** — releases stale bd claims on restart, resumes loop
+- **Falls back to legacy `bd ready` polling** — backward compatible with the
+  existing beads workflow
+
+### Quick start (persistent mode)
+
+Phase 2 adds a `--persistent` flag to `cto start`:
+
+```bash
+# Start the team with Python persistent supervisors (event-driven)
+bin/cto start demo-app --persistent
+
+# Or restart into persistent mode
+bin/cto restart demo-app --persistent
+```
+
+When `--persistent` is passed, `cto start`:
+1. Symlinks `src/` into `teams/<name>/.cto/src/`
+2. Spawns `persistent_supervisor.py` for each agent slot instead of bash loops
+3. Keeps the same tmux session layout (manager, reconciler, dev-N, review-N)
+
+### Architecture
+
+```
+team/
+└── .cto/
+    ├── src/                    ← symlink to CTO_ROOT/src (Phase 2)
+    ├── state/
+    │   └── agent_state.db      ← SQLite persistence
+    ├── logs/
+    │   └── {team}:{slot}.log   ← per-agent telemetry
+    ├── locks/
+    │   └── {task_id}/          ← atomic claim dirs (unchanged)
+    └── supervisor.sh           ← legacy bash loop (still used without --persistent)
+```
+
+### Key differences from the bash supervisor
+
+| Bash supervisor | Persistent supervisor |
+|-----------------|-----------------------|
+| Fresh CLI process every iteration | Long-running Python process |
+| Re-reads role prompt from scratch | Loads from state, appends scratchpad |
+| 5-15s spawn overhead per cycle | Sub-second wake on events |
+| Crash → manual recovery | Auto-releases claims, resumes loop |
+| Polls `bd ready` constantly | Event-driven + fallback poll |
+
+## Security Sandbox (Phase 2)
+
+`src/security.py` implements a 6-layer sandbox inspired by Delegate's security
+model.  Every agent process can be wrapped with:
+
+```python
+from security import Sandbox
+sb = Sandbox.for_agent(team_dir, worktree, allowed_domains=["github.com"])
+sb.apply()          # sets restrictive env vars
+sb.assert_command(["git", "status"])   # validate before exec
+```
+
+### The six layers
+
+1. **Write-path isolation** — agents can only write to their assigned worktree;
+   any path outside is rejected.
+2. **Disallowed git commands** — `git push --force`, `git reset --hard`, branch
+   deletion, `filter-branch`, etc. are blocked before execution.
+3. **OS-level sandbox** — on macOS a temporary Seatbelt profile restricts
+   file writes to the worktree + `/tmp` + standard devices.  On Linux it tries
+   `firejail` or `bwrap`; elsewhere it falls back to env-var warnings.
+4. **Network domain allowlist** — only pre-approved domains (GitHub, PyPI,
+   npm, model APIs) are reachable.  Implemented via `HTTP_PROXY` → localhost:9
+   with `NO_PROXY` bypass for allowed hosts.
+5. **MCP tool boundary** — agents interact only through provided MCP tools.
+   Direct shell spawn (`bash -c`, `sh -c`, backticks, command substitution) is
+   detected and rejected.
+6. **Daemon-managed worktree lifecycle** — only the supervisor may create or
+   destroy worktrees (`git worktree add/remove/prune`).  Agents receive
+   pre-created worktrees.
+
+### Tests
+
+```bash
+uv run --with pytest pytest tests/test_security.py -v
+```
+
+## Event-Driven Reconciler (Phase 2)
+
+The reconciler (`templates/reconciler.py`) now publishes workflow events to the
+file-based event bus whenever it files or transitions an issue:
+
+- `task.created` — new bd issue filed
+- `breakdown.approved` — CTO approved a breakdown
+- `plan.approved` — CTO approved a plan
+- `dev.assigned` — a dev task is ready for pickup
+- `review.required` — a review task is ready for pickup
+- `merge.ready` — a merge task is ready for a manager
+
+Persistent agents subscribe to `team.{name}.{role}` topics and wake
+immediately when relevant events arrive, skipping the old `bd ready` poll
+cycle.  If no events arrive within 30 s, the agent falls back to legacy
+polling — backward compatible with teams not yet on the event bus.
+
+### Configuration
+
+In `src/agent_process.py`:
+
+```python
+AgentConfig(
+    ...
+    event_priority=True,      # prefer events over bd polling
+    event_poll_timeout=30.0,  # seconds before fallback to bd ready
+)
+```
+
+When `event_priority=True`:
+1. Agent blocks on event bus for up to 30 s.
+2. If an event arrives, it processes immediately.
+3. If nothing arrives, it does **one** legacy `bd ready` poll, then goes
+   back to blocking on events.
+
+## Phase 2 Summary
+
+| Feature | Status |
+|---------|--------|
+| `--persistent` flag in `cto start` | ✅ |
+| Python persistent supervisors in tmux | ✅ |
+| Reconciler emits workflow events | ✅ |
+| AgentProcess event priority + polling fallback | ✅ |
+| 6-layer security sandbox (`src/security.py`) | ✅ |
+| Sandbox tests (`tests/test_security.py`) | ✅ |
+
+---
+
+*Phase 3 (Auto-Approval with Rollback) coming next.*
+
 ## Health Watchdog
 
 The reconciler now runs a health check **before** each workflow tick. It silently auto-heals:
