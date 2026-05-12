@@ -188,6 +188,38 @@ def _kind(labels: list[str]) -> str:
     return "—"
 
 
+def _read_team_models(team_dir: Path) -> tuple[str, str, str]:
+    """Parse .cto/config.yaml for (dev_model, manager_model, reviewer_model).
+
+    Each falls back to the dev model when its specific key is unset, matching
+    the launch logic in bin/cto.
+    """
+    cfg: dict[str, str] = {}
+    cfg_path = team_dir / ".cto" / "config.yaml"
+    try:
+        with open(cfg_path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].rstrip()
+                if not line or ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                cfg[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    dev_model = cfg.get("model", "—")
+    return dev_model, cfg.get("managerModel", dev_model), cfg.get("reviewerModel", dev_model)
+
+
+def _model_for_slot(slot: str, manager_model: str, reviewer_model: str, dev_model: str) -> str:
+    if slot == "manager":
+        return manager_model
+    if slot.startswith("review"):
+        return reviewer_model
+    if slot.startswith("dev"):
+        return dev_model
+    return "—"
+
+
 def _agent_status_from_activity(team_name: str, team_dir: Path) -> dict[str, dict]:
     """Derive per-slot agent status by scanning the tail of activity.jsonl.
 
@@ -258,6 +290,7 @@ def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict]
     sess = f"cto-{team_name}"
     windows = tmux_windows(sess) if tmux_alive(sess) else []
     activity_status = _agent_status_from_activity(team_name, team_dir)
+    dev_model, manager_model, reviewer_model = _read_team_models(team_dir)
 
     # Fast path: read issues.jsonl directly to skip three bd subprocess forks.
     # Falls back to parallel `bd list` queries if the file isn't there.
@@ -288,7 +321,9 @@ def _gather_team(team_name: str, team_dir: Path) -> tuple[list[dict], list[dict]
         act = activity_status.get(slot, {})
         agents.append({
             "agent": f"{team_name}:{slot}", "issue": issue, "team": team_name,
-            "provider": "claude", "model": "sonnet", "window": slot,
+            "provider": "claude",
+            "model": _model_for_slot(slot, manager_model, reviewer_model, dev_model),
+            "window": slot,
             "activity_status": act.get("status"),  # working|idle|Optional[stuck]
             "activity_last_ts": act.get("last_ts"),
             "activity_task_id": act.get("task_id"),

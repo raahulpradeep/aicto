@@ -245,6 +245,17 @@ def _read_team_config(tdir: Path) -> dict:
     return cfg
 
 
+def _model_for_slot(slot: str, manager_model: str, reviewer_model: str, dev_model: str) -> str:
+    """Mirror bin/cto's per-role model assignment for dashboard display."""
+    if slot == "manager":
+        return manager_model
+    if slot.startswith("review"):
+        return reviewer_model
+    if slot.startswith("dev"):
+        return dev_model
+    return "—"
+
+
 def _gather_team(team: str, tdir: Path):
     """Return (agent_rows, inbox_rows, open_rows, closed_rows) or None.
 
@@ -258,7 +269,9 @@ def _gather_team(team: str, tdir: Path):
     windows = tmux_windows(sess)
     cfg = _read_team_config(tdir)
     provider = cfg.get("agentProvider", "claude")
-    model = cfg.get("model", "—")
+    dev_model = cfg.get("model", "—")
+    manager_model = cfg.get("managerModel", dev_model)
+    reviewer_model = cfg.get("reviewerModel", dev_model)
 
     f_ip = _POOL.submit(_bd_json, ["list", "--status", "in_progress"], tdir)
     f_open = _POOL.submit(_bd_json, ["list", "--status", "open"], tdir)
@@ -279,7 +292,7 @@ def _gather_team(team: str, tdir: Path):
             "window": w,
             "issue": ip_by_assignee.get(f"{team}:{w}"),
             "provider": provider,
-            "model": model,
+            "model": _model_for_slot(w, manager_model, reviewer_model, dev_model),
         }
         for w in windows
     ]

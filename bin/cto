@@ -294,7 +294,7 @@ Usage:
   cto team adopt  <name> <path>  [--copy] [--developers N] [--reviewers N] [--container-use] [--agent-provider claude|kimi]
   cto team list
   cto team remove <name>
-  cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--agent-provider claude|kimi]
+  cto config <name> [--developers N] [--reviewers N] [--scale] [--container-use on|off] [--permission-mode MODE] [--model M] [--manager-model M] [--reviewer-model M] [--agent-provider claude|kimi]
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--ops] [--require-cto|--bypass-cto] [--parent-branch <branch>]
   cto inbox [<team>] [--json]
@@ -366,6 +366,7 @@ containerUse: $cuse
 agentProvider: $provider
 model: $default_model
 managerModel: $default_manager_model
+reviewerModel: $default_model
 extraArgs: []
 EOF
 
@@ -601,9 +602,10 @@ _scale_team() {
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
   local sess; sess="$(tmux_session "$name")"
-  local mode model provider
+  local mode model reviewer_model provider
   mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
+  reviewer_model="$(cfg_get "$name" reviewerModel "$model")"
   provider="$(cfg_get "$name" agentProvider claude)"
   local launcher="$tdir/.cto/supervisor.sh"
 
@@ -634,7 +636,7 @@ _scale_team() {
       local rev_file="$pdir/review-$i.md"
       [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
       tmux new-window -t "$sess" -n "$win" -c "$tdir" \
-        "$launcher" "$tdir" reviewer "$win" "$rev_file" "$mode" "$model" "$provider"
+        "$launcher" "$tdir" reviewer "$win" "$rev_file" "$mode" "$reviewer_model" "$provider"
       info "scaled up: $win"
     fi
   done
@@ -685,6 +687,7 @@ cmd_config() {
       --permission-mode) cfg_set "$name" permissionMode "$2";    shift 2 ;;
       --model)           cfg_set "$name" model "$2";             shift 2 ;;
       --manager-model)   cfg_set "$name" managerModel "$2";      shift 2 ;;
+      --reviewer-model)  cfg_set "$name" reviewerModel "$2";     shift 2 ;;
       --agent-provider)
         [[ "$2" == "claude" || "$2" == "kimi" || "$2" == "codex" ]] || die "--agent-provider must be claude, kimi, or codex"
         cfg_set "$name" agentProvider "$2"; shift 2 ;;
@@ -1163,10 +1166,11 @@ cmd_start() {
 
   local tdir; tdir="$(team_dir "$name")"
   local pdir="$tdir/.cto/prompts"
-  local mode model manager_model provider
+  local mode model manager_model reviewer_model provider
   mode="$(cfg_get "$name" permissionMode bypassPermissions)"
   model="$(cfg_get "$name" model sonnet)"
   manager_model="$(cfg_get "$name" managerModel "$model")"
+  reviewer_model="$(cfg_get "$name" reviewerModel "$model")"
   provider="$(cfg_get "$name" agentProvider claude)"
   (( dangerous )) && mode="bypassPermissions"
   local n_devs n_revs
@@ -1221,7 +1225,7 @@ cmd_start() {
     for i in $(seq 1 "$n_revs"); do
       local rev_file="$pdir/review-$i.md"
       [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
-      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
+      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$reviewer_model" "$provider"
     done
 
     info "started team $name in tmux session: $sess (persistent mode)"
@@ -1601,12 +1605,12 @@ PYEOF
     local rev_file="$pdir/review-$i.md"
     [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
     tmux new-window -t "$sess" -n "review-$i" -c "$tdir" \
-      "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
+      "$launcher" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$reviewer_model" "$provider"
   done
 
   fi  # close persistent/else
   info "  windows: manager, reconciler, dev-1..$n_devs, review-1..$n_revs"
-  info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev/reviewer-model: $model"
+  info "  agentProvider: $provider, permissionMode: $mode, manager-model: $manager_model, dev-model: $model, reviewer-model: $reviewer_model"
   info "  mode: $([[ $persistent -eq 1 ]] && echo persistent || echo legacy bash)"
   info "  attach: cto attach $name   (Ctrl-b d to detach)"
   if (( attach )); then

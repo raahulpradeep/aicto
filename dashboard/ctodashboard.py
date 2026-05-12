@@ -218,6 +218,17 @@ def _read_team_config(tdir: Path) -> dict:
     return cfg
 
 
+def _model_for_slot(slot: str, manager_model: str, reviewer_model: str, dev_model: str) -> str:
+    """Mirror bin/cto's per-role model assignment for dashboard display."""
+    if slot == "manager":
+        return manager_model
+    if slot.startswith("review"):
+        return reviewer_model
+    if slot.startswith("dev"):
+        return dev_model
+    return "—"
+
+
 def _gather_team(team: str, tdir: Path):
     """Gather data for a single team. Runs in a bg thread; bd calls are parallelised."""
     sess = f"cto-{team}"
@@ -227,7 +238,9 @@ def _gather_team(team: str, tdir: Path):
     windows = tmux_windows(sess)
     cfg = _read_team_config(tdir)
     provider = cfg.get("agentProvider", "claude")
-    model = cfg.get("model", "—")
+    dev_model = cfg.get("model", "—")
+    manager_model = cfg.get("managerModel", dev_model)
+    reviewer_model = cfg.get("reviewerModel", dev_model)
 
     # Launch all 3 bd queries in parallel — cuts per-team time from ~6s to ~2s
     # -n 20 for closed is enough (we only show 10 most recent)
@@ -243,7 +256,7 @@ def _gather_team(team: str, tdir: Path):
     agent_rows = [
         {"agent": f"{team}:{w}", "team": team, "window": w,
          "issue": ip_by_assignee.get(f"{team}:{w}"),
-         "provider": provider, "model": model}
+         "provider": provider, "model": _model_for_slot(w, manager_model, reviewer_model, dev_model)}
         for w in windows
     ]
 
