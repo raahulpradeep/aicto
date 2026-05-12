@@ -312,6 +312,7 @@ Usage:
   cto reconciler-sync <team> [--force]
   cto top                                   # live top-style dashboard (v2)
   cto dashboard [--legacy]                  # launch the event-driven dashboard
+  cto activity <team> [-f] [--agent <slot>] [--kind <k>] [--since <iso>] [--limit N]
 
   cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into its parent branch
   cto worktrees <team>
@@ -1882,9 +1883,17 @@ main() {
     worktrees) cmd_worktrees "$@" ;;
     dashboard)  cmd_dashboard "$@" ;;
     reconciler-sync) cmd_reconciler_sync "$@" ;;
+    activity)  cmd_activity  "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
   esac
+}
+
+cmd_activity() {
+  local name="${1:-}"; shift || true
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  python3 "$CTO_ROOT/src/activity_cli.py" "$tdir" "$@"
 }
 
 main "$@"

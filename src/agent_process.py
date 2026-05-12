@@ -664,6 +664,32 @@ class AgentProcess:
         except OSError:
             pass
 
+    def _activity(self, kind: str, summary: str, task_id: Optional[str] = None, **extras: Any) -> None:
+        """Emit a unified-feed activity row.
+
+        Distinct from `_telemetry` (which uses an `event` key) so existing
+        consumers keep working. Schema: ts/team/agent/role/slot/kind/summary/
+        task_id/extras. Best-effort: never raises on disk-full / read-only.
+        """
+        log_path = self.team_dir / ".cto" / "activity.jsonl"
+        row = {
+            "ts": self._now(),
+            "team": self.cfg.team,
+            "agent": self.agent_id,
+            "role": self.cfg.role,
+            "slot": self.cfg.slot,
+            "kind": kind,
+            "summary": summary,
+            "task_id": task_id,
+        }
+        if extras:
+            row["extras"] = extras
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, separators=(",", ":"), default=str) + "\n")
+        except OSError:
+            pass
+
     def _log(self, fmt: str, *args: Any) -> None:
         msg = fmt % args
         ts = time.strftime("%H:%M:%S")
