@@ -58,6 +58,9 @@ class AgentConfig:
     event_priority: bool = True
     # Timeout for event poll before falling back to bd ready (seconds)
     event_poll_timeout: float = 30.0
+    # §13: reuse a single Claude `--session-id` across iterations. Off by default;
+    # enabled only for the manager (cross-iteration orchestration continuity).
+    claude_resume_session: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -426,16 +429,24 @@ class AgentProcess:
                 rc = self._run_cmd(cmd, err_path)
 
             else:  # claude (default)
-                cmd = [
-                    "claude", "--print",
-                    "--output-format", "stream-json", "--verbose",
-                    "--permission-mode", perm,
-                    "--model", model,
-                    "--append-system-prompt", Path(role_file).read_text(),
-                    starter,
-                ]
-                self._log("invoking claude (task=%s)", task_id or "none")
+                cmd, session_id, resumed = self._build_claude_cmd(starter, role_file, perm, model)
+                tag = (session_id or "")[:8]
+                self._log("invoking claude (task=%s, resume=%s)",
+                          task_id or "none", tag if resumed else "no")
                 rc = self._run_cmd(cmd, err_path)
+                # If we tried to resume a session and Claude reported the session
+                # is gone (e.g. server-side GC), clear it and retry exactly once.
+                if rc != 0 and resumed and self._stderr_session_missing(err_path):
+                    self._log("session %s missing — clearing and retrying once", tag)
+                    self.state.extras.pop("claude_session_id", None)
+                    self.store.save(self.state)
+                    # Truncate err so a successful retry doesn't show the stale msg.
+                    with open(err_path, "w") as _f:
+                        _f.write("")
+                    cmd2, sid2, resumed2 = self._build_claude_cmd(starter, role_file, perm, model)
+                    assert not resumed2, "retry must use a fresh session"
+                    self._log("invoking claude (task=%s, resume=no, retry=1)", task_id or "none")
+                    rc = self._run_cmd(cmd2, err_path)
 
             # Capture last 20 lines of stderr for telemetry
             if os.path.getsize(err_path) > 0:
@@ -449,6 +460,71 @@ class AgentProcess:
             os.unlink(err_path)
 
         return rc
+
+    def _build_claude_cmd(
+        self,
+        starter: str,
+        role_file: str,
+        perm: str,
+        model: str,
+    ) -> tuple[list[str], Optional[str], bool]:
+        """Build the `claude --print` argv. Returns (cmd, session_id, resumed).
+
+        When `claude_resume_session` is enabled, reuses the per-agent session id
+        stored in `state.extras["claude_session_id"]`. First call generates and
+        persists a UUID **before** spawning Claude, so a crash leaves the next
+        iteration pointing at a real session. Resumed iterations drop
+        `--append-system-prompt` (the prompt is already baked into the session).
+        """
+        import uuid
+
+        base = [
+            "claude", "--print",
+            "--output-format", "stream-json", "--verbose",
+            "--permission-mode", perm,
+            "--model", model,
+        ]
+        if not self.cfg.claude_resume_session:
+            cmd = base + [
+                "--append-system-prompt", Path(role_file).read_text(),
+                starter,
+            ]
+            return cmd, None, False
+
+        session_id = self.state.extras.get("claude_session_id")
+        if session_id:
+            cmd = base + ["--resume", session_id, starter]
+            return cmd, session_id, True
+
+        # First-time session: assign, persist, then spawn.
+        session_id = str(uuid.uuid4())
+        self.state.extras["claude_session_id"] = session_id
+        self.store.save(self.state)
+        cmd = base + [
+            "--session-id", session_id,
+            "--append-system-prompt", Path(role_file).read_text(),
+            starter,
+        ]
+        return cmd, session_id, False
+
+    @staticmethod
+    def _stderr_session_missing(err_path: str) -> bool:
+        """Detect Claude's session-not-found error so we can transparently
+        recover (the server can GC sessions). Requires both 'session' and one
+        of {not found / does not exist / expired / no such session /
+        could not find} so we don't false-positive on rate-limit or model errors."""
+        try:
+            with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read().lower()
+        except OSError:
+            return False
+        if "session" not in text:
+            return False
+        for needle in ("not found", "does not exist", "expired",
+                       "no such session", "could not find"):
+            if needle in text:
+                return True
+        return False
 
     def _run_cmd(self, cmd: list[str], err_path: str) -> int:
         """Run a command, streaming stderr to err_path and teeing to agent log."""

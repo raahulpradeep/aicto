@@ -52,6 +52,10 @@ def main() -> int:
         model=model,
         agent_provider=provider,
         permission_mode=perm_mode,
+        # §13: only the manager benefits from cross-iteration session continuity.
+        # Devs/reviewers handle a discrete bd issue per iteration and re-derive
+        # state from the worktree — a fresh session each time is cleaner.
+        claude_resume_session=(role == "manager" and provider == "claude"),
     )
 
     proc = AgentProcess(config)
