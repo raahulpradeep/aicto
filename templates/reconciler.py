@@ -393,10 +393,10 @@ def execute(actions: list[Action], dry_run: bool = False, team_dir: Optional[Pat
         store = StateStore(str(db_path))
         bus = EventBus(store, watch_dir=state_dir)
 
-    def _publish(kind: str, **kwargs: Any) -> None:
+    def _publish(event_kind: str, **kwargs: Any) -> None:
         if bus is not None:
             try:
-                bus.publish("task.lifecycle", {"kind": kind, **kwargs})
+                bus.publish("task.lifecycle", {"event_kind": event_kind, **kwargs})
             except Exception:
                 pass  # best-effort; never let event bus break bd filing
 
