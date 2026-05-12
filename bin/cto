@@ -298,6 +298,7 @@ Usage:
 
   cto task <team> "<title>" [-d "<desc>"] [-p N] [--epic|--dev|--plan] [--ops] [--require-cto|--bypass-cto] [--parent-branch <branch>]
   cto inbox [<team>] [--json]
+  cto inbox <team> --mailbox [--unread] [--ack <id>] [--reply <id> --payload <json>] [--json]
   cto approve <team> <id> [--comment "…"]
   cto reject <team> <id> --comment "…"
   cto review                                # interactive TUI inbox
@@ -314,6 +315,7 @@ Usage:
   cto dashboard [--legacy]                  # launch the event-driven dashboard
   cto activity <team> [-f] [--agent <slot>] [--kind <k>] [--since <iso>] [--limit N]
   cto decisions <team> [--epic <id>]        # browse committed decision log
+  cto nudge <team> <slot> "<message>"       # inject a steering nudge into a running agent
 
   cto merge-epic <team> <epic-id>           # CTO-only: merge epic/<id> into its parent branch
   cto worktrees <team>
@@ -976,14 +978,35 @@ cmd_promote() {
 # ---- inbox ---------------------------------------------------------------
 
 cmd_inbox() {
-  local target="" json_mode=0
+  local target="" json_mode=0 mailbox=0 unread=0 ack="" reply="" payload=""
   while (( $# )); do
     case "$1" in
-      --json) json_mode=1; shift ;;
+      --json)    json_mode=1; shift ;;
+      --mailbox) mailbox=1;   shift ;;
+      --unread)  unread=1;    shift ;;
+      --ack)     ack="$2";    shift 2 ;;
+      --reply)   reply="$2";  shift 2 ;;
+      --payload) payload="$2"; shift 2 ;;
       -*) die "unknown flag: $1" ;;
       *) target="$1"; shift ;;
     esac
   done
+
+  # §17 mailbox inbox: route to cto_inbox_cli (per-team SQLite). Targets a
+  # single team — looping across all teams would multiplex DBs.
+  if (( mailbox )) || [[ -n "$ack" || -n "$reply" ]]; then
+    [[ -n "$target" ]] || die "inbox --mailbox requires <team>"
+    require_team "$target"
+    local tdir; tdir="$(team_dir "$target")"
+    local -a extra=()
+    (( unread )) && extra+=(--unread)
+    [[ -n "$ack" ]]     && extra+=(--ack "$ack")
+    [[ -n "$reply" ]]   && extra+=(--reply "$reply")
+    [[ -n "$payload" ]] && extra+=(--payload "$payload")
+    (( json_mode )) && extra+=(--json)
+    python3 "$CTO_ROOT/src/cto_inbox_cli.py" "$tdir" "${extra[@]}"
+    return $?
+  fi
   shopt -s nullglob
   local any=0
   local accum="[]"
@@ -1895,6 +1918,7 @@ main() {
     reconciler-sync) cmd_reconciler_sync "$@" ;;
     activity)  cmd_activity  "$@" ;;
     decisions) cmd_decisions "$@" ;;
+    nudge)     cmd_nudge     "$@" ;;
     exec)      cmd_exec      "$@" ;;
     *) die "unknown command: $cmd (see: cto help)" ;;
   esac
@@ -1912,6 +1936,16 @@ cmd_decisions() {
   require_team "$name"
   local tdir; tdir="$(team_dir "$name")"
   python3 "$CTO_ROOT/src/decisions_cli.py" "$tdir" "$@"
+}
+
+cmd_nudge() {
+  local name="${1:-}"; shift || true
+  local slot="${1:-}"; shift || true
+  local msg="${1:-}"; shift || true
+  [[ -n "$name" && -n "$slot" && -n "$msg" ]] || die "usage: cto nudge <team> <slot> \"<message>\""
+  require_team "$name"
+  local tdir; tdir="$(team_dir "$name")"
+  python3 "$CTO_ROOT/src/nudge_cli.py" "$tdir" "$name" "$slot" "$msg"
 }
 
 main "$@"
