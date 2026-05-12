@@ -1136,13 +1136,17 @@ cmd_reject() {
 cmd_start() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local attach=0 dangerous=0 force=0 persistent=0
+  # Persistent supervisors are the default (event-driven, scratchpad-backed,
+  # dramatically faster than the legacy stateless bash loop). Pass
+  # --no-persistent to fall back to the legacy bash supervisor.
+  local attach=0 dangerous=0 force=0 persistent=1
   while (( $# )); do
     case "$1" in
-      --attach)     attach=1;    shift ;;
-      --dangerous)  dangerous=1; shift ;;
-      --force)      force=1;     shift ;;
-      --persistent) persistent=1; shift ;;
+      --attach)        attach=1;    shift ;;
+      --dangerous)     dangerous=1; shift ;;
+      --force)         force=1;     shift ;;
+      --persistent)    persistent=1; shift ;;
+      --no-persistent) persistent=0; shift ;;
       *) die "unknown start flag: $1" ;;
     esac
   done
@@ -1200,7 +1204,7 @@ cmd_start() {
     # Spawn persistent supervisors for each agent slot.
     local manager_file="$pdir/manager.md"
     [[ "$provider" == "kimi" ]] && manager_file="$pdir/manager.yaml"
-    tmux new-session -d -s "$sess" -n manager -c "$tdir"       "$src_dir/persistent_supervisor.py" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
+    tmux new-session -d -s "$sess" -n manager -c "$tdir"       python3 "$src_dir/persistent_supervisor.py" "$tdir" manager manager "$manager_file" "$mode" "$manager_model" "$provider"
 
     tmux new-window -t "$sess" -n reconciler -c "$tdir"       bash -c '''while :; do python3 "$1/.cto/reconciler.py" --role manager --team-dir "$1" 2>&1 | while IFS= read -r line; do echo "[$(date +%H:%M:%S)] reconciler: $line"; done; if [[ -x "$1/.cto/wake.py" ]]; then python3 "$1/.cto/wake.py" "$1" 3 2>/dev/null || sleep 3; else sleep 3; fi; done''' bash "$tdir"
 
@@ -1211,13 +1215,13 @@ cmd_start() {
     for i in $(seq 1 "$n_devs"); do
       local dev_file="$pdir/dev-$i.md"
       [[ "$provider" == "kimi" ]] && dev_file="$pdir/dev-$i.yaml"
-      tmux new-window -t "$sess" -n "dev-$i" -c "$tdir"         "$src_dir/persistent_supervisor.py" "$tdir" developer "dev-$i" "$dev_file" "$mode" "$model" "$provider"
+      tmux new-window -t "$sess" -n "dev-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" developer "dev-$i" "$dev_file" "$mode" "$model" "$provider"
     done
 
     for i in $(seq 1 "$n_revs"); do
       local rev_file="$pdir/review-$i.md"
       [[ "$provider" == "kimi" ]] && rev_file="$pdir/review-$i.yaml"
-      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
+      tmux new-window -t "$sess" -n "review-$i" -c "$tdir"         python3 "$src_dir/persistent_supervisor.py" "$tdir" reviewer "review-$i" "$rev_file" "$mode" "$model" "$provider"
     done
 
     info "started team $name in tmux session: $sess (persistent mode)"
@@ -1627,18 +1631,20 @@ cmd_stop() {
 cmd_restart() {
   local name="${1:-}"; shift || true
   require_team "$name"
-  local persistent=0
+  # Persistent supervisors are the default; pass --no-persistent for legacy.
+  local persistent=1
   while (( $# )); do
     case "$1" in
-      --persistent) persistent=1; shift ;;
+      --persistent)    persistent=1; shift ;;
+      --no-persistent) persistent=0; shift ;;
       *) die "unknown restart flag: $1" ;;
     esac
   done
   cmd_stop "$name" || true
   if (( persistent )); then
-    cmd_start "$name" --persistent
-  else
     cmd_start "$name"
+  else
+    cmd_start "$name" --no-persistent
   fi
 }
 

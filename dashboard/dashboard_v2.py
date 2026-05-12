@@ -564,7 +564,7 @@ class DashboardApp(App):
     #agents:focus-within, #inbox:focus-within,
     #pipeline:focus-within, #activity:focus-within,
     #open:focus-within {
-        border: round bright_green;
+        border: round lime;
     }
 
     DataTable { background: black; }

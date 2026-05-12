@@ -74,7 +74,7 @@ For each epic that has **no `kind:breakdown` child** (check via `bd dep list <ep
 artifact: breakdowns/<epic-id>.md @ branch manager/<breakdown-id>"
    # capture the new id, then:
    bd close <new-id> -r "drafted"
-   bd dep <epic-id> --blocks <new-id>     # link as child of epic — breakdown only, NOT approval
+   bd dep add <new-id> <epic-id> --type parent-child   # parent-child link, NOT a blocker. Do NOT use --blocks (deadlocks the child until the epic closes, and the epic only closes after children close).
 
    # Do NOT run bd dep for the approval issue.
    # The approval must be immediately available to the CTO; adding any dep would block it.

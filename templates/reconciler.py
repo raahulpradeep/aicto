@@ -28,6 +28,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
+# This file is copied into <repo>/teams/<name>/.cto/reconciler.py and run from
+# there. Walk up to <repo> so its src/ modules (event_bus, state_store, etc.)
+# are importable. Falls through silently if src/ isn't there (e.g. if a future
+# layout vendors these modules into .cto/ directly).
+_HERE = Path(__file__).resolve()
+for _candidate in (_HERE.parent.parent.parent.parent / "src", _HERE.parent / "src"):
+    if _candidate.is_dir() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+        break
+
 from event_bus import EventBus
 from state_store import StateStore
 
