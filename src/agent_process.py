@@ -393,6 +393,8 @@ class AgentProcess:
         # Help the child know it's inside a persistent supervisor
         env["AICTO_PERSISTENT"] = "1"
         env["AICTO_AGENT_ID"] = self.agent_id
+        env["AICTO_ROLE"] = self.cfg.role
+        env["AICTO_TEAM_DIR"] = str(self.team_dir)
         if task_id:
             env["AICTO_TASK_ID"] = task_id
 

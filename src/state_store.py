@@ -81,6 +81,27 @@ class StateStore:
 
     CREATE INDEX IF NOT EXISTS idx_event_log_topic ON event_log(topic);
     CREATE INDEX IF NOT EXISTS idx_event_log_created ON event_log(created_at);
+
+    -- §12 mailbox: in-process agent-to-agent messages. Decoupled from bd to
+    -- avoid Dolt commits on routing chatter (questions, nudges, FYIs).
+    CREATE TABLE IF NOT EXISTS messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender          TEXT NOT NULL,
+        recipient_slot  TEXT,
+        recipient_role  TEXT,
+        kind            TEXT NOT NULL,
+        payload         TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        claimed_by      TEXT,
+        reply_payload   TEXT,
+        created_at      TEXT NOT NULL,
+        claimed_at      TEXT,
+        replied_at      TEXT,
+        read_at         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_role_status ON messages(recipient_role, status);
+    CREATE INDEX IF NOT EXISTS idx_messages_slot_status ON messages(recipient_slot, status);
+    CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
     """
 
     def __init__(self, db_path: str | Path):

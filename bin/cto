@@ -1206,6 +1206,10 @@ cmd_start() {
       cp -f "$CTO_ROOT/src/merger.py" "$tdir/.cto/merger.py"
       chmod +x "$tdir/.cto/merger.py"
     fi
+    if [[ -f "$CTO_ROOT/src/mailbox_cli.py" ]]; then
+      cp -f "$CTO_ROOT/src/mailbox_cli.py" "$tdir/.cto/mailbox.py"
+      chmod +x "$tdir/.cto/mailbox.py"
+    fi
 
     # Spawn persistent supervisors for each agent slot.
     local manager_file="$pdir/manager.md"
@@ -1580,6 +1584,11 @@ PYEOF
   if [[ -f "$CTO_ROOT/src/merger.py" ]]; then
     cp -f "$CTO_ROOT/src/merger.py" "$tdir/.cto/merger.py"
     chmod +x "$tdir/.cto/merger.py"
+  fi
+  # Install the §12 mailbox CLI so prompts can call `python3 .cto/mailbox.py …`.
+  if [[ -f "$CTO_ROOT/src/mailbox_cli.py" ]]; then
+    cp -f "$CTO_ROOT/src/mailbox_cli.py" "$tdir/.cto/mailbox.py"
+    chmod +x "$tdir/.cto/mailbox.py"
   fi
 
   # Spawn one tmux window per agent slot.
